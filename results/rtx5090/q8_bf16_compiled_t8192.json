@@ -1,0 +1,134 @@
+{
+ "model": "/home/sid/Documents/useful-work-coin/models/Qwen3-8B",
+ "mode": "bf16",
+ "compile": true,
+ "tokens": 8192,
+ "seq": 512,
+ "hadamard": 512,
+ "block_setup_s": 0.0,
+ "mem_gb": 16.535696384,
+ "mineable_layers": 145,
+ "layers": 145,
+ "embed": {
+  "gpu_s": 0.57536614266667,
+  "wall_s": 0.5818338721666502,
+  "hashed_macs": 0.0,
+  "linear_macs": 56899726737408.0,
+  "tokens_per_gpu_s": 14237.89026242011,
+  "tokens_per_wall_s": 14079.620303806632,
+  "noisy_gemm_s": 0.0,
+  "mining_aux_s": 0.0,
+  "other_s": 0.57536614266667,
+  "top_kernels": [
+   [
+    "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_re",
+    0.26260591033333314
+   ],
+   [
+    "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_re",
+    0.1342289523333329
+   ],
+   [
+    "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_re",
+    0.11488115766666754
+   ],
+   [
+    "triton_poi_fused_mul_0",
+    0.01374176266666694
+   ],
+   [
+    "void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits",
+    0.00890018333333359
+   ],
+   [
+    "triton_poi_fused_silu_0",
+    0.00858580916666668
+   ],
+   [
+    "triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0",
+    0.007044457166666959
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.0063528636666677985
+   ],
+   [
+    "void at::native::(anonymous namespace)::CatArrayBatchedCopy<",
+    0.006283050333333551
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.003964449500000007
+   ],
+   [
+    "triton_poi_fused_add_0",
+    0.0032643390000004105
+   ],
+   [
+    "triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_view_0",
+    0.002974205833333342
+   ]
+  ]
+ },
+ "score": {
+  "gpu_s": 0.6385414193333315,
+  "wall_s": 0.6435290956666601,
+  "hashed_macs": 0.0,
+  "linear_macs": 61997852917760.0,
+  "tokens_per_gpu_s": 12829.238248245272,
+  "tokens_per_wall_s": 12729.805155916916,
+  "noisy_gemm_s": 0.0,
+  "mining_aux_s": 0.0,
+  "other_s": 0.6385414193333315,
+  "top_kernels": [
+   [
+    "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_re",
+    0.30819513516666663
+   ],
+   [
+    "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_re",
+    0.13444989250000025
+   ],
+   [
+    "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_re",
+    0.1150573274999995
+   ],
+   [
+    "triton_poi_fused_mul_0",
+    0.013736101999999948
+   ],
+   [
+    "void at::native::(anonymous namespace)::cunn_SoftMaxForward<",
+    0.012188246833333475
+   ],
+   [
+    "void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits",
+    0.00890317783333316
+   ],
+   [
+    "triton_poi_fused_silu_0",
+    0.008589049166667317
+   ],
+   [
+    "triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0",
+    0.007038417666667113
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.00635204816666663
+   ],
+   [
+    "void at::native::(anonymous namespace)::CatArrayBatchedCopy<",
+    0.006300204666666739
+   ],
+   [
+    "void at::native::unrolled_elementwise_kernel<at::native::dir",
+    0.005135261666666792
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.003969875499999722
+   ]
+  ]
+ }
+}

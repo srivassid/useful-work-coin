@@ -27,8 +27,17 @@ def test_fused_quantizer_matches_torch():
     x = (torch.randn(300, 2560, device="cuda") * torch.linspace(0.1, 8, 2560, device="cuda")).to(torch.bfloat16)
     for bs in (0, 128, 512):
         q, s = __import__("uwc_ampere.ops", fromlist=["ops"]).quant_rows_had(x, bs)
+        # (wide rows such as k=17408 are covered by test_wide_quantizer_rows)
         H = M.hadamard(bs, "cuda") if bs else None
         qr, sr = M.quant_rows(M.rotate(x.float(), H))
         assert torch.allclose(s, sr, rtol=1e-5)
         assert (q.int() - qr.int()).abs().max().item() <= 1          # only float rounding ties differ
         assert (q != qr).float().mean().item() < 1e-3
+
+
+def test_wide_quantizer_rows():
+    from uwc_ampere import ops
+    x = torch.randn(64, 17408, device="cuda").to(torch.bfloat16)  # Qwen3-14B down_proj input
+    q, s = ops.quant_rows_had(x, 512)
+    qr, sr = M.quant_rows(M.rotate(x.float(), M.hadamard(512, "cuda")))
+    assert (q.int() - qr.int()).abs().max().item() <= 1

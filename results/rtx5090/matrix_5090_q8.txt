@@ -1,0 +1,29 @@
+q8_bf16_t8192                      embed gpu=  645.2ms wall=  660.3ms tok/s(gpu)=   12697
+q8_bf16_t8192                      score gpu=  708.6ms wall=  721.9ms tok/s(gpu)=   11561
+q8_plain_t8192 FAILED
+  File "cupy/cuda/function.pyx", line 147, in cupy.cuda.function.Function.__call__
+  File "cupy/cuda/function.pyx", line 129, in cupy.cuda.function._launch
+  File "cupy_backends/cuda/api/driver.pyx", line 286, in cupy_backends.cuda.api.driver.launchKernel
+  File "cupy_backends/cuda/api/driver.pyx", line 73, in cupy_backends.cuda.api.driver.check_status
+cupy_backends.cuda.api.driver.CUDADriverError: CUDA_ERROR_INVALID_VALUE: invalid argument
+q8_mined_t8192 FAILED
+  File "cupy/cuda/function.pyx", line 147, in cupy.cuda.function.Function.__call__
+  File "cupy/cuda/function.pyx", line 129, in cupy.cuda.function._launch
+  File "cupy_backends/cuda/api/driver.pyx", line 286, in cupy_backends.cuda.api.driver.launchKernel
+  File "cupy_backends/cuda/api/driver.pyx", line 73, in cupy_backends.cuda.api.driver.check_status
+cupy_backends.cuda.api.driver.CUDADriverError: CUDA_ERROR_INVALID_VALUE: invalid argument
+q8_bf16_compiled_t8192             embed gpu=  575.4ms wall=  581.8ms tok/s(gpu)=   14238
+q8_bf16_compiled_t8192             score gpu=  638.5ms wall=  643.5ms tok/s(gpu)=   12829
+q8_plain_compiled_t8192 FAILED
+  File "cupy/cuda/function.pyx", line 147, in cupy.cuda.function.Function.__call__
+  File "cupy/cuda/function.pyx", line 129, in cupy.cuda.function._launch
+  File "cupy_backends/cuda/api/driver.pyx", line 286, in cupy_backends.cuda.api.driver.launchKernel
+  File "cupy_backends/cuda/api/driver.pyx", line 73, in cupy_backends.cuda.api.driver.check_status
+cupy_backends.cuda.api.driver.CUDADriverError: CUDA_ERROR_INVALID_VALUE: invalid argument
+q8_mined_compiled_t8192 FAILED
+  File "cupy/cuda/function.pyx", line 147, in cupy.cuda.function.Function.__call__
+  File "cupy/cuda/function.pyx", line 129, in cupy.cuda.function._launch
+  File "cupy_backends/cuda/api/driver.pyx", line 286, in cupy_backends.cuda.api.driver.launchKernel
+  File "cupy_backends/cuda/api/driver.pyx", line 73, in cupy_backends.cuda.api.driver.check_status
+cupy_backends.cuda.api.driver.CUDADriverError: CUDA_ERROR_INVALID_VALUE: invalid argument
+MATRIX8DONE

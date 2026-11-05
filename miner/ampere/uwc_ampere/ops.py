@@ -29,6 +29,8 @@ FLAG_HASH, FLAG_DENOISE = 1, 2
 OUT_NONE, OUT_I32, OUT_BF16 = 0, 1, 2
 
 
+QUANT_MAX_SMEM = 96 * 1024  # dynamic smem for quant_rows_had (k <= 24576); fits every GPU's opt-in limit
+
 # GEMM configurations: (BN, STAGES, MINB). The hash-tile pattern is the same for all.
 CONFIGS = {"256x3": (256, 3, 1), "256x4": (256, 4, 1), "128x3": (128, 3, 2), "128x4": (128, 4, 2)}
 DEFAULT_CFG = os.environ.get("UWC_GEMM_CFG", "128x3")
@@ -44,6 +46,7 @@ def _module(cfg: str = DEFAULT_CFG) -> cp.RawModule:
                                           f"-DBN_={bn}", f"-DMINB={minb}"))
     k = mod.get_function("noisy_gemm")
     k.max_dynamic_shared_size_bytes = stages * (BM + bn) * BK
+    mod.get_function("quant_rows_had").max_dynamic_shared_size_bytes = QUANT_MAX_SMEM
     return mod
 
 
@@ -143,6 +146,7 @@ def quant_rows_had(x: torch.Tensor, bs: int, q: torch.Tensor | None = None, scal
     """x: m x k bf16 (contiguous) -> (int8 q in [-64, 64], float32 per-row scale), block Hadamard of size bs."""
     m, k = x.shape
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and k % 8 == 0 and (bs <= 1 or k % bs == 0)
+    assert 4 * k <= QUANT_MAX_SMEM, f"k={k} too large for the single-CTA-per-row quantizer"
     q = torch.empty((m, k), dtype=torch.int8, device=x.device) if q is None else q
     scale = torch.empty(m, dtype=torch.float32, device=x.device) if scale is None else scale
     _fn("quant_rows_had")((m,), (256,), (_p(x), np.int32(k), np.int32(bs), _p(q), _p(scale)), stream=_stream(),

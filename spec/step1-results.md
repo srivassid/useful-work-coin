@@ -127,3 +127,65 @@ The block size belongs in `MODEL_REG` with the reference runtime hash.
 On the GPU box: `miner/ampere/bench/run_matrix.sh <model_dir> <tag>` (λ),
 `python -m eval.ppl --model <dir>` (perplexity), `python -m eval.embed_quality --model <dir>`
 (embeddings), `pytest tests/` (correctness). Raw outputs are in `results/`.
+
+---
+
+# Addendum (2026-11-06): second GPU family, RTX 5090
+
+Box 192.168.29.38 (wired LAN address .50): RTX 5090 32 GB, Blackwell, compute capability 12.0,
+600 W limit. Same code, compiled for the detected architecture; all 26 tests pass, including
+Pearl's verifier accepting proofs from tiles mined on the 5090. Raw output: `results/rtx5090/`.
+
+## λ on the 5090
+
+Noise mining (sustained): **320–330 TMAC/s**, 4.5× the 3080.
+
+| Model | Runtime | λ embed | λ score | vs 3080 (embed / score) |
+|---|---|---|---|---|
+| Qwen3-1.7B | HF eager | 0.29 | 0.28 | 0.31 / 0.33 |
+| Qwen3-1.7B | compiled | 0.36 | 0.33 | 0.37 / 0.37 |
+| Qwen3-4B | HF eager | 0.33 | 0.33 | 0.41 / 0.41 |
+| Qwen3-4B | compiled | 0.41 | 0.39 | 0.49 / 0.47 |
+| Qwen3-8B | HF eager | 0.41 | 0.41 | does not fit |
+| **Qwen3-8B** | **compiled** | **0.49** | **0.48** | does not fit |
+
+λ is *lower* on the faster GPU for the same model: tensor throughput rose 4.5×, memory
+bandwidth only 2.4× (1.79 vs 0.76 TB/s), so memory-bound non-GEMM work takes a larger
+share. λ recovers with model size (4B → 8B: +0.08). For the design: λ depends on the
+(GPU, model) pair, and high-end GPUs need larger models to reach a given λ, so the pool's
+price and the client fee formula should use λ measured per job type and GPU class.
+
+Mining adds 27–30% GPU time over the same int8 job without mining (8B compiled embed:
+356 vs 274 ms). Mining-while-serving is still 1.6× faster than stock bf16 on this GPU
+(8B compiled embed: 356 vs 575 ms).
+
+## Quality, Qwen3-8B (WikiText-2 perplexity)
+
+| bf16 | W7A7, no rotation | + Hadamard 128 | + Hadamard 512 |
+|---|---|---|---|
+| 9.724 | 10.239 (+5.3%) | 9.849 (+1.3%) | **9.821 (+1.0%)** |
+
+Unlike 1.7B and 4B, the 8B shows a small loss (+1%) at the best block size.
+
+## Cross-hardware determinism (`bench/crosscheck.py`, `results/xc_*.json`)
+
+Identical NumPy-seeded inputs on RTX 3080, RTX 5090 and CPU:
+
+| Level | 3080 vs 5090 | GPU vs CPU |
+|---|---|---|
+| Mining GEMM, int32 output (1024×3072×4096) | identical | identical |
+| Winning tiles (749) | identical | – |
+| Activation quantizer, int8 + scales, Hadamard 0/128/512 | identical | identical |
+| Layer-0 mined QKV input and output (Qwen3-1.7B) | identical | – |
+| Decoder layer outputs | differ from layer 0 | – |
+| Prefill vs KV-cache decode, same GPU | differ (≈96% of elements, max 0.5) | – |
+
+The quantizer first differed from CPU by 1 ulp in the scale because of the GPU's approximate
+`rsqrtf`; folding the 1/√bs normalization into the dequant scale made every step that
+decides the int8 values IEEE add, max or divide in a fixed order, and it now matches.
+
+So everything consensus-relevant, and every integer layer, is already bit-exact across GPU
+families and CPU. What remains for build step 2 is the float part of the model (RMSNorm,
+rotary, softmax attention, SiLU, residual adds): it diverges in the first layer and makes
+prefill ≠ decode, which breaks teacher-forced verification. Those need integer (I-LLM-style)
+or fixed-order deterministic implementations.

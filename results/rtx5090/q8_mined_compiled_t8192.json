@@ -1,0 +1,144 @@
+{
+ "model": "/home/sid/Documents/useful-work-coin/models/Qwen3-8B",
+ "mode": "mined",
+ "compile": true,
+ "tokens": 8192,
+ "seq": 512,
+ "hadamard": 512,
+ "block_setup_s": 0.17175286099973164,
+ "mem_gb": 11.057031168,
+ "mineable_layers": 145,
+ "layers": 145,
+ "noise_macs_per_gpu_s": 324671614564171.0,
+ "noise_macs_per_wall_s": 287843256880236.75,
+ "noise_gpu_spread": [
+  323009637652531.3,
+  327379436101063.06
+ ],
+ "embed": {
+  "gpu_s": 0.3559312088333331,
+  "wall_s": 0.3656332861667124,
+  "hashed_macs": 56899726737408.0,
+  "linear_macs": 56899726737408.0,
+  "tokens_per_gpu_s": 23015.683358735627,
+  "tokens_per_wall_s": 22404.96232135937,
+  "noisy_gemm_s": 0.23856558433333358,
+  "mining_aux_s": 0.028426450166666672,
+  "other_s": 0.08893917433333287,
+  "top_kernels": [
+   [
+    "noisy_gemm",
+    0.23856558433333358
+   ],
+   [
+    "quant_rows_had",
+    0.023487307000000207
+   ],
+   [
+    "noise_rows",
+    0.019720454333333123
+   ],
+   [
+    "triton_poi_fused_mul_0",
+    0.01393833583333312
+   ],
+   [
+    "void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits",
+    0.008898544333333105
+   ],
+   [
+    "triton_poi_fused_silu_0",
+    0.008784050166666385
+   ],
+   [
+    "triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0",
+    0.008017799000000077
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.006365466166666511
+   ],
+   [
+    "void at::native::(anonymous namespace)::CatArrayBatchedCopy<",
+    0.00632362333333339
+   ],
+   [
+    "b3_tree_stage1",
+    0.0063183213333337625
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.003951415833333398
+   ],
+   [
+    "triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_view_0",
+    0.003241618000000101
+   ]
+  ],
+  "lambda_gpu": 0.49158754402682286,
+  "lambda_wall": 0.5636193367518041
+ },
+ "score": {
+  "gpu_s": 0.39662049199999705,
+  "wall_s": 0.4069478799999615,
+  "hashed_macs": 61997852917760.0,
+  "linear_macs": 61997852917760.0,
+  "tokens_per_gpu_s": 20654.505163591148,
+  "tokens_per_wall_s": 20130.341998589043,
+  "noisy_gemm_s": 0.25960669949999926,
+  "mining_aux_s": 0.03084331016666464,
+  "other_s": 0.10617048233333315,
+  "top_kernels": [
+   [
+    "noisy_gemm",
+    0.25960669949999926
+   ],
+   [
+    "quant_rows_had",
+    0.02358239850000039
+   ],
+   [
+    "noise_rows",
+    0.022057130166665734
+   ],
+   [
+    "triton_poi_fused_mul_0",
+    0.013932430833333332
+   ],
+   [
+    "void at::native::(anonymous namespace)::cunn_SoftMaxForward<",
+    0.012187360166666583
+   ],
+   [
+    "void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits",
+    0.008894812833333359
+   ],
+   [
+    "triton_poi_fused_silu_0",
+    0.008788164833333684
+   ],
+   [
+    "triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0",
+    0.007898863333332999
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.006358390500000353
+   ],
+   [
+    "b3_tree_stage1",
+    0.006350591999999848
+   ],
+   [
+    "void at::native::(anonymous namespace)::CatArrayBatchedCopy<",
+    0.006319001666666186
+   ],
+   [
+    "void at::native::unrolled_elementwise_kernel<at::native::dir",
+    0.005161706999999808
+   ]
+  ],
+  "lambda_gpu": 0.48145663906637753,
+  "lambda_wall": 0.5292755097903136
+ }
+}

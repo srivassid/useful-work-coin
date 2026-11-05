@@ -1,0 +1,11 @@
+q8_plain_t8192                     embed gpu=  342.8ms wall=  358.2ms tok/s(gpu)=   23896
+q8_plain_t8192                     score gpu=  375.8ms wall=  389.8ms tok/s(gpu)=   21798
+q8_mined_t8192                     embed gpu=  423.9ms wall=  442.8ms tok/s(gpu)=   19326 lambda_gpu=0.409 lambda_wall=0.466
+q8_mined_t8192                     score gpu=  464.5ms wall=  483.1ms tok/s(gpu)=   17638 lambda_gpu=0.409 lambda_wall=0.447
+                                   noise TMAC/s gpu mean=326.6 spread=[323.4, 329.6]
+q8_plain_compiled_t8192            embed gpu=  273.6ms wall=  281.2ms tok/s(gpu)=   29939
+q8_plain_compiled_t8192            score gpu=  307.4ms wall=  313.1ms tok/s(gpu)=   26651
+q8_mined_compiled_t8192            embed gpu=  355.9ms wall=  365.6ms tok/s(gpu)=   23016 lambda_gpu=0.492 lambda_wall=0.564
+q8_mined_compiled_t8192            score gpu=  396.6ms wall=  406.9ms tok/s(gpu)=   20655 lambda_gpu=0.481 lambda_wall=0.529
+                                   noise TMAC/s gpu mean=324.7 spread=[323.0, 327.4]
+MATRIX8DONE

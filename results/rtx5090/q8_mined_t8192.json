@@ -1,0 +1,144 @@
+{
+ "model": "/home/sid/Documents/useful-work-coin/models/Qwen3-8B",
+ "mode": "mined",
+ "compile": false,
+ "tokens": 8192,
+ "seq": 512,
+ "hadamard": 512,
+ "block_setup_s": 0.17341317899990827,
+ "mem_gb": 11.057031168,
+ "mineable_layers": 145,
+ "layers": 145,
+ "noise_macs_per_gpu_s": 326630941720987.4,
+ "noise_macs_per_wall_s": 287127708952940.44,
+ "noise_gpu_spread": [
+  323351649765901.25,
+  329577486962118.5
+ ],
+ "embed": {
+  "gpu_s": 0.4238943025000032,
+  "wall_s": 0.44279566700000333,
+  "hashed_macs": 56899726737408.0,
+  "linear_macs": 56899726737408.0,
+  "tokens_per_gpu_s": 19325.572322359625,
+  "tokens_per_wall_s": 18500.632708314053,
+  "noisy_gemm_s": 0.2267892845,
+  "mining_aux_s": 0.02826530116666845,
+  "other_s": 0.16883971683333476,
+  "top_kernels": [
+   [
+    "noisy_gemm",
+    0.2267892845
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.030527624000000322
+   ],
+   [
+    "quant_rows_had",
+    0.023250888999999837
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native",
+    0.019704034166666596
+   ],
+   [
+    "noise_rows",
+    0.01959905733333412
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_",
+    0.018170085166666773
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native",
+    0.013339376000000692
+   ],
+   [
+    "void at::native::unrolled_elementwise_kernel<at::native::dir",
+    0.010094343833333495
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.009697903833333188
+   ],
+   [
+    "void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits",
+    0.008839504499999996
+   ],
+   [
+    "void at::native::(anonymous namespace)::CatArrayBatchedCopy<",
+    0.008015566833332625
+   ],
+   [
+    "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<",
+    0.007439120500000637
+   ]
+  ],
+  "lambda_gpu": 0.40890331244075206,
+  "lambda_wall": 0.46610448324827697
+ },
+ "score": {
+  "gpu_s": 0.4644648466666635,
+  "wall_s": 0.4830808968332955,
+  "hashed_macs": 61997852917760.0,
+  "linear_macs": 61997852917760.0,
+  "tokens_per_gpu_s": 17637.502727691302,
+  "tokens_per_wall_s": 16957.822289600794,
+  "noisy_gemm_s": 0.2476310439999999,
+  "mining_aux_s": 0.030655279833332327,
+  "other_s": 0.18617852283333125,
+  "top_kernels": [
+   [
+    "noisy_gemm",
+    0.2476310439999999
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.030615280333332617
+   ],
+   [
+    "quant_rows_had",
+    0.023371081499999922
+   ],
+   [
+    "noise_rows",
+    0.021883384666665878
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native",
+    0.019733142500000023
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_",
+    0.0181723533333333
+   ],
+   [
+    "void at::native::unrolled_elementwise_kernel<at::native::dir",
+    0.015140876333333466
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native",
+    0.013316515666667068
+   ],
+   [
+    "void at::native::(anonymous namespace)::cunn_SoftMaxForward<",
+    0.012124539000000106
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 4, at::native::gpu_",
+    0.009692965999999806
+   ],
+   [
+    "void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits",
+    0.008838939333332999
+   ],
+   [
+    "void at::native::(anonymous namespace)::CatArrayBatchedCopy<",
+    0.00801215666666693
+   ]
+  ],
+  "lambda_gpu": 0.4086640895566335,
+  "lambda_wall": 0.44697340153153076
+ }
+}
