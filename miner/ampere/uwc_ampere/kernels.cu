@@ -37,7 +37,6 @@ typedef unsigned long long u64;
 #define A_STAGE (BM * BK)
 #define B_STAGE (BN * BK)
 #define STAGE_BYTES (A_STAGE + B_STAGE)
-#define LMAX 4
 
 // ------------------------------------------------------------------ BLAKE3
 #define F_CHUNK_START 1u
@@ -148,16 +147,29 @@ b3_tree_stage1(const u8* __restrict__ data, u64 nchunks, const u32* __restrict__
   u64 base = (u64)blockIdx.x * CHUNKS_PER_CTA;
   u64 chunk = base + threadIdx.x;
   int count = (int)min((u64)CHUNKS_PER_CTA, nchunks - base);
-  if (threadIdx.x < count) {
-    const uint4* p = reinterpret_cast<const uint4*>(data + chunk * 1024ull);
-    u32 cv[8];
+  // Blocks are staged through smem so each warp load covers whole 64-byte block rows
+  // (the naive per-thread 1 KiB stride left most of every sector unused).
+  __shared__ uint4 stage[2][CHUNKS_PER_CTA * 4];
+  u32 cv[8];
 #pragma unroll
-    for (int i = 0; i < 8; i++) cv[i] = k8[i];
-    for (int b = 0; b < 16; b++) {
+  for (int i = 0; i < 8; i++) cv[i] = k8[i];
+  const uint4* gbase = reinterpret_cast<const uint4*>(data + base * 1024ull);
+  auto fetch = [&](int buf, int b) {
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+      int idx = threadIdx.x + q * CHUNKS_PER_CTA, c = idx >> 2, part = idx & 3;
+      if (c < count) stage[buf][idx] = __ldg(gbase + (u64)c * 64 + b * 4 + part);
+    }
+  };
+  fetch(0, 0);
+  __syncthreads();
+  for (int b = 0; b < 16; b++) {
+    if (b + 1 < 16) fetch((b + 1) & 1, b + 1);
+    if (threadIdx.x < count) {
       u32 msg[16];
 #pragma unroll
       for (int q = 0; q < 4; q++) {
-        uint4 w = __ldg(p + b * 4 + q);
+        uint4 w = stage[b & 1][threadIdx.x * 4 + q];
         msg[4 * q] = w.x; msg[4 * q + 1] = w.y; msg[4 * q + 2] = w.z; msg[4 * q + 3] = w.w;
       }
       u32 flags = F_KEYED | (b == 0 ? F_CHUNK_START : 0u) | (b == 15 ? F_CHUNK_END : 0u) |
@@ -167,12 +179,30 @@ b3_tree_stage1(const u8* __restrict__ data, u64 nchunks, const u32* __restrict__
 #pragma unroll
       for (int i = 0; i < 8; i++) cv[i] = out[i];
     }
+    __syncthreads();
+  }
+  if (threadIdx.x < count) {
 #pragma unroll
     for (int i = 0; i < 8; i++) cvs[threadIdx.x * 8 + i] = cv[i];
   }
   __syncthreads();
   b3_reduce_smem(cvs, count, k8, F_KEYED, gridDim.x == 1);
   if (threadIdx.x < 8) cta_cvs[blockIdx.x * 8 + threadIdx.x] = cvs[threadIdx.x];
+}
+
+// Intermediate level for inputs above 64 MiB: each CTA reduces an aligned group of 1024
+// chaining values (a perfect subtree, never the root) to one.
+extern "C" __global__ void __launch_bounds__(512)
+b3_tree_mid(const u32* __restrict__ in_cvs, int count, const u32* __restrict__ key, u32* __restrict__ out_cvs) {
+  __shared__ u32 cvs[1024 * 8];
+  const int base = blockIdx.x * 1024, cnt = min(1024, count - base);
+  for (int i = threadIdx.x; i < cnt * 8; i += blockDim.x) cvs[i] = in_cvs[(u64)base * 8 + i];
+  __syncthreads();
+  u32 k8[8];
+#pragma unroll
+  for (int i = 0; i < 8; i++) k8[i] = key[i];
+  b3_reduce_smem(cvs, cnt, k8, F_KEYED, false);
+  if (threadIdx.x < 8) out_cvs[blockIdx.x * 8 + threadIdx.x] = cvs[threadIdx.x];
 }
 
 // Stage 2 (one CTA of 512 threads, up to 1024 stage-1 values = 64 MiB of input): reduce the stage-1 values to the root, then
@@ -274,14 +304,14 @@ extern "C" __global__ void noise_perm(u32* __restrict__ out, u32 k, u32 r, const
 // For each row of src (rows x k int8), optionally:
 //   dst[l]  = src[l] + E[row][Pn.first(l)] - E[row][Pn.second(l)]            (noising)
 //   proj[j] = sum_l x[l] * ([Pp.first(l)==j] - [Pp.second(l)==j]),  x = src  (rank-r projection)
-// then writes proj in LMAX balanced base-128 int8 limbs to corr[li][row][corr_off + j]
+// then writes proj in `lmax` balanced base-128 int8 limbs to corr[li][row][corr_off + j]
 // (row stride 2r) and copies E rows to corr[li][row][ecopy_off + j]. maxabs = max |proj|.
 #define NR_ROWS 8
 extern "C" __global__ void __launch_bounds__(256)
 noise_rows(const i8* __restrict__ src, int rows, int k, int r,
            const i8* __restrict__ E, const u32* __restrict__ Pn, i8* __restrict__ dst,
            const u32* __restrict__ Pp, i8* __restrict__ corr, int corr_off, int ecopy_off,
-           i32* __restrict__ maxabs) {
+           i32* __restrict__ maxabs, int lmax) {
   extern __shared__ __align__(16) u8 smem_nr[];
   i8* Es = reinterpret_cast<i8*>(smem_nr);                         // NR_ROWS * r
   i32* proj = reinterpret_cast<i32*>(smem_nr + NR_ROWS * r);       // NR_ROWS * r
@@ -323,8 +353,7 @@ noise_rows(const i8* __restrict__ src, int rows, int k, int r,
     if (Pp && corr_off >= 0) {
       int v = proj[i];
       local_max = max(local_max, abs(v));
-#pragma unroll
-      for (int li = 0; li < LMAX; li++) {
+      for (int li = 0; li < lmax; li++) {
         int d = ((v + 64) & 127) - 64;
         corr[li * limb_stride + base + corr_off + j] = (i8)d;
         v = (v - d) >> 7;
@@ -332,8 +361,7 @@ noise_rows(const i8* __restrict__ src, int rows, int k, int r,
     }
     if (E && ecopy_off >= 0) {
       i8 e = Es[i];
-#pragma unroll
-      for (int li = 0; li < LMAX; li++) corr[li * limb_stride + base + ecopy_off + j] = e;
+      for (int li = 0; li < lmax; li++) corr[li * limb_stride + base + ecopy_off + j] = e;
     }
   }
   if (Pp && maxabs) {
@@ -428,7 +456,7 @@ noisy_gemm(const i8* __restrict__ A, const i8* __restrict__ B, int m, int n, int
            const u32* __restrict__ key, const u32* __restrict__ target,
            u32* __restrict__ wins, int max_wins,
            const float* __restrict__ a_scale, const float* __restrict__ b_scale,
-           void* __restrict__ out, int out_mode, int flags) {
+           void* __restrict__ out, int out_mode, int flags, int lmax) {
   extern __shared__ __align__(128) u8 smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int wm = warp / WARPS_N, wn = warp % WARPS_N, g = lane >> 2, t4 = lane & 3;
@@ -544,6 +572,7 @@ noisy_gemm(const i8* __restrict__ A, const i8* __restrict__ B, int m, int n, int
     if (mx > 63) L = 2;
     if (mx > 8127) L = 3;
     if (mx > 1040319) L = 4;
+    L = min(L, lmax);  // host sizes lmax for the worst case 127*k, so this never truncates
     const int R2 = 2 * r, KC = R2 / CBK, S = L * KC, TOT = 4 * S;
     const u64 limbA = (u64)m * R2, limbB = (u64)n * R2;
     __syncthreads();
@@ -650,5 +679,66 @@ noisy_gemm(const i8* __restrict__ A, const i8* __restrict__ B, int m, int n, int
       *reinterpret_cast<uint4*>(o + ((u64)(bm0 + row) * n + bn0) * 2 + v * 16) =
           *reinterpret_cast<const uint4*>(smem + row * PITCH + v * 16);
     }
+  }
+}
+
+// ------------------------------------------------------------------ fused activation quantizer
+// One CTA per row: bf16 -> float in smem -> optional block fast Walsh-Hadamard transform
+// (block size bs, power of two dividing k, orthonormal) -> per-row absmax -> int8 in [-64, 64].
+// q = rint(x' / s), s = max|x'| / 64 (round-half-even, like torch.round).
+extern "C" __global__ void __launch_bounds__(256)
+quant_rows_had(const unsigned short* __restrict__ x, int k, int bs, i8* __restrict__ q, float* __restrict__ scale) {
+  extern __shared__ float rowf[];
+  __shared__ float red[8];
+  const int r = blockIdx.x, tid = threadIdx.x;
+  const unsigned short* xr = x + (u64)r * k;
+  for (int i = tid * 8; i < k; i += 256 * 8) {
+    uint4 v = *reinterpret_cast<const uint4*>(xr + i);
+    u32 w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      rowf[i + 2 * j] = __uint_as_float(w[j] << 16);
+      rowf[i + 2 * j + 1] = __uint_as_float(w[j] & 0xFFFF0000u);
+    }
+  }
+  __syncthreads();
+  float norm = 1.0f;
+  if (bs > 1) {
+    for (int lh = 0; (1 << lh) < bs; lh++) {
+      const int h = 1 << lh;
+      for (int p = tid; p < (k >> 1); p += 256) {
+        int i = ((p >> lh) << (lh + 1)) | (p & (h - 1)), j = i + h;
+        float a = rowf[i], b = rowf[j];
+        rowf[i] = a + b;
+        rowf[j] = a - b;
+      }
+      __syncthreads();
+    }
+    norm = rsqrtf((float)bs);
+  }
+  float mx = 0.f;
+  for (int i = tid; i < k; i += 256) mx = fmaxf(mx, fabsf(rowf[i] * norm));
+#pragma unroll
+  for (int s = 16; s > 0; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, s));
+  if ((tid & 31) == 0) red[tid >> 5] = mx;
+  __syncthreads();
+  if (tid < 32) {
+    mx = tid < 8 ? red[tid] : 0.f;
+#pragma unroll
+    for (int s = 4; s > 0; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, s));
+    if (tid == 0) red[0] = fmaxf(mx, 1e-8f) / 64.0f;
+  }
+  __syncthreads();
+  const float sc = red[0];
+  if (tid == 0) scale[r] = sc;
+  i8* qr = q + (u64)r * k;
+  for (int i = tid * 4; i < k; i += 256 * 4) {
+    u32 o = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float v = fminf(fmaxf(rintf(rowf[i + j] * norm / sc), -64.f), 64.f);
+      o |= ((u32)(u8)(i8)(int)v) << (8 * j);
+    }
+    *reinterpret_cast<u32*>(qr + i) = o;
   }
 }

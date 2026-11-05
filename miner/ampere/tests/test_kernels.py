@@ -10,7 +10,7 @@ from uwc_ampere import reference as ref
 DEV = "cuda"
 
 
-@pytest.mark.parametrize("nchunks", [1, 2, 3, 63, 64, 65, 130, 1000, 4097])
+@pytest.mark.parametrize("nchunks", [1, 2, 3, 63, 64, 65, 130, 1000, 4097, 65536, 65537, 300_001])
 def test_tree_hash_matches_blake3(nchunks):
     rng = np.random.default_rng(nchunks)
     data = rng.integers(0, 256, size=nchunks * 1024, dtype=np.uint8)
@@ -64,7 +64,7 @@ def test_noise_rows_noising_and_projection():
     Pp = ref.perm_matrix(ref.SEED_LABEL_B, b"\x02" * 32, k, r)
     pack = lambda P: torch.from_numpy((P[:, 0] | (P[:, 1] << 16)).astype(np.uint32).view(np.int32)).to(DEV)
     dst = torch.empty((rows, k), dtype=torch.int8, device=DEV)
-    corr = torch.zeros((ops.LMAX, rows, 2 * r), dtype=torch.int8, device=DEV)
+    corr = torch.zeros((ops.limbs_for(k), rows, 2 * r), dtype=torch.int8, device=DEV)
     mx = torch.zeros(1, dtype=torch.int32, device=DEV)
     ops.noise_rows(torch.from_numpy(A).to(DEV), rows, k, r, E=torch.from_numpy(E).to(DEV), Pn=pack(Pn), dst=dst,
                    Pp=pack(Pp), corr=corr, corr_off=0, ecopy_off=r, maxabs=mx)
@@ -77,7 +77,7 @@ def test_noise_rows_noising_and_projection():
     c = corr.cpu().numpy()
     assert np.array_equal(_limbs_to_int(c, 0, r), proj)
     assert int(mx.item()) == int(np.abs(proj).max())
-    for li in range(ops.LMAX):
+    for li in range(ops.limbs_for(k)):
         assert np.array_equal(c[li, :, r:], E)
 
 

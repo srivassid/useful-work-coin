@@ -13,7 +13,16 @@ from . import reference as ref
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 BM, BN, BK = 128, 256, 64
-LMAX = 4
+
+
+def limbs_for(k: int) -> int:
+    """Balanced base-128 limbs that always cover |projection| <= 127 * k."""
+    bound, L, cap = 127 * k, 1, 63
+    while cap < bound:
+        L += 1
+        cap = cap * 128 + 63
+    return L
+
 WIN_WORDS = 10
 CHUNKS_PER_CTA = 64
 FLAG_HASH, FLAG_DENOISE = 1, 2
@@ -89,12 +98,17 @@ def b3_root_and_seed(data: torch.Tensor, key: torch.Tensor, *, prefix=None, salt
     assert nbytes % 1024 == 0 and nbytes > 0
     nchunks = nbytes // 1024
     ncta = (nchunks + CHUNKS_PER_CTA - 1) // CHUNKS_PER_CTA
-    assert ncta <= 1024, "input larger than 64 MiB"
     if scratch is None or scratch.numel() < ncta * 8:
         scratch = torch.empty(ncta * 8, dtype=torch.int32, device=data.device)
     st = _stream()
     _fn("b3_tree_stage1")((ncta,), (CHUNKS_PER_CTA,), (_p(data), np.uint64(nchunks), _p(key), _p(scratch)), stream=st)
-    _fn("b3_tree_stage2")((1,), (512,), (_p(scratch), np.int32(ncta), _p(key), _p(prefix), _p(salt), np.uint32(dim),
+    cur, count = scratch, ncta
+    while count > 1024:  # inputs above 64 MiB (e.g. lm_head): reduce aligned 1024-groups
+        groups = (count + 1023) // 1024
+        nxt = torch.empty(groups * 8, dtype=torch.int32, device=data.device)
+        _fn("b3_tree_mid")((groups,), (512,), (_p(cur), np.int32(count), _p(key), _p(nxt)), stream=st)
+        cur, count = nxt, groups
+    _fn("b3_tree_stage2")((1,), (512,), (_p(cur), np.int32(count), _p(key), _p(prefix), _p(salt), np.uint32(dim),
                                          _p(root_out), _p(seed_out)), stream=st)
     return scratch
 
@@ -113,12 +127,26 @@ def noise_perm(out: torch.Tensor, k: int, r: int, label: torch.Tensor, key: torc
 
 
 def noise_rows(src, rows, k, r, *, E=None, Pn=None, dst=None, Pp=None, corr=None, corr_off=-1, ecopy_off=-1,
-               maxabs=None):
+               maxabs=None, lmax=None):
+    lmax = corr.shape[0] if corr is not None else 0
     assert rows % 8 == 0 and k % 4 == 0
     smem = 8 * r + 8 * r * 4
     _fn("noise_rows")((rows // 8,), (256,),
                       (_p(src), np.int32(rows), np.int32(k), np.int32(r), _p(E), _p(Pn), _p(dst), _p(Pp), _p(corr),
-                       np.int32(corr_off), np.int32(ecopy_off), _p(maxabs)), stream=_stream(), shared_mem=smem)
+                       np.int32(corr_off), np.int32(ecopy_off), _p(maxabs), np.int32(lmax)), stream=_stream(),
+                      shared_mem=smem)
+
+
+# ------------------------------------------------------------------ activation quantizer
+def quant_rows_had(x: torch.Tensor, bs: int, q: torch.Tensor | None = None, scale: torch.Tensor | None = None):
+    """x: m x k bf16 (contiguous) -> (int8 q in [-64, 64], float32 per-row scale), block Hadamard of size bs."""
+    m, k = x.shape
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and k % 8 == 0 and (bs <= 1 or k % bs == 0)
+    q = torch.empty((m, k), dtype=torch.int8, device=x.device) if q is None else q
+    scale = torch.empty(m, dtype=torch.float32, device=x.device) if scale is None else scale
+    _fn("quant_rows_had")((m,), (256,), (_p(x), np.int32(k), np.int32(bs), _p(q), _p(scale)), stream=_stream(),
+                          shared_mem=4 * k)
+    return q, scale
 
 
 # ------------------------------------------------------------------ GEMM
@@ -133,19 +161,23 @@ def gemm(A, B, *, r=128, flags=0, corrA=None, corrB=None, maxabs=None, key=None,
     _fn("noisy_gemm", cfg)(((n // bn) * (m // BM),), (bn,),
                               (_p(A), _p(B), np.int32(m), np.int32(n), np.int32(k), np.int32(r), _p(corrA), _p(corrB),
                                _p(maxabs), _p(key), _p(target), _p(wins), np.int32(max_wins), _p(a_scale), _p(b_scale),
-                               _p(out), np.int32(out_mode), np.int32(flags)),
+                               _p(out), np.int32(out_mode), np.int32(flags),
+                               np.int32(corrA.shape[0] if corrA is not None else 0)),
                               stream=_stream(), shared_mem=stages * (BM + bn) * BK)
 
 
 # ------------------------------------------------------------------ one mined linear layer
+_WORKSPACE: dict = {}
+
+
 @dataclass
 class MinedWeight:
     """A weight B^T (n x k int8, values in [-64, 64]) prepared for mining under one block template.
 
     setup_block() runs once per (block header, k); forward() runs per call and needs no host sync.
     """
-    Bt: torch.Tensor            # n x k int8
-    b_scale: torch.Tensor       # n float32
+    Bt: torch.Tensor            # n x k int8 (GPU, or pinned CPU to save memory: only BpEBt lives on GPU)
+    b_scale: torch.Tensor       # n float32, on the mining GPU
     r: int = 128
     max_wins: int = 64
     # per block
@@ -166,40 +198,50 @@ class MinedWeight:
     def k(self):
         return self.Bt.shape[1]
 
+    @property
+    def device(self):
+        return self.b_scale.device
+
     def setup_block(self, job_key: bytes, target_words: np.ndarray):
-        dev = self.Bt.device
+        dev = self.device
         n, k, r = self.n, self.k, self.r
+        Bt = self.Bt if self.Bt.device == dev else self.Bt.to(dev, non_blocking=True)
         self.job_key = words(job_key, dev)
         self.target = torch.from_numpy(target_words.astype(np.uint32).view(np.int32).copy()).to(dev)
         self.b_seed = torch.empty(8, dtype=torch.int32, device=dev)
         c = consts(dev)
-        b3_root_and_seed(self.Bt.view(-1), self.job_key, prefix=self.job_key, salt=c["SALT_B"], dim=n,
+        b3_root_and_seed(Bt.view(-1), self.job_key, prefix=self.job_key, salt=c["SALT_B"], dim=n,
                          seed_out=self.b_seed)
         self.EBRt = torch.empty((n, r), dtype=torch.int8, device=dev)
         noise_uniform(self.EBRt, c["LABEL_B"], self.b_seed)
         self.PB = torch.empty(k, dtype=torch.int32, device=dev)
         noise_perm(self.PB, k, r, c["LABEL_B"], self.b_seed)
-        self.BpEBt = torch.empty_like(self.Bt)
-        self.corrB = torch.zeros((LMAX, n, 2 * r), dtype=torch.int8, device=dev)
-        noise_rows(self.Bt, n, k, r, E=self.EBRt, Pn=self.PB, dst=self.BpEBt, corr=self.corrB, ecopy_off=0)
-        self._bufs.clear()
+        if self.BpEBt is None:
+            self.BpEBt = torch.empty((n, k), dtype=torch.int8, device=dev)
+            self.corrB = torch.zeros((limbs_for(k), n, 2 * r), dtype=torch.int8, device=dev)
+        noise_rows(Bt, n, k, r, E=self.EBRt, Pn=self.PB, dst=self.BpEBt, corr=self.corrB, ecopy_off=0)
+        del Bt
 
     def _buf(self, m: int):
-        b = self._bufs.get(m)
-        if b is None:
-            dev, k, r, n = self.Bt.device, self.k, self.r, self.n
-            b = dict(
+        """Per-call buffers. The large ones are a workspace shared by every weight with the same
+        (m, k, r): layers run one after another on one stream. Win records are per weight."""
+        dev, k, r = self.device, self.k, self.r
+        key = (str(dev), m, k, r)
+        ws = _WORKSPACE.get(key)
+        if ws is None:
+            ws = _WORKSPACE[key] = dict(
                 a_seed=torch.empty(8, dtype=torch.int32, device=dev),
                 EAL=torch.empty((m, r), dtype=torch.int8, device=dev),
                 PA=torch.empty(k, dtype=torch.int32, device=dev),
                 ApEA=torch.empty((m, k), dtype=torch.int8, device=dev),
-                corrA=torch.zeros((LMAX, m, 2 * r), dtype=torch.int8, device=dev),
+                corrA=torch.zeros((limbs_for(k), m, 2 * r), dtype=torch.int8, device=dev),
                 maxabs=torch.zeros(2, dtype=torch.int32, device=dev),
-                wins=torch.zeros(1 + self.max_wins * WIN_WORDS, dtype=torch.int32, device=dev),
-                scratch=torch.empty(8 * 1024, dtype=torch.int32, device=dev),
+                scratch=torch.empty(8 * max(1024, -(-m * k // (1024 * CHUNKS_PER_CTA))), dtype=torch.int32, device=dev),
             )
-            self._bufs[m] = b
-        return b
+        wins = self._bufs.get(m)
+        if wins is None:
+            wins = self._bufs[m] = torch.zeros(1 + self.max_wins * WIN_WORDS, dtype=torch.int32, device=dev)
+        return {**ws, "wins": wins}
 
     def forward(self, A: torch.Tensor, a_scale: torch.Tensor, out: torch.Tensor | None = None,
                 out_mode: int = OUT_BF16, hash_tiles: bool = True) -> torch.Tensor:
@@ -229,6 +271,23 @@ class MinedWeight:
              wins=b["wins"], max_wins=self.max_wins, a_scale=a_scale, b_scale=self.b_scale, out=out, out_mode=out_mode)
         return out
 
+    def noise_mine(self, A: torch.Tensor):
+        """What a pure noise miner runs per attempt batch: commit A, noise it, hashed GEMM, no output.
+
+        No projections (X, Y) and no denoise, since nobody needs C."""
+        m, k = A.shape
+        n, r = self.n, self.r
+        dev = A.device
+        b = self._buf(m)
+        c = consts(dev)
+        b3_root_and_seed(A.view(-1), self.job_key, prefix=self.b_seed, salt=c["SALT_A"], dim=m,
+                         seed_out=b["a_seed"], scratch=b["scratch"])
+        noise_uniform(b["EAL"], c["LABEL_A"], b["a_seed"], zero_me=b["wins"], zero_n=1)
+        noise_perm(b["PA"], k, r, c["LABEL_A"], b["a_seed"])
+        noise_rows(A, m, k, r, E=b["EAL"], Pn=b["PA"], dst=b["ApEA"])
+        gemm(b["ApEA"], self.BpEBt, r=r, flags=FLAG_HASH, key=b["a_seed"], target=self.target, wins=b["wins"],
+             max_wins=self.max_wins)
+
     def winners(self, m: int) -> list[tuple[int, int, bytes]]:
         """(row_offset, col_offset, hash) for winning tiles of the last forward with this m (syncs)."""
         w = self._buf(m)["wins"].cpu().numpy().view(np.uint32)
@@ -241,7 +300,7 @@ class GraphedForward:
     """MinedWeight.forward captured as one CUDA graph for a fixed m (static input/output buffers)."""
 
     def __init__(self, w: MinedWeight, m: int, out_mode: int = OUT_BF16):
-        dev = w.Bt.device
+        dev = w.device
         self.w, self.m = w, m
         self.A = torch.zeros((m, w.k), dtype=torch.int8, device=dev)
         self.a_scale = torch.ones(m, dtype=torch.float32, device=dev)
