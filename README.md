@@ -6,7 +6,7 @@ plus a verified job market. Work follows the doc's build plan.
 | Step | Status |
 |---|---|
 | 1. Go/no-go: λ and quantization quality | **done**: see `spec/step1-results.md` |
-| 2. Reference runtime (bit-exact across GPU families) | integer-only Ampere path done; needs a second GPU family |
+| 2. Reference runtime (bit-exact across GPU families) | **done**: see `spec/step2-results.md` |
 | 3–7. Job module, verification, pool, simulator, testnet | not started |
 
 Layout (from the doc): `chain/`, `miner/` (`miner/ampere`: Ampere port of Pearl's NoisyGEMM

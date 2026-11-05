@@ -53,7 +53,7 @@ A from-scratch Qwen3 forward in plain tensor ops, so GPU and CPU run the same pr
 | Model | bf16 | W7A7, float attention (step 1) | Deterministic runtime |
 |---|---|---|---|
 | Qwen3-1.7B | 16.711 | 16.706 | **16.755 (+0.26%)** |
-| Qwen3-4B | 13.656 | 13.647 | QWEN4B_RESULT |
+| Qwen3-4B | 13.656 | 13.647 | **13.586 (−0.5%)** |
 
 ## Costs and limits
 
