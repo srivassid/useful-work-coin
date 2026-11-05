@@ -123,3 +123,16 @@ def test_mined_forward_exact_and_winners_match_reference():
             expect.add((rb * 64 + g, cb * 64 + 2 * t, h))
     got = set(w.winners(m))
     assert expect and got == expect
+
+
+def test_graphed_forward_matches_eager():
+    rng = np.random.default_rng(5)
+    m, n, k = 256, 512, 2048
+    A = torch.from_numpy(rng.integers(-64, 65, size=(m, k), dtype=np.int8)).to(DEV)
+    Bt = torch.from_numpy(rng.integers(-64, 65, size=(n, k), dtype=np.int8)).to(DEV)
+    w = ops.MinedWeight(Bt=Bt, b_scale=torch.ones(n, device=DEV))
+    w.setup_block(rng.bytes(32), np.zeros(8, np.uint32))
+    gf = ops.GraphedForward(w, m, out_mode=ops.OUT_I32)
+    gf.A.copy_(A)
+    got = gf().clone()
+    assert torch.equal(got, torch._int_mm(A, Bt.t()))

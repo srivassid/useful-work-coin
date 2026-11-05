@@ -20,10 +20,20 @@ typedef unsigned long long u64;
 #ifndef STAGES
 #define STAGES 3
 #endif
+#ifndef BN_
+#define BN_ 256
+#endif
+#ifndef MINB
+#define MINB 1
+#endif
+#ifndef GROUP_M
+#define GROUP_M 8
+#endif
 #define BM 128
-#define BN 256
+#define BN BN_
 #define BK 64
-#define NTHREADS 256
+#define WARPS_N (BN / 64)
+#define NTHREADS (2 * WARPS_N * 32)
 #define A_STAGE (BM * BK)
 #define B_STAGE (BN * BK)
 #define STAGE_BYTES (A_STAGE + B_STAGE)
@@ -356,12 +366,12 @@ __device__ __forceinline__ int swz(int row, int chunk) { return row * 64 + ((chu
 __device__ __forceinline__ void load_stage(u8* sA, u8* sB, const i8* __restrict__ A, const i8* __restrict__ B,
                                            int bm0, int bn0, int k, int kt, int tid) {
 #pragma unroll
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < (BM * BK / 16) / NTHREADS; i++) {
     int idx = tid + i * NTHREADS, row = idx >> 2, c = idx & 3;
     cp_async16(smem_u32addr(sA + swz(row, c)), A + (u64)(bm0 + row) * k + kt * BK + c * 16);
   }
 #pragma unroll
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < (BN * BK / 16) / NTHREADS; i++) {
     int idx = tid + i * NTHREADS, row = idx >> 2, c = idx & 3;
     cp_async16(smem_u32addr(sB + swz(row, c)), B + (u64)(bn0 + row) * k + kt * BK + c * 16);
   }
@@ -374,6 +384,34 @@ __device__ __forceinline__ u32 bf16x2(float a, float b) {
   return ua | (ub << 16);
 }
 
+#define CSTAGES 2
+#define CBK 128
+#define CORR_STAGE ((BM + WARPS_N * 16) * CBK)
+// 128-byte rows, 16-byte chunks XOR-swizzled by row (conflict-free ldmatrix over 8 rows).
+__device__ __forceinline__ int swz128(int row, int chunk) { return row * 128 + ((chunk ^ (row & 7)) << 4); }
+// One pipeline step of the denoise phase: A-side [X_li | EAL] rows bm0..bm0+128 and the
+// B-side [EBRt | Y_li] rows for this pass's column strip (16 cols per warp column), k-chunk kc.
+__device__ __forceinline__ void load_corr(u8* st, const i8* __restrict__ corrA, const i8* __restrict__ corrB,
+                                          u64 limbA, u64 limbB, int R2, int L, int KC, int gstep,
+                                          int bm0, int bn0, int tid) {
+  const int S = L * KC, p = gstep / S, step = gstep - p * S;
+  int li = L - 1 - step / KC, kc = step - (step / KC) * KC;
+  u8* sA = st;
+  u8* sB = st + BM * CBK;
+  const i8* pa = corrA + li * limbA + (u64)bm0 * R2 + kc * CBK;
+#pragma unroll
+  for (int i = 0; i < (BM * CBK / 16) / NTHREADS; i++) {
+    int idx = tid + i * NTHREADS, row = idx >> 3, c = idx & 7;
+    cp_async16(smem_u32addr(sA + swz128(row, c)), pa + (u64)row * R2 + c * 16);
+  }
+#pragma unroll
+  for (int i = 0; i < (WARPS_N * 16 * CBK / 16) / NTHREADS; i++) {
+    int idx = tid + i * NTHREADS, q = idx >> 3, c = idx & 7;
+    int col = bn0 + (q >> 4) * 64 + p * 16 + (q & 15);
+    cp_async16(smem_u32addr(sB + swz128(q, c)), corrB + li * limbB + (u64)col * R2 + kc * CBK + c * 16);
+  }
+}
+
 #define FLAG_HASH 1
 #define FLAG_DENOISE 2
 #define OUT_NONE 0
@@ -384,7 +422,7 @@ __device__ __forceinline__ u32 bf16x2(float a, float b) {
 // C = A * B^T with A: m x k, B: n x k (both int8, k contiguous). With FLAG_HASH, A and B are
 // the noised operands and every thread hashes its 8 x 16 tile; with FLAG_DENOISE the
 // epilogue subtracts sum_li 128^li [X_li | EAL] [EBRt | Y_li]^T exactly in int32.
-extern "C" __global__ void __launch_bounds__(NTHREADS, 1)
+extern "C" __global__ void __launch_bounds__(NTHREADS, MINB)
 noisy_gemm(const i8* __restrict__ A, const i8* __restrict__ B, int m, int n, int k, int r,
            const i8* __restrict__ corrA, const i8* __restrict__ corrB, const i32* __restrict__ maxabs,
            const u32* __restrict__ key, const u32* __restrict__ target,
@@ -393,8 +431,16 @@ noisy_gemm(const i8* __restrict__ A, const i8* __restrict__ B, int m, int n, int
            void* __restrict__ out, int out_mode, int flags) {
   extern __shared__ __align__(128) u8 smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const int wm = warp >> 2, wn = warp & 3, g = lane >> 2, t4 = lane & 3;
-  const int bm0 = blockIdx.y * BM, bn0 = blockIdx.x * BN;
+  const int wm = warp / WARPS_N, wn = warp % WARPS_N, g = lane >> 2, t4 = lane & 3;
+  // grouped rasterization: GROUP_M row-tiles share B tiles in L2
+  int bm0, bn0;
+  {
+    const int npm = m / BM, npn = n / BN, pid = blockIdx.x;
+    const int grp = GROUP_M * npn, gid = pid / grp, first = gid * GROUP_M;
+    const int gsz = min(npm - first, GROUP_M), in = pid - gid * grp;
+    bm0 = (first + in % gsz) * BM;
+    bn0 = (in / gsz) * BN;
+  }
   const int KT = k / BK, tiles_per_chunk = r / BK;
   const bool do_hash = flags & FLAG_HASH;
 
@@ -490,69 +536,119 @@ noisy_gemm(const i8* __restrict__ A, const i8* __restrict__ B, int m, int n, int
   }
 
   if (flags & FLAG_DENOISE) {
+    // acc -= sum_li 128^li [X_li | EAL] [EBRt | Y_li]^T, exact in int32 (Horner over limbs).
+    // Four passes over quarter-width column strips keep the temporary accumulator at 32
+    // registers; operands stream through smem with the same cp.async + ldmatrix path.
     int L = 1;
-    int mx = max(maxabs[0], maxabs[1]);
+    const int mx = max(maxabs[0], maxabs[1]);
     if (mx > 63) L = 2;
     if (mx > 8127) L = 3;
     if (mx > 1040319) L = 4;
-    const int R2 = 2 * r;
+    const int R2 = 2 * r, KC = R2 / CBK, S = L * KC, TOT = 4 * S;
     const u64 limbA = (u64)m * R2, limbB = (u64)n * R2;
+    __syncthreads();
 #pragma unroll
-    for (int mi = 0; mi < 4; mi++) {
-      i32 tmp[8][4];
+    for (int s = 0; s < CSTAGES - 1; s++) {
+      if (s < TOT) load_corr(smem + s * CORR_STAGE, corrA, corrB, limbA, limbB, R2, L, KC, s, bm0, bn0, tid);
+      cp_async_commit();
+    }
 #pragma unroll
-      for (int b = 0; b < 8; b++)
+    for (int p = 0; p < 4; p++) {
+      i32 tmp[4][2][4];
 #pragma unroll
-        for (int c = 0; c < 4; c++) tmp[b][c] = 0;
-      const int ra = bm0 + wm * 64 + mi * 16 + g;
-      for (int li = L - 1; li >= 0; li--) {
+      for (int a = 0; a < 4; a++)
 #pragma unroll
-        for (int b = 0; b < 8; b++)
+        for (int b = 0; b < 2; b++)
 #pragma unroll
-          for (int c = 0; c < 4; c++) tmp[b][c] <<= 7;
-        const i8* pa = corrA + li * limbA;
-        const i8* pb = corrB + li * limbB;
-        for (int kk = 0; kk < R2; kk += 32) {
-          u32 a[4];
-          a[0] = __ldg(reinterpret_cast<const u32*>(pa + (u64)ra * R2 + kk + 4 * t4));
-          a[1] = __ldg(reinterpret_cast<const u32*>(pa + (u64)(ra + 8) * R2 + kk + 4 * t4));
-          a[2] = __ldg(reinterpret_cast<const u32*>(pa + (u64)ra * R2 + kk + 16 + 4 * t4));
-          a[3] = __ldg(reinterpret_cast<const u32*>(pa + (u64)(ra + 8) * R2 + kk + 16 + 4 * t4));
+          for (int c = 0; c < 4; c++) tmp[a][b][c] = 0;
+      for (int step = 0; step < S; step++) {
+        const int gs = p * S + step;
+        cp_async_wait<CSTAGES - 2>();
+        __syncthreads();
+        {
+          int nx = gs + CSTAGES - 1;
+          if (nx < TOT) load_corr(smem + (nx % CSTAGES) * CORR_STAGE, corrA, corrB, limbA, limbB, R2, L, KC, nx, bm0, bn0, tid);
+          cp_async_commit();
+        }
+        if (step % KC == 0) {
 #pragma unroll
-          for (int nj = 0; nj < 8; nj++) {
-            const int cb = bn0 + wn * 64 + nj * 8 + g;
-            u32 b2[2];
-            b2[0] = __ldg(reinterpret_cast<const u32*>(pb + (u64)cb * R2 + kk + 4 * t4));
-            b2[1] = __ldg(reinterpret_cast<const u32*>(pb + (u64)cb * R2 + kk + 16 + 4 * t4));
-            mma_s8(tmp[nj], a, b2);
+          for (int a = 0; a < 4; a++)
+#pragma unroll
+            for (int b = 0; b < 2; b++)
+#pragma unroll
+              for (int c = 0; c < 4; c++) tmp[a][b][c] <<= 7;
+        }
+        const u8* sA = smem + (gs % CSTAGES) * CORR_STAGE;
+        const u8* sB = sA + BM * CBK;
+#pragma unroll
+        for (int ks = 0; ks < CBK / 32; ks++) {
+          u32 af[4][4], b0[2], b1[2];
+#pragma unroll
+          for (int mi = 0; mi < 4; mi++) {
+            int row = wm * 64 + mi * 16 + (lane & 15);
+            int c = ks * 2 + (lane >> 4);
+            ldsm_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3], smem_u32addr(sA + swz128(row, c)));
+          }
+          {
+            int row = wn * 16 + ((lane >> 4) << 3) + (lane & 7);
+            int c = ks * 2 + ((lane >> 3) & 1);
+            ldsm_x4(b0[0], b0[1], b1[0], b1[1], smem_u32addr(sB + swz128(row, c)));
+          }
+#pragma unroll
+          for (int mi = 0; mi < 4; mi++) {
+            mma_s8(tmp[mi][0], af[mi], b0);
+            mma_s8(tmp[mi][1], af[mi], b1);
           }
         }
       }
 #pragma unroll
-      for (int b = 0; b < 8; b++)
+      for (int a = 0; a < 4; a++)
 #pragma unroll
-        for (int c = 0; c < 4; c++) acc[mi][b][c] -= tmp[b][c];
+        for (int b = 0; b < 2; b++)
+#pragma unroll
+          for (int c = 0; c < 4; c++) acc[a][2 * p + b][c] -= tmp[a][b][c];
     }
+    cp_async_wait<0>();
   }
 
-  if (out_mode != OUT_NONE) {
+  if (out_mode == OUT_I32) {
 #pragma unroll
     for (int mi = 0; mi < 4; mi++) {
       const int r0 = bm0 + wm * 64 + mi * 16 + g;
 #pragma unroll
       for (int nj = 0; nj < 8; nj++) {
         const int c0 = bn0 + wn * 64 + nj * 8 + 2 * t4;
-        if (out_mode == OUT_I32) {
-          i32* o = reinterpret_cast<i32*>(out);
-          *reinterpret_cast<int2*>(o + (u64)r0 * n + c0) = make_int2(acc[mi][nj][0], acc[mi][nj][1]);
-          *reinterpret_cast<int2*>(o + (u64)(r0 + 8) * n + c0) = make_int2(acc[mi][nj][2], acc[mi][nj][3]);
-        } else {
-          u32* o = reinterpret_cast<u32*>(out);
-          float s0 = a_scale[r0], s1 = a_scale[r0 + 8], q0 = b_scale[c0], q1 = b_scale[c0 + 1];
-          o[((u64)r0 * n + c0) >> 1] = bf16x2((float)acc[mi][nj][0] * s0 * q0, (float)acc[mi][nj][1] * s0 * q1);
-          o[((u64)(r0 + 8) * n + c0) >> 1] = bf16x2((float)acc[mi][nj][2] * s1 * q0, (float)acc[mi][nj][3] * s1 * q1);
-        }
+        i32* o = reinterpret_cast<i32*>(out);
+        *reinterpret_cast<int2*>(o + (u64)r0 * n + c0) = make_int2(acc[mi][nj][0], acc[mi][nj][1]);
+        *reinterpret_cast<int2*>(o + (u64)(r0 + 8) * n + c0) = make_int2(acc[mi][nj][2], acc[mi][nj][3]);
       }
+    }
+  } else if (out_mode == OUT_BF16) {
+    // Stage the scaled bf16 tile in smem (padded rows), then write full 16-byte vectors.
+    constexpr int PITCH = BN * 2 + 16;  // bytes
+    __syncthreads();
+#pragma unroll
+    for (int mi = 0; mi < 4; mi++) {
+      const int lr = wm * 64 + mi * 16 + g;
+      const float s0 = a_scale[bm0 + lr], s1 = a_scale[bm0 + lr + 8];
+#pragma unroll
+      for (int nj = 0; nj < 8; nj++) {
+        const int lc = wn * 64 + nj * 8 + 2 * t4;
+        const float q0 = b_scale[bn0 + lc], q1 = b_scale[bn0 + lc + 1];
+        *reinterpret_cast<u32*>(smem + lr * PITCH + lc * 2) =
+            bf16x2((float)acc[mi][nj][0] * s0 * q0, (float)acc[mi][nj][1] * s0 * q1);
+        *reinterpret_cast<u32*>(smem + (lr + 8) * PITCH + lc * 2) =
+            bf16x2((float)acc[mi][nj][2] * s1 * q0, (float)acc[mi][nj][3] * s1 * q1);
+      }
+    }
+    __syncthreads();
+    constexpr int VPR = BN * 2 / 16;  // 16-byte vectors per row
+    u8* o = reinterpret_cast<u8*>(out);
+#pragma unroll 4
+    for (int i = tid; i < BM * VPR; i += NTHREADS) {
+      const int row = i / VPR, v = i - row * VPR;
+      *reinterpret_cast<uint4*>(o + ((u64)(bm0 + row) * n + bn0) * 2 + v * 16) =
+          *reinterpret_cast<const uint4*>(smem + row * PITCH + v * 16);
     }
   }
 }
