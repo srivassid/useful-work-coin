@@ -39,8 +39,9 @@ def _module(cfg: str = DEFAULT_CFG) -> cp.RawModule:
     bn, stages, minb = CONFIGS[cfg]
     with open(os.path.join(_HERE, "kernels.cu")) as f:
         src = f.read()
-    mod = cp.RawModule(code=src, options=("-arch=sm_86", "-std=c++17", f"-DSTAGES={stages}", f"-DBN_={bn}",
-                                          f"-DMINB={minb}"))
+    major, minor = torch.cuda.get_device_capability()
+    mod = cp.RawModule(code=src, options=(f"-arch=sm_{major}{minor}", "-std=c++17", f"-DSTAGES={stages}",
+                                          f"-DBN_={bn}", f"-DMINB={minb}"))
     k = mod.get_function("noisy_gemm")
     k.max_dynamic_shared_size_bytes = stages * (BM + bn) * BK
     return mod
