@@ -1,0 +1,11 @@
+{
+ "device": "cpu",
+ "torch": "2.11.0+cu130",
+ "L1_gemm_int32": "bf9394d180bda5b0412c",
+ "L2_q_bs0": "ce0b9f970855d5565ecc",
+ "L2_scale_bs0": "c15f21b56e165b4e76b7",
+ "L2_q_bs128": "440e431806f833e22989",
+ "L2_scale_bs128": "b11bb63a72dfee572c80",
+ "L2_q_bs512": "c51b454f3687cd02109f",
+ "L2_scale_bs512": "66c49428583d960017f2"
+}

@@ -685,7 +685,9 @@ noisy_gemm(const i8* __restrict__ A, const i8* __restrict__ B, int m, int n, int
 // ------------------------------------------------------------------ fused activation quantizer
 // One CTA per row: bf16 -> float in smem -> optional block fast Walsh-Hadamard transform
 // (block size bs, power of two dividing k, orthonormal) -> per-row absmax -> int8 in [-64, 64].
-// q = rint(x' / s), s = max|x'| / 64 (round-half-even, like torch.round).
+// q = rint(y / s), s = max|y| / 64, y = unnormalized transform (round-half-even). The 1/sqrt(bs)
+// normalization does not change q, so it is folded into the returned (dequant) scale instead:
+// every step that decides q is an IEEE add/max/divide in a fixed order -> identical on any GPU/CPU.
 extern "C" __global__ void __launch_bounds__(256)
 quant_rows_had(const unsigned short* __restrict__ x, int k, int bs, i8* __restrict__ q, float* __restrict__ scale) {
   extern __shared__ float rowf[];
@@ -714,10 +716,10 @@ quant_rows_had(const unsigned short* __restrict__ x, int k, int bs, i8* __restri
       }
       __syncthreads();
     }
-    norm = rsqrtf((float)bs);
+    norm = 1.0f / sqrtf((float)bs);  // only used for the dequant scale
   }
   float mx = 0.f;
-  for (int i = tid; i < k; i += 256) mx = fmaxf(mx, fabsf(rowf[i] * norm));
+  for (int i = tid; i < k; i += 256) mx = fmaxf(mx, fabsf(rowf[i]));
 #pragma unroll
   for (int s = 16; s > 0; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, s));
   if ((tid & 31) == 0) red[tid >> 5] = mx;
@@ -730,13 +732,13 @@ quant_rows_had(const unsigned short* __restrict__ x, int k, int bs, i8* __restri
   }
   __syncthreads();
   const float sc = red[0];
-  if (tid == 0) scale[r] = sc;
+  if (tid == 0) scale[r] = sc * norm;
   i8* qr = q + (u64)r * k;
   for (int i = tid * 4; i < k; i += 256 * 4) {
     u32 o = 0;
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-      float v = fminf(fmaxf(rintf(rowf[i + j] * norm / sc), -64.f), 64.f);
+      float v = fminf(fmaxf(rintf(__fdiv_rn(rowf[i + j], sc)), -64.f), 64.f);
       o |= ((u32)(u8)(i8)(int)v) << (8 * j);
     }
     *reinterpret_cast<u32*>(qr + i) = o;
