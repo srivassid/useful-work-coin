@@ -23,7 +23,7 @@ def ppl(mdl, ids, seq, dev, max_windows):
         h = mdl.model(input_ids=x[None, :-1]).last_hidden_state[0]
         for s in range(0, seq, 1024):
             lg = mdl.lm_head(h[s:s + 1024]).float()
-            nll += torch.nn.functional.cross_entropy(lg, x[1 + s:1 + s + 1024], reduction="sum").item()
+            nll += torch.nn.functional.cross_entropy(lg, x[1 + s:1 + s + 1024].to(lg.device), reduction="sum").item()
         cnt += seq
     return math.exp(nll / cnt), cnt
 
@@ -44,10 +44,14 @@ def main():
     res = {"model": a.model, "seq": a.seq}
     for v in a.variants.split(","):
         mode, _, had = v.partition(":")
-        mdl = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cpu")
+        if mode == "hf":  # stock bf16, split over all visible GPUs (for models that do not fit one 3080)
+            mdl = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="auto",
+                                                       max_memory={0: "5GiB", 1: "6GiB"})
+        else:
+            mdl = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cpu")
+            M.convert_qwen3(mdl, dev, mode=mode, hadamard_block=int(had or 0))
+            mdl.to(dev)
         mdl.eval()
-        M.convert_qwen3(mdl, dev, mode=mode, hadamard_block=int(had or 0))
-        mdl.to(dev)
         p, n = ppl(mdl, ids, a.seq, dev, a.max_windows)
         res[v] = p
         print(json.dumps({"variant": v, "ppl": round(p, 4), "tokens": n}), flush=True)

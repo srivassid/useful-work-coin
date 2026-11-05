@@ -60,7 +60,7 @@ class MinedLinear(nn.Module):
         super().__init__()
         self.mode = mode
         self.splits = [l.out_features for l in linears]
-        W = torch.cat([l.weight.detach() for l in linears], 0).to(device=device, dtype=torch.float32)
+        W = torch.cat([l.weight.detach() for l in linears], 0)  # stays where it was loaded (CPU)
         bias = [l.bias for l in linears]
         self.bias = None if all(b is None for b in bias) else torch.cat(
             [b.detach() if b is not None else torch.zeros(l.out_features) for b, l in zip(bias, linears)]).to(device, torch.bfloat16)
@@ -70,14 +70,23 @@ class MinedLinear(nn.Module):
             bs = min(hadamard_block, self.k & -self.k)
             self.H = hadamard(bs, device)
         if mode == "bf16":
-            self.W = W.to(torch.bfloat16)
+            self.W = W.to(device=device, dtype=torch.bfloat16)
         else:
-            Wq, sw = quant_rows(rotate(W, self.H))
-            self.Wq, self.sw = Wq.contiguous(), sw.contiguous()
+            # quantize in row chunks on the GPU so huge layers (lm_head) never need a full fp32 copy
+            qs, ss = [], []
+            for s0 in range(0, self.n, 16384):
+                q, sc = quant_rows(rotate(W[s0:s0 + 16384].to(device=device, dtype=torch.float32), self.H))
+                qs.append(q.cpu() if mode == "mined" else q)
+                ss.append(sc)
+            self.Wq, self.sw = torch.cat(qs).contiguous(), torch.cat(ss).contiguous()
+            if mode == "mined":  # only the noised copy will live on the GPU (made in setup_block)
+                self.Wq = self.Wq.pin_memory()
         del W
         self.r = r
         self.cfg = cfg or ops.DEFAULT_CFG
         self.bn = ops.CONFIGS[self.cfg][0]
+        if mode == "mined" and not self.mineable:  # falls back to cuBLAS int8, so weights must be on the GPU
+            self.Wq = self.Wq.to(device)
         self.mw: ops.MinedWeight | None = None
         self.hashed_macs = 0   # m_pad * n * k summed over mined calls
         self.useful_macs = 0   # m * n * k summed over calls
@@ -92,8 +101,6 @@ class MinedLinear(nn.Module):
         if self.mode != "mined" or not self.mineable:
             return
         if self.mw is None:
-            # only the noised copy stays on the GPU; the clean weights go to pinned host memory
-            self.Wq = self.Wq.cpu().pin_memory()
             self.mw = ops.MinedWeight(Bt=self.Wq, b_scale=self.sw, r=self.r)
         self.mw.setup_block(job_key_for_k(self.k), bound_for_k(self.k))
 
@@ -168,7 +175,8 @@ class _FusedHead(nn.Module):
 def convert_qwen3(model, device, mode="mined", hadamard_block=512, mine_lm_head=True, cfg=None) -> list[MinedLinear]:
     """Swap every linear in a HF Qwen3 model (q/k/v fused, gate/up fused). Returns the MinedLinears."""
     mls = []
-    for layer in model.model.layers:
+    base = model.model if hasattr(model, "model") else model  # CausalLM or bare Qwen3Model (embeddings)
+    for layer in base.layers:
         at, mlp = layer.self_attn, layer.mlp
         qkv = MinedLinear([at.q_proj, at.k_proj, at.v_proj], device, mode, hadamard_block, cfg=cfg)
         head = _FusedHead(qkv)
@@ -182,7 +190,7 @@ def convert_qwen3(model, device, mode="mined", hadamard_block=512, mine_lm_head=
         mlp.down_proj = d
         mls += [qkv, o, gu, d]
         torch.cuda.empty_cache()
-    if mine_lm_head:
+    if mine_lm_head and hasattr(model, "lm_head"):
         lm = MinedLinear([model.lm_head], device, mode, hadamard_block, cfg=cfg)
         model.lm_head = lm
         mls.append(lm)

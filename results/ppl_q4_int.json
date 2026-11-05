@@ -1,0 +1,7 @@
+{
+ "model": "/home/sid/Documents/useful-work-coin/models/Qwen3-4B",
+ "seq": 2048,
+ "int:0": 14.34561701521643,
+ "int:128": 13.647346677980142,
+ "int:512": 13.895359386667655
+}

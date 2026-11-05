@@ -1,0 +1,20 @@
+{
+ "model": "/home/sid/Documents/useful-work-coin/models/Qwen3-Embedding-4B",
+ "texts": 256,
+ "results": {
+  "128": {
+   "cos_mean": 0.9903265237808228,
+   "cos_min": 0.9864020347595215,
+   "top1_neighbor_agreement": 0.91015625,
+   "top10_overlap": 0.96015625,
+   "pairwise_sim_spearman": 0.9965575337409973
+  },
+  "512": {
+   "cos_mean": 0.9931659698486328,
+   "cos_min": 0.9903616309165955,
+   "top1_neighbor_agreement": 0.9375,
+   "top10_overlap": 0.96640625,
+   "pairwise_sim_spearman": 0.9972010254859924
+  }
+ }
+}

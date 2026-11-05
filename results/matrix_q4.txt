@@ -1,0 +1,10 @@
+q4_plain_t8192                     embed gpu=  799.6ms wall=  849.5ms tok/s(gpu)=   10245
+q4_plain_t8192                     score gpu=  880.5ms wall=  925.5ms tok/s(gpu)=    9304
+q4_mined_t8192                     embed gpu= 1013.8ms wall= 1070.9ms tok/s(gpu)=    8081 lambda_gpu=0.410 lambda_wall=0.436
+q4_mined_t8192                     score gpu= 1145.5ms wall= 1203.8ms tok/s(gpu)=    7152 lambda_gpu=0.405 lambda_wall=0.418
+                                   noise TMAC/s gpu mean=71.1 spread=[70.1, 72.5]
+q4_plain_compiled_t8192            embed gpu=  640.9ms wall=  661.9ms tok/s(gpu)=   12781
+q4_plain_compiled_t8192            score gpu=  724.0ms wall=  741.8ms tok/s(gpu)=   11316
+q4_mined_compiled_t8192            embed gpu=  854.8ms wall=  883.4ms tok/s(gpu)=    9583 lambda_gpu=0.485 lambda_wall=0.522
+q4_mined_compiled_t8192            score gpu=  986.1ms wall= 1018.1ms tok/s(gpu)=    8307 lambda_gpu=0.468 lambda_wall=0.490
+                                   noise TMAC/s gpu mean=71.4 spread=[70.5, 72.9]
