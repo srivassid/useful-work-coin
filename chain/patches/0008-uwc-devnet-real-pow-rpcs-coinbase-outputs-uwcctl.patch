@@ -1,0 +1,802 @@
+From 43adf52e593021a098ec4e1bddd0197662cde506 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 09:28:45 +0530
+Subject: [PATCH] UWC devnet: real-PoW network, job-state RPCs, job coinbase
+ outputs in getblocktemplate, uwcctl keys (build step 7)
+
+- chaincfg.UWCDevNetParams (--uwcdevnet): own magic (UWCD), genesis, ports 18670/18671,
+  proof verification on (unlike SimNet), 1-minute blocks with WTEMA retargeting, job module
+  with a 2-of-3 council.
+- RPCs getjobstate, getjob, listjobs, getjobaccount, getcategory (read-only).
+- getblocktemplate returns uwc_coinbase_outputs (pool deposit, due withdrawals, job-state
+  commitment); Pearl's gateway appends them to the coinbase it builds.
+- cmd/uwcctl: Taproot keys and their job-module accounts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ .../blockchain_utils/blockchain_utils.py      |   5 +
+ .../src/pearl_gateway/comm/dataclasses.py     |   1 +
+ .../src/pearl_gateway/rpc_types.py            |   8 +
+ node/btcjson/chainsvrresults.go               |  11 +
+ node/btcjson/uwccmds.go                       |  35 +++
+ node/chaincfg/uwc_devnet.go                   |  83 ++++++
+ node/cmd/uwcctl/keys.go                       |  69 +++++
+ node/cmd/uwcctl/main.go                       |  62 ++++
+ node/config.go                                |   8 +-
+ node/params.go                                |   6 +
+ node/rpcjobs.go                               | 280 ++++++++++++++++++
+ node/rpcserver.go                             |   9 +
+ node/rpcserverhelp.go                         |   3 +
+ node/wire/protocol.go                         |  16 +-
+ 14 files changed, 589 insertions(+), 7 deletions(-)
+ create mode 100644 node/btcjson/uwccmds.go
+ create mode 100644 node/chaincfg/uwc_devnet.go
+ create mode 100644 node/cmd/uwcctl/keys.go
+ create mode 100644 node/cmd/uwcctl/main.go
+ create mode 100644 node/rpcjobs.go
+
+diff --git a/miner/pearl-gateway/src/pearl_gateway/blockchain_utils/blockchain_utils.py b/miner/pearl-gateway/src/pearl_gateway/blockchain_utils/blockchain_utils.py
+index 9dcb87f9..cf266233 100644
+--- a/miner/pearl-gateway/src/pearl_gateway/blockchain_utils/blockchain_utils.py
++++ b/miner/pearl-gateway/src/pearl_gateway/blockchain_utils/blockchain_utils.py
+@@ -72,6 +72,7 @@ def create_coinbase_transaction(
+     mining_address: str,
+     coinbase_aux: dict[str, str] | None = None,
+     default_witness_commitment: str | None = None,
++    extra_outputs: list[tuple[int, str]] | None = None,
+ ) -> Transaction:
+     """
+     Create a coinbase transaction from scratch.
+@@ -101,6 +102,10 @@ def create_coinbase_transaction(
+     coinbase_output = TxOutput(coinbase_value, script_pubkey)
+ 
+     outputs = [coinbase_output]
++    # Useful-Work Coin: outputs the job module requires, after the miner's and before the
++    # witness commitment (raw scripts from the node's template).
++    for value, script_hex in extra_outputs or []:
++        outputs.append(TxOutput(value, Script.from_raw(script_hex)))
+ 
+     has_witness = default_witness_commitment is not None
+ 
+diff --git a/miner/pearl-gateway/src/pearl_gateway/comm/dataclasses.py b/miner/pearl-gateway/src/pearl_gateway/comm/dataclasses.py
+index 510cd6e1..68b399ae 100644
+--- a/miner/pearl-gateway/src/pearl_gateway/comm/dataclasses.py
++++ b/miner/pearl-gateway/src/pearl_gateway/comm/dataclasses.py
+@@ -67,6 +67,7 @@ class BlockTemplate:
+             mining_address=mining_address,
+             coinbase_aux=data.coinbaseaux.model_dump(),
+             default_witness_commitment=data.default_witness_commitment,
++            extra_outputs=[(o.value, o.script) for o in data.uwc_coinbase_outputs],
+         )
+         raw_transactions = [bytes.fromhex(tx.data) for tx in data.transactions]
+         txids = [tx.txid for tx in data.transactions]
+diff --git a/miner/pearl-gateway/src/pearl_gateway/rpc_types.py b/miner/pearl-gateway/src/pearl_gateway/rpc_types.py
+index 496287a4..7f40671c 100644
+--- a/miner/pearl-gateway/src/pearl_gateway/rpc_types.py
++++ b/miner/pearl-gateway/src/pearl_gateway/rpc_types.py
+@@ -23,6 +23,11 @@ class CoinbaseAux(BaseModel):
+ 
+ 
+ # Original struct from node/btcjson/chainsvrresults.go:GetBlockTemplateResult
++class CoinbaseOutput(BaseModel):
++    value: int = Field(ge=0)
++    script: str
++
++
+ class GetBlockTemplateResponse(BaseModel):
+     """Fields in getblocktemplate response with runtime validation."""
+ 
+@@ -43,5 +48,8 @@ class GetBlockTemplateResponse(BaseModel):
+     coinbaseaux: CoinbaseAux
+     coinbasevalue: int = Field(ge=0)
+     default_witness_commitment: str | None = None
++    # Useful-Work Coin: coinbase outputs the job module requires, in order (pool deposit, due
++    # withdrawals, job-state commitment). Empty on other networks.
++    uwc_coinbase_outputs: list[CoinbaseOutput] = []
+     # Absent from nodes that predate the field; those only ever require V1.
+     requiredcertversion: CertificateVersion = CertificateVersion.ZK_DENSE
+diff --git a/node/btcjson/chainsvrresults.go b/node/btcjson/chainsvrresults.go
+index eb384259..b092c05e 100644
+--- a/node/btcjson/chainsvrresults.go
++++ b/node/btcjson/chainsvrresults.go
+@@ -281,6 +281,11 @@ type GetBlockTemplateResult struct {
+ 	// Witness commitment defined in BIP 0141.
+ 	DefaultWitnessCommitment string `json:"default_witness_commitment,omitempty"`
+ 
++	// Useful-Work Coin: coinbase outputs the job module requires (pool deposit, due
++	// withdrawals, job-state commitment), in order, after the miner's output and before the
++	// witness commitment. A miner that builds its own coinbase must include them.
++	UWCCoinbaseOutputs []GetBlockTemplateResultOutput `json:"uwc_coinbase_outputs,omitempty"`
++
+ 	// Optional long polling from BIP 0022.
+ 	LongPollID  string `json:"longpollid,omitempty"`
+ 	LongPollURI string `json:"longpolluri,omitempty"`
+@@ -914,3 +919,9 @@ type GetTxSpendingPrevOutResult struct {
+ 	// spending this output (omitted if unspent).
+ 	SpendingTxid string `json:"spendingtxid,omitempty"`
+ }
++
++// GetBlockTemplateResultOutput is one required coinbase output of a block template.
++type GetBlockTemplateResultOutput struct {
++	Value  int64  `json:"value"`
++	Script string `json:"script"`
++}
+diff --git a/node/btcjson/uwccmds.go b/node/btcjson/uwccmds.go
+new file mode 100644
+index 00000000..db40ea0d
+--- /dev/null
++++ b/node/btcjson/uwccmds.go
+@@ -0,0 +1,35 @@
++package btcjson
++
++// Useful-Work Coin job-module queries (read-only).
++
++// GetJobStateCmd defines the getjobstate JSON-RPC command.
++type GetJobStateCmd struct{}
++
++// GetJobCmd defines the getjob JSON-RPC command.
++type GetJobCmd struct {
++	JobID string
++}
++
++// ListJobsCmd defines the listjobs JSON-RPC command.
++type ListJobsCmd struct {
++	Status *string
++}
++
++// GetJobAccountCmd defines the getjobaccount JSON-RPC command.
++type GetJobAccountCmd struct {
++	Account string
++}
++
++// GetCategoryCmd defines the getcategory JSON-RPC command.
++type GetCategoryCmd struct {
++	CategoryID string
++}
++
++func init() {
++	flags := UsageFlag(0)
++	MustRegisterCmd("getjobstate", (*GetJobStateCmd)(nil), flags)
++	MustRegisterCmd("getjob", (*GetJobCmd)(nil), flags)
++	MustRegisterCmd("listjobs", (*ListJobsCmd)(nil), flags)
++	MustRegisterCmd("getjobaccount", (*GetJobAccountCmd)(nil), flags)
++	MustRegisterCmd("getcategory", (*GetCategoryCmd)(nil), flags)
++}
+diff --git a/node/chaincfg/uwc_devnet.go b/node/chaincfg/uwc_devnet.go
+new file mode 100644
+index 00000000..c0586c73
+--- /dev/null
++++ b/node/chaincfg/uwc_devnet.go
+@@ -0,0 +1,83 @@
++package chaincfg
++
++import (
++	"encoding/hex"
++	"math/big"
++	"time"
++
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++// Useful-Work Coin development network (build step 7). Unlike UWC SimNet it verifies proof of
++// work for real: blocks carry zk certificates mined with cuPOW. It is private: no DNS seeds,
++// peers are added by hand.
++
++// uwcDevNetPowLimit is the easiest target: 2^212. At one block a minute that suits about 1 TMAC/s
++// of noise mining; retargeting raises difficulty from there.
++var uwcDevNetPowLimit = new(big.Int).Lsh(bigOne, 212)
++
++// uwcDevNetCouncil are the accounts (sha256 of P2TR scripts) of the devnet's 2-of-3 council.
++// Their keys are kept outside the repository.
++var uwcDevNetCouncil = []string{
++	"894d710011fce6d2275d73973964012b09176dd76c4faf1a2ac72bbf6c0c9b54",
++	"bf95254d25d6c79352f4836988d36a0aad22d7d35fe58d7697728c1412c70b4e",
++	"6c5501426cdc8b53974dd218b071eb7acfe7377e2a116d7768a356f6ff988b01",
++}
++
++func uwcDevNetJobParams() *jobstate.Params {
++	p := jobstate.DefaultParams()
++	for _, h := range uwcDevNetCouncil {
++		var a jobstate.AccountID
++		b, err := hex.DecodeString(h)
++		if err != nil || len(b) != 32 {
++			panic("chaincfg: bad UWC devnet council account " + h)
++		}
++		copy(a[:], b)
++		p.Council = append(p.Council, a)
++	}
++	p.CouncilThreshold = 2
++	return &p
++}
++
++var uwcDevNetGenesisBlock = func() wire.MsgBlock {
++	b := wire.MsgBlock{
++		MsgHeader: wire.MsgHeader{
++			BlockHeader: wire.BlockHeader{
++				Version:    1,
++				MerkleRoot: genesisMerkleRoot,
++				Timestamp:  time.Unix(1793923200, 0), // 2026-11-06 00:00:00 UTC
++				Bits:       0x1a020000,               // 2^201: about one block a minute at 550 TMAC/s
++			},
++		},
++		Transactions: []*wire.MsgTx{&genesisCoinbaseTx},
++	}
++	h := b.BlockHash()
++	b.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: &wire.CertificateV1{
++		Hash: h, ProofData: []byte{0x75, 0x77, 0x63, 0x64}, // genesis is not verified
++	}}
++	return b
++}()
++
++var uwcDevNetGenesisHash = uwcDevNetGenesisBlock.BlockHash()
++
++// UWCDevNetParams are the parameters of the Useful-Work Coin development network.
++var UWCDevNetParams = func() Params {
++	p := SimNetParams
++	p.Name = "uwc-devnet"
++	p.Net = wire.UWCDevNet
++	p.DefaultPort = "18670"
++	p.GenesisBlock = &uwcDevNetGenesisBlock
++	p.GenesisHash = &uwcDevNetGenesisHash
++	p.PowLimit = uwcDevNetPowLimit
++	p.PowLimitBits = 0x1b100000 // 2^212
++	p.PoWNoRetargeting = false
++	p.TargetTimePerBlock = time.Minute
++	p.WTEMAHalfLife = time.Hour
++	p.ReduceMinDifficulty = false
++	p.MinDiffReductionTime = 0
++	p.GenerateSupported = false
++	p.CoinbaseMaturity = 10
++	p.JobModule = uwcDevNetJobParams()
++	return p
++}()
+diff --git a/node/cmd/uwcctl/keys.go b/node/cmd/uwcctl/keys.go
+new file mode 100644
+index 00000000..93c2d1c3
+--- /dev/null
++++ b/node/cmd/uwcctl/keys.go
+@@ -0,0 +1,69 @@
++package main
++
++import (
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++
++	"github.com/pearl-research-labs/pearl/node/btcec"
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/txscript"
++)
++
++// key is a Taproot key-path key: its P2TR output script controls one job-module account.
++type key struct {
++	Priv    *btcec.PrivateKey
++	Script  []byte
++	Account jobstate.AccountID
++}
++
++type keyFile struct {
++	Priv string `json:"priv"`
++}
++
++func keyFromPriv(b []byte) *key {
++	priv, _ := btcec.PrivKeyFromBytes(b)
++	script, _ := txscript.PayToTaprootScript(txscript.ComputeTaprootKeyNoScript(priv.PubKey()))
++	return &key{Priv: priv, Script: script, Account: jobstate.AccountForScript(script)}
++}
++
++func newKey() *key {
++	var b [32]byte
++	if _, err := rand.Read(b[:]); err != nil {
++		panic(err)
++	}
++	return keyFromPriv(b[:])
++}
++
++func loadKey(path string) (*key, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	var kf keyFile
++	if err := json.Unmarshal(raw, &kf); err != nil {
++		return nil, fmt.Errorf("%s: %w", path, err)
++	}
++	b, err := hex.DecodeString(kf.Priv)
++	if err != nil || len(b) != 32 {
++		return nil, fmt.Errorf("%s: bad private key", path)
++	}
++	return keyFromPriv(b), nil
++}
++
++func (k *key) save(path string) error {
++	raw, _ := json.Marshal(keyFile{Priv: hex.EncodeToString(k.Priv.Serialize())})
++	return os.WriteFile(path, raw, 0o600)
++}
++
++func (k *key) address(p *chaincfg.Params) string {
++	a, err := btcutil.NewAddressTaproot(k.Script[2:], p)
++	if err != nil {
++		return "?"
++	}
++	return a.EncodeAddress()
++}
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+new file mode 100644
+index 00000000..47170247
+--- /dev/null
++++ b/node/cmd/uwcctl/main.go
+@@ -0,0 +1,62 @@
++// Command uwcctl manages Useful-Work Coin keys and job-module transactions: deposits, job
++// operations and job-state queries against a pearld node.
++package main
++
++import (
++	"encoding/hex"
++	"fmt"
++	"os"
++
++	"github.com/pearl-research-labs/pearl/node/chaincfg"
++)
++
++func usage() {
++	fmt.Fprintln(os.Stderr, `usage: uwcctl <command> [args]
++
++  keygen <file>          new key (Taproot key path); prints its account and address
++  info <keyfile>         account, P2TR script and address of a key`)
++	os.Exit(2)
++}
++
++var netParams = &chaincfg.UWCDevNetParams
++
++func main() {
++	if len(os.Args) < 2 {
++		usage()
++	}
++	args := os.Args[2:]
++	var err error
++	switch os.Args[1] {
++	case "keygen":
++		if len(args) != 1 {
++			usage()
++		}
++		if _, e := os.Stat(args[0]); e == nil {
++			err = fmt.Errorf("%s exists", args[0])
++			break
++		}
++		k := newKey()
++		if err = k.save(args[0]); err == nil {
++			printKey(k)
++		}
++	case "info":
++		if len(args) != 1 {
++			usage()
++		}
++		var k *key
++		if k, err = loadKey(args[0]); err == nil {
++			printKey(k)
++		}
++	default:
++		usage()
++	}
++	if err != nil {
++		fmt.Fprintln(os.Stderr, "uwcctl:", err)
++		os.Exit(1)
++	}
++}
++
++func printKey(k *key) {
++	fmt.Printf("account %s\nscript  %s\naddress %s\n", hex.EncodeToString(k.Account[:]),
++		hex.EncodeToString(k.Script), k.address(netParams))
++}
+diff --git a/node/config.go b/node/config.go
+index ac8665d3..b792b394 100644
+--- a/node/config.go
++++ b/node/config.go
+@@ -175,6 +175,7 @@ type config struct {
+ 	RPCUser                  string        `short:"u" long:"rpcuser" description:"Username for RPC connections"`
+ 	SigCacheMaxSize          uint          `long:"sigcachemaxsize" description:"The maximum number of entries in the signature verification cache"`
+ 	SimNet                   bool          `long:"simnet" description:"Use the simulation test network"`
++	UWCDevNet                bool          `long:"uwcdevnet" description:"Use the Useful-Work Coin development network"`
+ 	SigNet                   bool          `long:"signet" description:"Use the signet test network"`
+ 	SigNetChallenge          string        `long:"signetchallenge" description:"Connect to a custom signet network defined by this challenge instead of using the global default signet test network -- Can be specified multiple times"`
+ 	SigNetSeedNode           []string      `long:"signetseednode" description:"Specify a seed node for the signet network instead of using the global default signet network seed nodes"`
+@@ -504,7 +505,7 @@ func loadConfig() (*config, []string, error) {
+ 	// Load additional config from file.
+ 	var configFileError error
+ 	parser := newConfigParser(&cfg, &serviceOpts, flags.Default)
+-	if !(preCfg.RegressionTest || preCfg.SimNet || preCfg.SigNet) ||
++	if !(preCfg.RegressionTest || preCfg.SimNet || preCfg.SigNet || preCfg.UWCDevNet) ||
+ 		preCfg.ConfigFile != defaultConfigFile {
+ 
+ 		if _, err := os.Stat(preCfg.ConfigFile); os.IsNotExist(err) {
+@@ -583,6 +584,11 @@ func loadConfig() (*config, []string, error) {
+ 		activeNetParams = &simNetParams
+ 		cfg.DisableDNSSeed = true
+ 	}
++	if cfg.UWCDevNet {
++		numNets++
++		activeNetParams = &uwcDevNetParams
++		cfg.DisableDNSSeed = true
++	}
+ 	if cfg.SigNet {
+ 		numNets++
+ 		activeNetParams = &sigNetParams
+diff --git a/node/params.go b/node/params.go
+index a76922b2..d12506fd 100644
+--- a/node/params.go
++++ b/node/params.go
+@@ -59,6 +59,12 @@ var simNetParams = params{
+ 	rpcPort: "18556",
+ }
+ 
++// uwcDevNetParams contains parameters specific to the Useful-Work Coin development network.
++var uwcDevNetParams = params{
++	Params:  &chaincfg.UWCDevNetParams,
++	rpcPort: "18671",
++}
++
+ // sigNetParams contains parameters specific to the Signet network
+ // (wire.SigNet).
+ var sigNetParams = params{
+diff --git a/node/rpcjobs.go b/node/rpcjobs.go
+new file mode 100644
+index 00000000..a38d3621
+--- /dev/null
++++ b/node/rpcjobs.go
+@@ -0,0 +1,280 @@
++package main
++
++import (
++	"bytes"
++	"encoding/hex"
++	"sort"
++
++	"github.com/pearl-research-labs/pearl/node/btcjson"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++)
++
++// Read-only RPCs over the Useful-Work Coin job module (build step 7).
++
++func init() {
++	h := map[string]commandHandler{
++		"getjobstate":   handleGetJobState,
++		"getjob":        handleGetJob,
++		"listjobs":      handleListJobs,
++		"getjobaccount": handleGetJobAccount,
++		"getcategory":   handleGetCategory,
++	}
++	for k, v := range h {
++		rpcHandlersBeforeInit[k] = v
++		rpcLimited[k] = struct{}{}
++		rpcResultTypes[k] = []interface{}{(*map[string]interface{})(nil)}
++	}
++	for k, v := range map[string]string{
++		"getjobstate--synopsis":   "Returns a summary of the job module after the best block: state root, statistics, system balances, categories, proposals and forced-error commitments.",
++		"getjobstate--result0":    "Job-module summary",
++		"getjob--synopsis":        "Returns one job of the job module.",
++		"getjob-jobid":            "The hex-encoded job id",
++		"getjob--result0":         "The job",
++		"listjobs--synopsis":      "Lists jobs (id, status, provider, fee), optionally only those with one status.",
++		"listjobs-status":         "Only jobs with this status (posted, accepted, committed, verify-commit, verify-reveal, provider-reveal, challenge, disputed, settled, expired, failed, aborted)",
++		"listjobs--result0":       "Jobs keyed by id",
++		"getjobaccount--synopsis": "Returns a job-module account: free balance, verifier stake, unbonding stake and pending withdrawals.",
++		"getjobaccount-account":   "The hex-encoded account (sha256 of the controlling pkScript)",
++		"getjobaccount--result0":  "The account",
++		"getcategory--synopsis":   "Returns a public-good pool category.",
++		"getcategory-categoryid":  "The hex-encoded category id",
++		"getcategory--result0":    "The category",
++	} {
++		helpDescsEnUS[k] = v
++	}
++	for k := range h { // map results: one entry per field
++		helpDescsEnUS[k+"--result0--key"] = "field"
++		helpDescsEnUS[k+"--result0--value"] = "value"
++		helpDescsEnUS[k+"--result0--desc"] = "see the synopsis"
++	}
++}
++
++func hx(b []byte) string { return hex.EncodeToString(b) }
++
++func parseHash(s string) (jobstate.Hash, error) {
++	var h jobstate.Hash
++	b, err := hex.DecodeString(s)
++	if err != nil || len(b) != 32 {
++		return h, &btcjson.RPCError{Code: btcjson.ErrRPCInvalidParameter, Message: "expected 32 hex-encoded bytes"}
++	}
++	copy(h[:], b)
++	return h, nil
++}
++
++func (s *rpcServer) jobState() (*jobstate.State, error) {
++	if s.cfg.ChainParams.JobModule == nil {
++		return nil, &btcjson.RPCError{Code: btcjson.ErrRPCMisc, Message: "this network has no job module"}
++	}
++	st, err := s.cfg.Chain.JobStateAtTip()
++	if err != nil {
++		return nil, &btcjson.RPCError{Code: btcjson.ErrRPCMisc, Message: err.Error()}
++	}
++	if st == nil {
++		return nil, &btcjson.RPCError{Code: btcjson.ErrRPCMisc, Message: "this network has no job module"}
++	}
++	return st, nil
++}
++
++func handleGetJobState(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
++	st, err := s.jobState()
++	if err != nil {
++		return nil, err
++	}
++	statuses := map[string]int{}
++	for _, j := range st.Jobs {
++		statuses[j.Status.String()]++
++	}
++	cats := map[string]interface{}{}
++	for id, c := range st.Categories {
++		cats[hx(id[:])] = categorySummary(c)
++	}
++	props := map[string]interface{}{}
++	for id, p := range st.Proposals {
++		var ap []string
++		for _, a := range p.Approvals {
++			ap = append(ap, hx(a[:]))
++		}
++		props[hx(id[:])] = map[string]interface{}{"action": hx(p.Action), "approvals": ap, "expires": p.Expires}
++	}
++	fes := map[string]interface{}{}
++	for id, f := range st.FECommits {
++		fes[hx(id[:])] = map[string]interface{}{"commitment": hx(f.Commitment[:]), "reserve": f.Reserve,
++			"height": f.Height, "expires": f.Expires}
++	}
++	root := st.Root()
++	best := s.cfg.Chain.BestSnapshot()
++	return map[string]interface{}{
++		"height":     best.Height,
++		"root":       hx(root[:]),
++		"stats":      st.Stats,
++		"jobs":       statuses,
++		"models":     len(st.Models),
++		"pool":       st.Accounts[jobstate.PoolAccount],
++		"treasury":   st.Accounts[jobstate.TreasuryAccount],
++		"holdings":   st.Holdings(),
++		"stakers":    len(st.Stakes),
++		"categories": cats,
++		"proposals":  props,
++		"fecommits":  fes,
++	}, nil
++}
++
++func categorySummary(c *jobstate.Category) map[string]interface{} {
++	sp := c.Spec
++	return map[string]interface{}{
++		"model": hx(sp.Model[:]), "workroot": hx(sp.WorkRoot[:]), "units": sp.Units, "stagesperunit": sp.StagesPerUnit,
++		"seqlen": sp.SeqLen, "k": sp.K, "n": sp.N, "unitdeadline": sp.UnitDeadline, "capbp": sp.CapBP,
++		"curator": hx(sp.Curator[:]), "canaryleaves": sp.CanaryLeaves,
++		"budget": c.Budget, "price": c.Price, "retired": c.Retired, "closed": c.Closed,
++		"inflight": c.InFlight, "done": c.Done, "epochdeliveries": len(c.Epoch),
++	}
++}
++
++func jobJSON(j *jobstate.Job) map[string]interface{} {
++	var committee []interface{}
++	for _, v := range j.Committee {
++		committee = append(committee, map[string]interface{}{"account": hx(v.Account[:]), "committed": v.Committed,
++			"revealed": v.Revealed, "positions": v.Positions, "flagged": v.Flagged})
++	}
++	var revealed []interface{}
++	for _, r := range j.Revealed {
++		revealed = append(revealed, map[string]interface{}{"stage": r.Stage, "root": hx(r.Root[:])})
++	}
++	var disputes []interface{}
++	for _, d := range j.Disputes {
++		disputes = append(disputes, map[string]interface{}{"verifier": d.Verifier, "challenger": hx(d.Challenger[:]),
++			"stage": d.Stage, "claimedroot": hx(d.ClaimedRoot[:]), "bond": d.Bond, "height": d.Height})
++	}
++	out := map[string]interface{}{
++		"id": hx(j.ID[:]), "status": j.Status.String(), "client": hx(j.Client[:]), "provider": hx(j.Provider[:]),
++		"model": hx(j.Model[:]), "inputroot": hx(j.InputRoot[:]), "stages": j.Stages, "seqlen": j.SeqLen,
++		"k": j.K, "n": j.N, "fee": j.Fee, "verifierpay": j.VerifierPay, "treasurycut": j.TreasuryCut, "bond": j.Bond,
++		"deadline": j.Deadline, "phaseend": j.PhaseEnd, "posted": j.PostHeight, "accepted": j.AcceptHeight,
++		"committedat": j.CommitHeight, "stageroot": hx(j.StageRoot[:]), "outputroot": hx(j.OutputRoot[:]),
++		"challengeend": j.ChallengeEnd, "committee": committee, "revealed": revealed, "disputes": disputes,
++		"decoy": j.Decoy,
++	}
++	if j.IsPool() {
++		out["pool"] = hx(j.Pool[:])
++		out["unit"] = j.Unit
++		out["canary"] = j.Canary != nil
++	}
++	if g := j.Game; g != nil {
++		out["game"] = map[string]interface{}{"stage": g.Stage, "phase": g.Phase, "lo": g.Lo, "size": g.Size,
++			"n": g.N, "leaf": g.Leaf, "block": g.Block, "elem": g.Elem, "pmoved": g.PMoved, "cmoved": g.CMoved,
++			"deadline": g.Deadline, "provroot": hx(g.ProvRoot[:]), "chalroot": hx(g.ChalRoot[:])}
++	}
++	var reqs []interface{}
++	for _, r := range j.DataReqs {
++		served := 0
++		for _, x := range r.Served {
++			if x {
++				served++
++			}
++		}
++		reqs = append(reqs, map[string]interface{}{"stage": r.Stage, "requester": hx(r.Requester[:]), "due": r.Due,
++			"served": served, "rows": len(r.Served)})
++	}
++	if reqs != nil {
++		out["datarequests"] = reqs
++	}
++	return out
++}
++
++func handleGetJob(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
++	c := cmd.(*btcjson.GetJobCmd)
++	id, err := parseHash(c.JobID)
++	if err != nil {
++		return nil, err
++	}
++	st, err := s.jobState()
++	if err != nil {
++		return nil, err
++	}
++	j := st.Jobs[id]
++	if j == nil {
++		return nil, &btcjson.RPCError{Code: btcjson.ErrRPCInvalidParameter, Message: "unknown job"}
++	}
++	return jobJSON(j), nil
++}
++
++func handleListJobs(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
++	c := cmd.(*btcjson.ListJobsCmd)
++	st, err := s.jobState()
++	if err != nil {
++		return nil, err
++	}
++	ids := make([]jobstate.Hash, 0, len(st.Jobs))
++	for id, j := range st.Jobs {
++		if c.Status == nil || j.Status.String() == *c.Status {
++			ids = append(ids, id)
++		}
++	}
++	sort.Slice(ids, func(a, b int) bool { return bytes.Compare(ids[a][:], ids[b][:]) < 0 })
++	out := map[string]interface{}{}
++	for _, id := range ids {
++		j := st.Jobs[id]
++		e := map[string]interface{}{"status": j.Status.String(), "provider": hx(j.Provider[:]), "client": hx(j.Client[:]),
++			"fee": j.Fee, "stages": j.Stages, "posted": j.PostHeight, "phaseend": j.PhaseEnd}
++		if j.IsPool() {
++			e["pool"], e["unit"] = hx(j.Pool[:]), j.Unit
++		}
++		out[hx(id[:])] = e
++	}
++	return out, nil
++}
++
++func handleGetJobAccount(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
++	c := cmd.(*btcjson.GetJobAccountCmd)
++	h, err := parseHash(c.Account)
++	if err != nil {
++		return nil, err
++	}
++	a := jobstate.AccountID(h)
++	st, err := s.jobState()
++	if err != nil {
++		return nil, err
++	}
++	var unb, wds []interface{}
++	for _, u := range st.Unbonding {
++		if u.Account == a {
++			unb = append(unb, map[string]interface{}{"amount": u.Amount, "due": u.Due})
++		}
++	}
++	for _, w := range st.Withdrawals {
++		if w.Account == a {
++			wds = append(wds, map[string]interface{}{"amount": w.Amount, "due": w.Due, "pkscript": hx(w.PkScript)})
++		}
++	}
++	return map[string]interface{}{"account": hx(a[:]), "balance": st.Accounts[a], "stake": st.Stakes[a],
++		"unbonding": unb, "withdrawals": wds}, nil
++}
++
++func handleGetCategory(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
++	c := cmd.(*btcjson.GetCategoryCmd)
++	id, err := parseHash(c.CategoryID)
++	if err != nil {
++		return nil, err
++	}
++	st, err := s.jobState()
++	if err != nil {
++		return nil, err
++	}
++	cat := st.Categories[id]
++	if cat == nil {
++		return nil, &btcjson.RPCError{Code: btcjson.ErrRPCInvalidParameter, Message: "unknown category"}
++	}
++	out := categorySummary(cat)
++	var inflight, done []uint32
++	for i, u := range cat.Units {
++		if u.Done {
++			done = append(done, i)
++		} else {
++			inflight = append(inflight, i)
++		}
++	}
++	sort.Slice(inflight, func(a, b int) bool { return inflight[a] < inflight[b] })
++	out["inflightunits"] = inflight
++	out["doneunits"] = len(done)
++	return out, nil
++}
+diff --git a/node/rpcserver.go b/node/rpcserver.go
+index 213cdb93..887a3bbf 100644
+--- a/node/rpcserver.go
++++ b/node/rpcserver.go
+@@ -1771,6 +1771,15 @@ func (state *gbtWorkState) blockTemplateResult(useCoinbaseValue bool, submitOld
+ 	if useCoinbaseValue {
+ 		reply.CoinbaseAux = gbtCoinbaseAux
+ 		reply.CoinbaseValue = &msgBlock.Transactions[0].TxOut[0].Value
++		// Any coinbase outputs besides the miner's and the witness commitment are the job
++		// module's (only Useful-Work Coin networks have them).
++		for _, out := range msgBlock.Transactions[0].TxOut[1:] {
++			if bytes.HasPrefix(out.PkScript, blockchain.WitnessMagicBytes) {
++				continue
++			}
++			reply.UWCCoinbaseOutputs = append(reply.UWCCoinbaseOutputs, btcjson.GetBlockTemplateResultOutput{
++				Value: out.Value, Script: hex.EncodeToString(out.PkScript)})
++		}
+ 	} else {
+ 		// Ensure the template has a valid payment address associated
+ 		// with it when a full coinbase is requested.
+diff --git a/node/rpcserverhelp.go b/node/rpcserverhelp.go
+index 58d2ff95..b9f822c9 100644
+--- a/node/rpcserverhelp.go
++++ b/node/rpcserverhelp.go
+@@ -335,6 +335,9 @@ var helpDescsEnUS = map[string]string{
+ 	"getblocktemplateresult-capabilities":               "List of server capabilities including 'proposal' to indicate support for block proposals",
+ 	"getblocktemplateresult-reject-reason":              "Reason the proposal was invalid as-is (only applies to proposal responses)",
+ 	"getblocktemplateresult-default_witness_commitment": "The witness commitment itself. Will be populated if the block has witness data",
++	"getblocktemplateresult-uwc_coinbase_outputs":       "Useful-Work Coin: coinbase outputs the job module requires (pool deposit, due withdrawals, job-state commitment), to add in order after the miner's output and before the witness commitment",
++	"getblocktemplateresultoutput-value":                "Value in grains",
++	"getblocktemplateresultoutput-script":               "Hex-encoded output script",
+ 	"getblocktemplateresult-requiredcertversion":        "Certificate version a block built on this template must carry at its height under the hardfork cutovers (1 before the MoE fork, 2 at and after it, 3 at and after the salted-seed fork)",
+ 
+ 	// GetBlockTemplateCmd help.
+diff --git a/node/wire/protocol.go b/node/wire/protocol.go
+index 8d66fa51..1b820158 100644
+--- a/node/wire/protocol.go
++++ b/node/wire/protocol.go
+@@ -149,17 +149,21 @@ const (
+ 
+ 	// SimNet represents the simulation test network.
+ 	SimNet PearlNet = 0x50524C53 // "PRLS" in ASCII
++
++	// UWCDevNet is the Useful-Work Coin development network: real proof of work, job module on.
++	UWCDevNet PearlNet = 0x55574344 // "UWCD" in ASCII
+ )
+ 
+ // netStrings is a map of networks back to their constant names for
+ // pretty printing.
+ var netStrings = map[PearlNet]string{
+-	MainNet:  "MainNet",
+-	RegTest:  "RegTest",
+-	TestNet:  "TestNet",
+-	TestNet2: "TestNet2",
+-	SigNet:   "SigNet",
+-	SimNet:   "SimNet",
++	MainNet:   "MainNet",
++	RegTest:   "RegTest",
++	TestNet:   "TestNet",
++	TestNet2:  "TestNet2",
++	SigNet:    "SigNet",
++	SimNet:    "SimNet",
++	UWCDevNet: "UWCDevNet",
+ }
+ 
+ // String returns the PearlNet in human-readable form.
+-- 
+2.30.2
+
