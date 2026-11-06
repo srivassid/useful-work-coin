@@ -10,7 +10,7 @@ clients is a later, separate decision.
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Real blocks: devnet params, `pearld` with proof verification, Ampere miner → Pearl gateway (zk proof) → node | **done** |
-| 2 | Job tooling: `uwcctl` deposits and job ops (Taproot-signed), council actions | next |
+| 2 | Job tooling: `uwcctl` deposits and job ops (Taproot-signed), council actions | **done** |
 | 3 | Provider, verifier and watcher daemons on the GPUs (deterministic runtime), client CLI with off-chain output delivery | – |
 | 4 | Testnet metrics page: useful share, λ per job type, verification overhead, false-slash rate, client price | – |
 | 5 | Public testnet: exposure, outside clients | needs a decision |
@@ -50,3 +50,24 @@ Lessons:
 - The gateway caches its template per height, so after a node restart it must be restarted too.
 - The genesis timestamp is the start of the day, so the first block's 9-hour gap eased the
   difficulty. It recovers with the 1-hour half-life.
+
+## Milestone 2: job tooling on the real chain (2026-11-06)
+
+- **`node/uwcclient`** (patch 0009), shared by `uwcctl` and the daemons to come:
+  - Taproot key-path keys;
+  - coins found through the node's address index, skipping immature coinbases and coins
+    already spent in the mempool (`gettxout` doesn't see mempool spends; `gettxspendingprevout`
+    does);
+  - transaction signing, and several job ops in one transaction (all inputs from one key, so
+    one actor);
+  - op references computed as the node computes them: sha256(txid ‖ output index).
+- **On the devnet:**
+  - The miner deposited 200 coins into its job-module account.
+  - The council members and the curator were funded with ordinary coins.
+  - Qwen3-1.7B registered (model `12abc45b…`): weights root `89af7bfb…` over 726,512 canonical
+    rows, computed in 4.3 min on CPU by `runtime/agent/model_info.py`; 7 layer groups of 4
+    layers; Hadamard block 512; up to 512 positions.
+  - The 2-of-3 council opened pool category `c951e9ad…`. Its work list
+    (`runtime/agent/worklist.py`) is 200 units, each 128 tokens of WikiText-2 test text with 7
+    stages, and it gets 60% of pool income. The proposal sat at one approval until the second
+    member approved; then the category opened and started collecting about 6 coins per block.

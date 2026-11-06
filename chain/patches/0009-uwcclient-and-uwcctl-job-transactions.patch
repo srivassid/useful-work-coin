@@ -1,0 +1,814 @@
+From e0e8694fed4112ab1133eef9067645499d4e6b6f Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 09:43:11 +0530
+Subject: [PATCH] uwcclient and uwcctl: Taproot-signed deposits, job ops and
+ council proposals against a pearld node (build step 7)
+
+node/uwcclient: keys, coin selection over the address index (skipping coins spent in the
+mempool and immature coinbases), signing, several ops per transaction, op references as the
+node computes them, job-state queries. cmd/uwcctl: send, deposit, stake, unstake, withdraw,
+modelreg, jobpost, propose-category/fe/retire, approve, fe-reveal, and queries.
+jobstate.TagHash is exported for ids.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/cmd/uwcctl/keys.go  |  69 --------
+ node/cmd/uwcctl/main.go  | 327 ++++++++++++++++++++++++++++++++++----
+ node/jobstate/apply.go   |   4 +
+ node/uwcclient/client.go | 334 +++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 632 insertions(+), 102 deletions(-)
+ delete mode 100644 node/cmd/uwcctl/keys.go
+ create mode 100644 node/uwcclient/client.go
+
+diff --git a/node/cmd/uwcctl/keys.go b/node/cmd/uwcctl/keys.go
+deleted file mode 100644
+index 93c2d1c3..00000000
+--- a/node/cmd/uwcctl/keys.go
++++ /dev/null
+@@ -1,69 +0,0 @@
+-package main
+-
+-import (
+-	"crypto/rand"
+-	"encoding/hex"
+-	"encoding/json"
+-	"fmt"
+-	"os"
+-
+-	"github.com/pearl-research-labs/pearl/node/btcec"
+-	"github.com/pearl-research-labs/pearl/node/btcutil"
+-	"github.com/pearl-research-labs/pearl/node/chaincfg"
+-	"github.com/pearl-research-labs/pearl/node/jobstate"
+-	"github.com/pearl-research-labs/pearl/node/txscript"
+-)
+-
+-// key is a Taproot key-path key: its P2TR output script controls one job-module account.
+-type key struct {
+-	Priv    *btcec.PrivateKey
+-	Script  []byte
+-	Account jobstate.AccountID
+-}
+-
+-type keyFile struct {
+-	Priv string `json:"priv"`
+-}
+-
+-func keyFromPriv(b []byte) *key {
+-	priv, _ := btcec.PrivKeyFromBytes(b)
+-	script, _ := txscript.PayToTaprootScript(txscript.ComputeTaprootKeyNoScript(priv.PubKey()))
+-	return &key{Priv: priv, Script: script, Account: jobstate.AccountForScript(script)}
+-}
+-
+-func newKey() *key {
+-	var b [32]byte
+-	if _, err := rand.Read(b[:]); err != nil {
+-		panic(err)
+-	}
+-	return keyFromPriv(b[:])
+-}
+-
+-func loadKey(path string) (*key, error) {
+-	raw, err := os.ReadFile(path)
+-	if err != nil {
+-		return nil, err
+-	}
+-	var kf keyFile
+-	if err := json.Unmarshal(raw, &kf); err != nil {
+-		return nil, fmt.Errorf("%s: %w", path, err)
+-	}
+-	b, err := hex.DecodeString(kf.Priv)
+-	if err != nil || len(b) != 32 {
+-		return nil, fmt.Errorf("%s: bad private key", path)
+-	}
+-	return keyFromPriv(b), nil
+-}
+-
+-func (k *key) save(path string) error {
+-	raw, _ := json.Marshal(keyFile{Priv: hex.EncodeToString(k.Priv.Serialize())})
+-	return os.WriteFile(path, raw, 0o600)
+-}
+-
+-func (k *key) address(p *chaincfg.Params) string {
+-	a, err := btcutil.NewAddressTaproot(k.Script[2:], p)
+-	if err != nil {
+-		return "?"
+-	}
+-	return a.EncodeAddress()
+-}
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index 47170247..8e8ce582 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -1,62 +1,323 @@
+-// Command uwcctl manages Useful-Work Coin keys and job-module transactions: deposits, job
+-// operations and job-state queries against a pearld node.
++// Command uwcctl manages Useful-Work Coin keys and job-module transactions (deposits, stakes,
++// models, jobs, council proposals) and queries job state from a pearld node.
++//
++// RPC connection from the environment: UWC_RPC (host:port, default 127.0.0.1:18671),
++// UWC_RPC_USER, UWC_RPC_PASS. Amounts are in grains.
+ package main
+ 
+ import (
+ 	"encoding/hex"
++	"encoding/json"
+ 	"fmt"
+ 	"os"
++	"strconv"
+ 
++	"github.com/pearl-research-labs/pearl/node/btcutil"
+ 	"github.com/pearl-research-labs/pearl/node/chaincfg"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/txscript"
++	"github.com/pearl-research-labs/pearl/node/uwcclient"
++	"github.com/pearl-research-labs/pearl/node/wire"
+ )
+ 
+-func usage() {
+-	fmt.Fprintln(os.Stderr, `usage: uwcctl <command> [args]
++const help = `usage: uwcctl <command> [args]
+ 
+-  keygen <file>          new key (Taproot key path); prints its account and address
+-  info <keyfile>         account, P2TR script and address of a key`)
+-	os.Exit(2)
+-}
++keys
++  keygen <file>                       new key; prints its account and address
++  info <key>                          account, P2TR script and address
++
++money
++  coins <key>                         spendable outputs of the key
++  send <key> <amount> <to>            pay a P2TR output; <to> is a key file, address or script hex
++  deposit <key> <amount> [account]    credit a module account (default: the key's own)
++  stake <key> <amount>                verifier stake
++  unstake <key> <amount>
++  withdraw <key> <amount>             back to the key's own P2TR script (paid by a later coinbase)
++
++jobs
++  modelreg <key> <model.json>         register a model (weights_root, runtime_hash, layer_groups, block, cfg)
++  jobpost <key> <model> <input_root> <stages> <fee> <deadline_blocks> <k> <n> <seq_len>
++
++council (actions are proposed by one member and approved by others)
++  propose-category <key> <category.json>
++  propose-fe <key> <commitment> <reserve>
++  propose-retire <key> <category>
++  approve <key> <proposal>
++  fe-reveal <key> <fecommit> <salt> <record_hex>
++
++queries
++  state | jobs [status] | job <id> | account <account|key> | category <id>`
+ 
+ var netParams = &chaincfg.UWCDevNetParams
+ 
++func die(err error) {
++	fmt.Fprintln(os.Stderr, "uwcctl:", err)
++	os.Exit(1)
++}
++
++func need(args []string, n int) {
++	if len(args) < n {
++		fmt.Fprintln(os.Stderr, help)
++		os.Exit(2)
++	}
++}
++
++func client() *uwcclient.Client {
++	host := os.Getenv("UWC_RPC")
++	if host == "" {
++		host = "127.0.0.1:18671"
++	}
++	c, err := uwcclient.Dial(host, os.Getenv("UWC_RPC_USER"), os.Getenv("UWC_RPC_PASS"), netParams)
++	if err != nil {
++		die(err)
++	}
++	return c
++}
++
++func key(path string) *uwcclient.Key {
++	k, err := uwcclient.LoadKey(path)
++	if err != nil {
++		die(err)
++	}
++	return k
++}
++
++func amount(s string) int64 {
++	v, err := strconv.ParseInt(s, 10, 64)
++	if err != nil || v < 0 {
++		die(fmt.Errorf("bad amount %q", s))
++	}
++	return v
++}
++
++func hash32(s string) jobstate.Hash {
++	var h jobstate.Hash
++	b, err := hex.DecodeString(s)
++	if err != nil || len(b) != 32 {
++		die(fmt.Errorf("expected 32 hex bytes: %q", s))
++	}
++	copy(h[:], b)
++	return h
++}
++
++func printJSON(v interface{}) {
++	b, _ := json.MarshalIndent(v, "", "  ")
++	fmt.Println(string(b))
++}
++
++func hx(b []byte) string { return hex.EncodeToString(b) }
++
++// submit sends ops (and deposits) from key and prints the txid and each op's reference.
++func submit(k *uwcclient.Key, deps []jobstate.Deposit, ops ...*jobstate.Op) {
++	h, refs, err := client().SubmitOps(k, deps, ops...)
++	if err != nil {
++		die(err)
++	}
++	out := map[string]interface{}{"txid": h.String()}
++	var rs []string
++	for i, r := range refs {
++		rs = append(rs, hx(r[:]))
++		switch ops[i].Kind {
++		case jobstate.OpJobPost, jobstate.OpPoolClaim:
++			id := jobstate.TagHash("job", r[:])
++			out["job"] = hx(id[:])
++		case jobstate.OpModelReg:
++			id := jobstate.TagHash("model", r[:])
++			out["model"] = hx(id[:])
++		case jobstate.OpPropose:
++			id := jobstate.TagHash("proposal", r[:])
++			out["proposal"] = hx(id[:])
++		}
++	}
++	if rs != nil {
++		out["refs"] = rs
++	}
++	printJSON(out)
++}
++
++// propose wraps a council action in PROPOSE.
++func propose(k *uwcclient.Key, action *jobstate.Op) {
++	submit(k, nil, &jobstate.Op{Kind: jobstate.OpPropose, Data: action.Encode()})
++}
++
+ func main() {
+ 	if len(os.Args) < 2 {
+-		usage()
++		fmt.Fprintln(os.Stderr, help)
++		os.Exit(2)
+ 	}
+-	args := os.Args[2:]
+-	var err error
+-	switch os.Args[1] {
++	cmd, args := os.Args[1], os.Args[2:]
++	switch cmd {
+ 	case "keygen":
+-		if len(args) != 1 {
+-			usage()
+-		}
++		need(args, 1)
+ 		if _, e := os.Stat(args[0]); e == nil {
+-			err = fmt.Errorf("%s exists", args[0])
+-			break
++			die(fmt.Errorf("%s exists", args[0]))
+ 		}
+-		k := newKey()
+-		if err = k.save(args[0]); err == nil {
+-			printKey(k)
++		k := uwcclient.NewKey()
++		if err := k.Save(args[0]); err != nil {
++			die(err)
+ 		}
++		printKey(k)
+ 	case "info":
+-		if len(args) != 1 {
+-			usage()
++		need(args, 1)
++		printKey(key(args[0]))
++	case "coins":
++		need(args, 1)
++		coins, err := client().Coins(key(args[0]))
++		if err != nil {
++			die(err)
++		}
++		total := int64(0)
++		var list []string
++		for _, c := range coins {
++			total += c.Value
++			list = append(list, fmt.Sprintf("%s:%d %d", c.Out.Hash, c.Out.Index, c.Value))
++		}
++		printJSON(map[string]interface{}{"total": total, "coins": list})
++	case "send":
++		need(args, 3)
++		to := args[2]
++		var script []byte
++		if _, e := os.Stat(to); e == nil {
++			script = key(to).Script
++		} else if a, err := btcutil.DecodeAddress(to, netParams); err == nil {
++			script, _ = txscript.PayToAddrScript(a)
++		} else if b, err := hex.DecodeString(to); err == nil && jobstate.ValidPayoutScript(b) {
++			script = b
++		} else {
++			die(fmt.Errorf("bad destination %q", to))
++		}
++		h, err := client().Send(key(args[0]), []*wire.TxOut{wire.NewTxOut(amount(args[1]), script)})
++		if err != nil {
++			die(err)
++		}
++		printJSON(map[string]string{"txid": h.String()})
++	case "deposit":
++		need(args, 2)
++		k := key(args[0])
++		to := k.Account
++		if len(args) > 2 {
++			to = jobstate.AccountID(hash32(args[2]))
+ 		}
+-		var k *key
+-		if k, err = loadKey(args[0]); err == nil {
+-			printKey(k)
++		submit(k, []jobstate.Deposit{{Account: to, Amount: amount(args[1])}})
++	case "stake", "unstake":
++		need(args, 2)
++		kind := jobstate.OpStake
++		if cmd == "unstake" {
++			kind = jobstate.OpUnstake
+ 		}
++		submit(key(args[0]), nil, &jobstate.Op{Kind: kind, Amount: amount(args[1])})
++	case "withdraw":
++		need(args, 2)
++		k := key(args[0])
++		submit(k, nil, &jobstate.Op{Kind: jobstate.OpWithdraw, Amount: amount(args[1]), PkScript: k.Script})
++	case "modelreg":
++		need(args, 2)
++		var m struct {
++			WeightsRoot string            `json:"weights_root"`
++			RuntimeHash string            `json:"runtime_hash"`
++			LayerGroups uint32            `json:"layer_groups"`
++			Block       uint32            `json:"rotation_block"`
++			Cfg         jobstate.ModelCfg `json:"cfg"`
++		}
++		raw, err := os.ReadFile(args[1])
++		if err != nil {
++			die(err)
++		}
++		if err := json.Unmarshal(raw, &m); err != nil {
++			die(err)
++		}
++		submit(key(args[0]), nil, &jobstate.Op{Kind: jobstate.OpModelReg, H1: hash32(m.WeightsRoot), H2: hash32(m.RuntimeHash),
++			U1: m.LayerGroups, U2: m.Block, Cfg: m.Cfg})
++	case "jobpost":
++		need(args, 9)
++		c := client()
++		var h int64
++		if err := c.Query("getblockcount", &h); err != nil {
++			die(err)
++		}
++		k, n := amount(args[6]), amount(args[7])
++		submit(key(args[0]), nil, &jobstate.Op{Kind: jobstate.OpJobPost, Model: hash32(args[1]), H1: hash32(args[2]),
++			U1: uint32(amount(args[3])), Amount: amount(args[4]), Deadline: int32(h + amount(args[5]) + 1),
++			K: uint8(k), N: uint8(n), U2: uint32(amount(args[8]))})
++	case "propose-category":
++		need(args, 2)
++		var sp struct {
++			Model, WorkRoot, Curator, CanaryRoot       string
++			Units, StagesPerUnit, SeqLen, CanaryLeaves uint32
++			K, N                                       uint8
++			UnitDeadline                               int32
++			CapBP, InitPrice, Grant                    int64
++		}
++		raw, err := os.ReadFile(args[1])
++		if err != nil {
++			die(err)
++		}
++		if err := json.Unmarshal(raw, &sp); err != nil {
++			die(err)
++		}
++		cs := jobstate.CategorySpec{Model: hash32(sp.Model), WorkRoot: hash32(sp.WorkRoot), Units: sp.Units,
++			StagesPerUnit: sp.StagesPerUnit, SeqLen: sp.SeqLen, K: sp.K, N: sp.N, UnitDeadline: sp.UnitDeadline,
++			CapBP: sp.CapBP, InitPrice: sp.InitPrice, Grant: sp.Grant, Curator: jobstate.AccountID(hash32(sp.Curator)),
++			CanaryLeaves: sp.CanaryLeaves}
++		if sp.CanaryRoot != "" {
++			cs.CanaryRoot = hash32(sp.CanaryRoot)
++		}
++		propose(key(args[0]), &jobstate.Op{Kind: jobstate.OpPoolCategory, Cat: cs})
++	case "propose-fe":
++		need(args, 3)
++		propose(key(args[0]), &jobstate.Op{Kind: jobstate.OpFECommit, H1: hash32(args[1]), Amount: amount(args[2])})
++	case "propose-retire":
++		need(args, 2)
++		propose(key(args[0]), &jobstate.Op{Kind: jobstate.OpPoolRetire, Job: hash32(args[1])})
++	case "approve":
++		need(args, 2)
++		submit(key(args[0]), nil, &jobstate.Op{Kind: jobstate.OpApprove, Job: hash32(args[1])})
++	case "fe-reveal":
++		need(args, 4)
++		rec, err := hex.DecodeString(args[3])
++		if err != nil {
++			die(err)
++		}
++		submit(key(args[0]), nil, &jobstate.Op{Kind: jobstate.OpFEReveal, Job: hash32(args[1]), H1: hash32(args[2]), Data: rec})
++	case "state", "jobs", "job", "account", "category":
++		c := client()
++		var out interface{}
++		var err error
++		switch cmd {
++		case "state":
++			err = c.Query("getjobstate", &out)
++		case "jobs":
++			if len(args) > 0 {
++				err = c.Query("listjobs", &out, args[0])
++			} else {
++				err = c.Query("listjobs", &out)
++			}
++		case "job":
++			need(args, 1)
++			err = c.Query("getjob", &out, args[0])
++		case "account":
++			need(args, 1)
++			a := args[0]
++			if _, e := os.Stat(a); e == nil {
++				k := key(a)
++				a = hx(k.Account[:])
++			}
++			err = c.Query("getjobaccount", &out, a)
++		case "category":
++			need(args, 1)
++			err = c.Query("getcategory", &out, args[0])
++		}
++		if err != nil {
++			die(err)
++		}
++		printJSON(out)
+ 	default:
+-		usage()
+-	}
+-	if err != nil {
+-		fmt.Fprintln(os.Stderr, "uwcctl:", err)
+-		os.Exit(1)
++		fmt.Fprintln(os.Stderr, help)
++		os.Exit(2)
+ 	}
+ }
+ 
+-func printKey(k *key) {
+-	fmt.Printf("account %s\nscript  %s\naddress %s\n", hex.EncodeToString(k.Account[:]),
+-		hex.EncodeToString(k.Script), k.address(netParams))
++func printKey(k *uwcclient.Key) {
++	a, _ := k.Address(netParams)
++	fmt.Printf("account %s\nscript  %s\naddress %s\n", hx(k.Account[:]), hx(k.Script), a.EncodeAddress())
+ }
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+index b35c6313..7129b41d 100644
+--- a/node/jobstate/apply.go
++++ b/node/jobstate/apply.go
+@@ -733,3 +733,7 @@ func (s *State) advanceProviderReveal(p Params, h int32, j *Job) {
+ 		}
+ 	}
+ }
++
++// TagHash is sha256(tag || parts...): job ids are TagHash("job", ref), model ids
++// TagHash("model", ref), proposal ids TagHash("proposal", ref), and so on.
++func TagHash(tag string, parts ...[]byte) Hash { return tagHash(tag, parts...) }
+diff --git a/node/uwcclient/client.go b/node/uwcclient/client.go
+new file mode 100644
+index 00000000..70f5e451
+--- /dev/null
++++ b/node/uwcclient/client.go
+@@ -0,0 +1,334 @@
++// Package uwcclient builds, signs and submits Useful-Work Coin job-module transactions
++// (deposits and job operations) and reads job state from a pearld node. It is shared by
++// uwcctl and the provider, verifier and watcher daemons.
++package uwcclient
++
++import (
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"sort"
++	"sync"
++
++	"github.com/pearl-research-labs/pearl/node/blockchain"
++	"github.com/pearl-research-labs/pearl/node/btcec"
++	"github.com/pearl-research-labs/pearl/node/btcjson"
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg"
++	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/rpcclient"
++	"github.com/pearl-research-labs/pearl/node/txscript"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++// ---------------------------------------------------------------- keys
++
++// Key is a Taproot key-path key; its P2TR script controls one job-module account.
++type Key struct {
++	Priv    *btcec.PrivateKey
++	Script  []byte
++	Account jobstate.AccountID
++}
++
++type keyFile struct {
++	Priv string `json:"priv"`
++}
++
++func KeyFromPriv(b []byte) *Key {
++	priv, _ := btcec.PrivKeyFromBytes(b)
++	script, _ := txscript.PayToTaprootScript(txscript.ComputeTaprootKeyNoScript(priv.PubKey()))
++	return &Key{Priv: priv, Script: script, Account: jobstate.AccountForScript(script)}
++}
++
++func NewKey() *Key {
++	var b [32]byte
++	if _, err := rand.Read(b[:]); err != nil {
++		panic(err)
++	}
++	return KeyFromPriv(b[:])
++}
++
++func LoadKey(path string) (*Key, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	var kf keyFile
++	if err := json.Unmarshal(raw, &kf); err != nil {
++		return nil, fmt.Errorf("%s: %w", path, err)
++	}
++	b, err := hex.DecodeString(kf.Priv)
++	if err != nil || len(b) != 32 {
++		return nil, fmt.Errorf("%s: bad private key", path)
++	}
++	return KeyFromPriv(b), nil
++}
++
++func (k *Key) Save(path string) error {
++	raw, _ := json.Marshal(keyFile{Priv: hex.EncodeToString(k.Priv.Serialize())})
++	return os.WriteFile(path, raw, 0o600)
++}
++
++func (k *Key) Address(p *chaincfg.Params) (btcutil.Address, error) {
++	return btcutil.NewAddressTaproot(k.Script[2:], p)
++}
++
++// ---------------------------------------------------------------- client
++
++// Client talks to one pearld over JSON-RPC (HTTP POST).
++type Client struct {
++	RPC    *rpcclient.Client
++	Params *chaincfg.Params
++	// FeePerVByte is the fee rate in grains per virtual byte.
++	FeePerVByte int64
++
++	mu      sync.Mutex
++	pending map[wire.OutPoint]bool // spent by our own transactions not yet seen by the node
++}
++
++func Dial(host, user, pass string, p *chaincfg.Params) (*Client, error) {
++	c, err := rpcclient.New(&rpcclient.ConnConfig{Host: host, User: user, Pass: pass, HTTPPostMode: true,
++		DisableTLS: true}, nil)
++	if err != nil {
++		return nil, err
++	}
++	return &Client{RPC: c, Params: p, FeePerVByte: 5, pending: map[wire.OutPoint]bool{}}, nil
++}
++
++// Coin is a spendable output of a key.
++type Coin struct {
++	Out   wire.OutPoint
++	Value int64
++}
++
++// Coins returns the key's unspent outputs (mempool included), skipping immature coinbases.
++func (c *Client) Coins(k *Key) ([]Coin, error) {
++	addr, err := k.Address(c.Params)
++	if err != nil {
++		return nil, err
++	}
++	var txs []*rawTx
++	for skip := 0; ; skip += 100 {
++		page, err := c.searchRaw(addr, skip, 100)
++		if err != nil {
++			return nil, err
++		}
++		txs = append(txs, page...)
++		if len(page) < 100 {
++			break
++		}
++	}
++	scriptHex := hex.EncodeToString(k.Script)
++	var coins []Coin
++	seen := map[wire.OutPoint]bool{}
++	for _, t := range txs {
++		h, err := chainhash.NewHashFromStr(t.Txid)
++		if err != nil {
++			continue
++		}
++		for _, v := range t.Vout {
++			if v.ScriptPubKey.Hex != scriptHex {
++				continue
++			}
++			op := wire.OutPoint{Hash: *h, Index: v.N}
++			if seen[op] {
++				continue
++			}
++			seen[op] = true
++			c.mu.Lock()
++			spent := c.pending[op]
++			c.mu.Unlock()
++			if spent {
++				continue
++			}
++			res, err := c.RPC.GetTxOut(h, v.N, true)
++			if err != nil || res == nil {
++				continue // spent (or unknown)
++			}
++			if res.Coinbase && res.Confirmations < int64(c.Params.CoinbaseMaturity) {
++				continue
++			}
++			amt, err := btcutil.NewAmount(res.Value)
++			if err != nil {
++				continue
++			}
++			coins = append(coins, Coin{Out: op, Value: int64(amt)})
++		}
++	}
++	// gettxout does not see spends by mempool transactions; drop those coins
++	if len(coins) > 0 {
++		ops := make([]wire.OutPoint, len(coins))
++		for i, cn := range coins {
++			ops[i] = cn.Out
++		}
++		res, err := c.RPC.GetTxSpendingPrevOut(ops)
++		if err != nil {
++			return nil, err
++		}
++		spent := map[wire.OutPoint]bool{}
++		for i, r := range res {
++			if r.SpendingTxid != "" {
++				spent[ops[i]] = true
++			}
++		}
++		kept := coins[:0]
++		for _, cn := range coins {
++			if !spent[cn.Out] {
++				kept = append(kept, cn)
++			}
++		}
++		coins = kept
++	}
++	sort.Slice(coins, func(a, b int) bool { return coins[a].Value > coins[b].Value })
++	return coins, nil
++}
++
++type rawTx struct {
++	Txid string `json:"txid"`
++	Vout []struct {
++		N            uint32 `json:"n"`
++		ScriptPubKey struct {
++			Hex string `json:"hex"`
++		} `json:"scriptPubKey"`
++	} `json:"vout"`
++}
++
++func (c *Client) searchRaw(addr btcutil.Address, skip, count int) ([]*rawTx, error) {
++	params := []interface{}{addr.EncodeAddress(), 1, skip, count, 0, false}
++	var raw []json.RawMessage
++	for _, p := range params {
++		b, _ := json.Marshal(p)
++		raw = append(raw, b)
++	}
++	res, err := c.RPC.RawRequest("searchrawtransactions", raw)
++	if err != nil {
++		// no transactions for this address yet
++		if e, ok := err.(*btcjson.RPCError); ok && e.Code == btcjson.ErrRPCNoTxInfo {
++			return nil, nil
++		}
++		return nil, err
++	}
++	var out []*rawTx
++	if err := json.Unmarshal(res, &out); err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++// Send spends the key's coins into outs plus change back to the key, signs and broadcasts.
++// Every input is the key's, so the transaction's job operations act for the key's account.
++func (c *Client) Send(k *Key, outs []*wire.TxOut) (*chainhash.Hash, error) {
++	coins, err := c.Coins(k)
++	if err != nil {
++		return nil, err
++	}
++	need := int64(0)
++	for _, o := range outs {
++		need += o.Value
++	}
++	tx := wire.NewMsgTx(2)
++	prev := map[wire.OutPoint]*wire.TxOut{}
++	have := int64(0)
++	for _, o := range outs {
++		tx.AddTxOut(o)
++	}
++	change := wire.NewTxOut(0, k.Script)
++	tx.AddTxOut(change)
++	for _, cn := range coins {
++		tx.AddTxIn(&wire.TxIn{PreviousOutPoint: cn.Out, Sequence: wire.MaxTxInSequenceNum})
++		prev[cn.Out] = &wire.TxOut{Value: cn.Value, PkScript: k.Script}
++		have += cn.Value
++		if have >= need+c.fee(tx) {
++			break
++		}
++	}
++	fee := c.fee(tx)
++	if have < need+fee {
++		return nil, fmt.Errorf("insufficient funds: have %d, need %d + fee %d", have, need, fee)
++	}
++	change.Value = have - need - fee
++	if change.Value < 1000 { // dust: give it to the fee
++		tx.TxOut = tx.TxOut[:len(tx.TxOut)-1]
++	}
++	fetcher := txscript.NewMultiPrevOutFetcher(prev)
++	sh := txscript.NewTxSigHashes(tx, fetcher)
++	for i, in := range tx.TxIn {
++		p := prev[in.PreviousOutPoint]
++		wit, err := txscript.TaprootWitnessSignature(tx, sh, i, p.Value, p.PkScript, txscript.SigHashDefault, k.Priv)
++		if err != nil {
++			return nil, err
++		}
++		in.SetWitness(wit)
++	}
++	h, err := c.RPC.SendRawTransaction(tx, false)
++	if err != nil {
++		return nil, err
++	}
++	c.mu.Lock()
++	for _, in := range tx.TxIn {
++		c.pending[in.PreviousOutPoint] = true
++	}
++	c.mu.Unlock()
++	return h, nil
++}
++
++// fee estimates the fee of tx once each input carries a 64-byte Schnorr signature.
++func (c *Client) fee(tx *wire.MsgTx) int64 {
++	base := int64(tx.SerializeSizeStripped())
++	wit := int64(len(tx.TxIn)) * (1 + 1 + 64) // stack count, push, signature
++	if wit > 0 {
++		wit += 2 // segwit marker and flag
++	}
++	vsize := base + (wit+3)/4
++	return max(vsize*c.FeePerVByte, 1000)
++}
++
++// OpRef is the reference the node gives the op in output index i of tx: sha256(txid || i).
++func OpRef(txid *chainhash.Hash, i uint32) jobstate.Hash {
++	var ref [36]byte
++	copy(ref[:32], txid[:])
++	ref[32], ref[33], ref[34], ref[35] = byte(i), byte(i>>8), byte(i>>16), byte(i>>24)
++	return jobstate.Hash(chainhash.HashH(ref[:]))
++}
++
++// SubmitOps sends one transaction carrying the ops (in order) and the deposits. It returns the
++// txid and each op's reference (job ids are tagHash("job", ref), model ids tagHash("model", ref)).
++func (c *Client) SubmitOps(k *Key, deposits []jobstate.Deposit, ops ...*jobstate.Op) (*chainhash.Hash, []jobstate.Hash, error) {
++	var outs []*wire.TxOut
++	for _, o := range ops {
++		s, err := blockchain.JobOpScript(o.Encode())
++		if err != nil {
++			return nil, nil, err
++		}
++		outs = append(outs, wire.NewTxOut(0, s))
++	}
++	for _, d := range deposits {
++		outs = append(outs, wire.NewTxOut(d.Amount, blockchain.JobDepositScript(d.Account)))
++	}
++	h, err := c.Send(k, outs)
++	if err != nil {
++		return nil, nil, err
++	}
++	refs := make([]jobstate.Hash, len(ops))
++	for i := range ops {
++		refs[i] = OpRef(h, uint32(i))
++	}
++	return h, refs, nil
++}
++
++// Query calls one of the job-state RPCs and decodes the result into out.
++func (c *Client) Query(method string, out interface{}, args ...interface{}) error {
++	var raw []json.RawMessage
++	for _, a := range args {
++		b, _ := json.Marshal(a)
++		raw = append(raw, b)
++	}
++	res, err := c.RPC.RawRequest(method, raw)
++	if err != nil {
++		return err
++	}
++	return json.Unmarshal(res, out)
++}
+-- 
+2.30.2
+
