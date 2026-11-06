@@ -54,6 +54,7 @@ def main() -> None:
     ap.add_argument("--devnet", default=DEVNET)
     ap.add_argument("--window", type=int, default=60, help="blocks for difficulty and block time")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--extra", nargs="*", default=[], help="other boxes' devnet dirs (agent states, miner logs) copied here")
     a = ap.parse_args()
     chain = Chain(a.devnet)
     s = chain.state()
@@ -75,10 +76,13 @@ def main() -> None:
     hashed_total = hash_macs_per_block * h  # approximate: the current difficulty for every block
 
     # agents' own records
+    dirs = [a.devnet] + a.extra
+
     def states(role):
         out = {}
-        for f in glob.glob(os.path.join(a.devnet, "agent", f"{role}-*.json")):
-            out.update(json.load(open(f)).get("jobs", {}))
+        for d in dirs:
+            for f in glob.glob(os.path.join(d, "agent", f"{role}-*.json")):
+                out.update(json.load(open(f)).get("jobs", {}))
         return out
     prov, ver = states("provider"), states("verifier")
     decoys = states("decoy")
@@ -90,10 +94,22 @@ def main() -> None:
 
     # noise rates from the miners
     rates = {}
-    for f in glob.glob(os.path.join(a.devnet, "logs", "noise-gpu*.jsonl")):
-        recs = [json.loads(l) for l in open(f) if l.strip()][-20:]
-        if recs:
-            rates[os.path.basename(f)] = (recs[-1]["device"], statistics.median(r["macs_per_s"] for r in recs))
+    for d in dirs:
+        for f in glob.glob(os.path.join(d, "logs", "noise-gpu*.jsonl")):
+            recs = [json.loads(l) for l in open(f) if l.strip()][-20:]
+            if recs:
+                rates[os.path.basename(d.rstrip("/")) + ":" + os.path.basename(f)] = (
+                    recs[-1]["device"], statistics.median(r["macs_per_s"] for r in recs))
+    by_device: dict[str, list[float]] = {}
+    for dev, r in rates.values():
+        by_device.setdefault(dev, []).append(r)
+    # live lambda: hashed MACs per second of a mining provider's job over its GPU class's noise rate
+    live = []
+    for jid, p in prov.items():
+        if p.get("hashed_macs") and p.get("computed") and p.get("gpu"):
+            noise = statistics.median(by_device.get(p["gpu"], [0])) or None
+            if noise:
+                live.append(p["hashed_macs"] / p["computed"] / noise)
 
     # client price against renting the same GPU at its mining income
     reward = 100 * GRAIN * (1 - 0.10)  # miner's share of the subsidy (approximately the current subsidy)
@@ -116,6 +132,8 @@ def main() -> None:
         "useful_share": useful_macs / hashed_total if hashed_total else 0,
         "useful_share_note": f"{settled_stages} settled stages x {per_stage/1e9:.0f} GMAC vs {hashed_total/1e18:.1f} EMAC hashed",
         "noise_TMACs_by_gpu": {k: [d, round(r / 1e12, 1)] for k, (d, r) in rates.items()},
+        "lambda_live_median": statistics.median(live) if live else None,
+        "lambda_live_jobs": len(live),
         "verification_overhead_median": statistics.median(overhead) if overhead else None,
         "verification_overhead_jobs": len(overhead),
         "false_slashes": len(false_slash),

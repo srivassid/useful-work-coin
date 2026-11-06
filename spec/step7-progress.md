@@ -156,6 +156,58 @@ The Python protocol helpers match Go (`TestAgentVectors`).
 | Useful share | 3.8 × 10⁻⁷ | tiny jobs; providers don't mine during jobs yet |
 | Network | 340 TMAC/s, 44.8 s blocks | 3080s at 61–66 TMAC/s each when not shared with agents |
 
+## A third box and providers that mine (2026-11-06)
+
+**Node C** on 192.168.29.245 (wired; the same host is 192.168.29.13 on Wi-Fi): 2× RTX 3080 Ti
+12 GB and 3× RTX 3080 (10 and 20 GB). It runs a node, a gateway, noise miners on three 3080s and
+one 3080 Ti, and a second provider (`provider245`) that mines while serving. The environment was
+copied from box 71 (uv Python, venv, Qwen3-1.7B, weights store).
+
+**A fresh node could not sync the devnet.** Node C, validating from genesis with the current
+binary, rejected block 99: "coinbase must commit job-state root". It then banned node A. Job-module
+rules were changed three times on the running chain (the challenge window 1440 → 60 → 20, and
+the pool bond basis), without activation heights. Nodes A and B applied each change from the
+block they restarted at, so they agree with each other, but the history isn't valid under any
+single rule set.
+- Node C was bootstrapped from node A's data directory (node A stopped briefly; node B kept the chain).
+- Rule for the testnet: start from a fresh genesis with final rules. Any later change to job-module
+  rules gets an activation height, as Pearl does for its own forks (`MoEForkHeight`,
+  `SaltedSeedForkHeight`).
+
+**Mining while serving** (`agent/mining.py`, provider `--mine`):
+- Every int8 GEMM of a job runs Pearl's noisy GEMM under the gateway's current block key; layers
+  are re-keyed when the template changes.
+- Winning tiles are proven, verified locally and submitted like a miner's.
+- Hashed MACs are counted per job, so λ is measured live.
+- The reference runtime is not modified (its hash is registered on chain); the agent wraps it.
+- **Bit-exact:** pool unit 0 computed with mining on, on a 3080 Ti, gives exactly the roots the
+  3080 provider committed without mining.
+- **Live λ of the reference runtime is about 1×10⁻⁴.** It hashed 180 GMAC in 25 s (0.007 TMAC/s)
+  against about 65 TMAC/s of noise mining. Step 1's fast fused path reached 0.37–0.49. Emulated
+  float ops and per-row hashing dominate, so production providers need a fast runtime with the
+  same op order (the step-2 caveat, now measured on live jobs).
+
+**State at block 324 (three boxes):**
+- 24 jobs settled (196 stages); 12 pool units paid; 8 noise miners at 304 TMAC/s.
+- **Two providers in the open race:** box 71's 3080, and the mining provider on .245's 3080 Ti
+  (about 24 s per unit).
+- **First canary:** the curator revealed canary unit 7; all 7 stages were opened and matched the
+  expected roots, with no dispute.
+- **First caught decoy:** the committee sampled stages 0, 2 and 4 of decoy `606731b3`. The honest
+  watcher checked stage 3, the wrong one; the game opened and the decoy (which never defends)
+  failed. Three other decoys went unsampled (missed). Jackpots are paid when the decoy runner
+  reveals the record after its last decoy ends.
+
+**Metrics (`agent/metrics.py --extra` with agent states from all boxes; page updated):**
+
+| Metric | Value |
+|---|---|
+| live λ (reference runtime, 3 mining jobs) | 1.6 × 10⁻⁴ |
+| verification overhead | 1.8× provider compute (29 jobs) |
+| client price vs renting | 0.89× (4 client jobs) |
+| false slashes | 4, all operational, the last before the agent fixes |
+| useful share | 9.5 × 10⁻⁷ |
+
 ## Where to resume (2026-11-06, end of session)
 
 The devnet keeps running on its own: nodes, gateways, miners (box 71 GPUs 0 and 2, the 5090),

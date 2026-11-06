@@ -35,7 +35,7 @@
 <div class="uw">
   <header>
     <h1 id="title">UWC devnet</h1>
-    <p class="lede">The full job flow runs on a private two-node network with real cuPOW blocks, mined by RTX 3080s and an RTX 5090. Snapshot at block <b data-draw="height" data-source="headline" data-field="height" data-row="0">—</b>: <b data-draw="settled2" data-source="headline" data-field="settled_jobs" data-row="0">—</b> jobs settled, and every one of the <b data-draw="failed2" data-source="headline" data-field="failed_jobs" data-row="0">—</b> failures was an honest provider slashed for an operational fault in the agent or the node restarts, not a consensus error.</p>
+    <p class="lede">The full job flow runs on a private three-node network with real cuPOW blocks, mined by RTX 3080s, 3080 Tis and an RTX 5090. Snapshot at block <b data-draw="height" data-source="headline" data-field="height" data-row="0">—</b>: <b data-draw="settled2" data-source="headline" data-field="settled_jobs" data-row="0">—</b> jobs settled. The <b data-draw="false2" data-source="headline" data-field="false_slashes" data-row="0">—</b> honest providers slashed all lost to operational faults in the agent or in node restarts, not to a consensus error; the other failures are decoys that were caught.</p>
   </header>
 
   <section class="tiles" aria-label="Testnet metrics">
@@ -58,6 +58,11 @@
       <span class="label">Client price vs renting</span>
       <span class="big" data-draw="price" data-source="headline" data-field="client_price_vs_rent" data-row="0">—</span>
       <p class="note">Fee over provider GPU time priced at its noise-mining income; the test client's fee was below cost.</p>
+    </div>
+    <div class="tile">
+      <span class="label">Live λ (reference runtime)</span>
+      <span class="big warn" data-draw="lambda" data-source="headline" data-field="lambda_live" data-row="0">—</span>
+      <p class="note">Hashed MACs per second while a provider served <span data-draw="ljobs" data-source="headline" data-field="lambda_live_jobs" data-row="0">—</span> jobs, over its GPU's noise rate. The fast path reached 0.37–0.49.</p>
     </div>
     <div class="tile">
       <span class="label">Useful share</span>
@@ -89,7 +94,7 @@
   <div class="grid2">
     <section class="card" id="mining">
       <h2>Noise mining per GPU</h2>
-      <p class="note">Sustained hashed TMAC/s logged by each 3080's miner (Ampere cuPOW kernels)</p>
+      <p class="note">Sustained hashed TMAC/s logged by each miner (Ampere cuPOW kernels), on all three boxes; GPUs shared with agents run slower</p>
       <div class="chart" data-draw="gpu-chart" data-source="gpus"></div>
     </section>
     <section class="card" id="lambda">
@@ -122,7 +127,8 @@
       <dt>Verification overhead</dt><dd>Seconds a verifier spent recomputing its sampled stages, over the seconds the provider spent on the whole job. Verifiers here recompute each sampled stage from the tokens, including every earlier layer group.</dd>
       <dt>Client price vs renting</dt><dd>The job's fee over the provider's GPU seconds times what that GPU would earn noise mining in the same time. Below 1 means the provider earned less than mining would have paid.</dd>
       <dt>False slash</dt><dd>A failed job whose provider had computed every stage honestly.</dd>
-      <dt>Left out</dt><dd>λ from live jobs: devnet providers run the reference runtime without mining, so λ comes from the step-1 benchmarks. Decoy outcomes are counted when the council reveals its forced-error record, after the decoys end.</dd>
+      <dt>Live λ</dt><dd>Only the provider on .245 mines while serving. It runs the reference runtime, whose emulated float ops dominate its time; the measured λ table shows the fast path from step 1.</dd>
+      <dt>Left out</dt><dd>Jackpots: decoy outcomes count on chain once the council reveals its forced-error record, after the last decoy ends.</dd>
     </dl>
   </details>
 </div>
@@ -140,6 +146,12 @@
   one('failed2', 'failed_jobs', fmt.int);
   one('stages', 'settled_stages', fmt.int);
   one('false', 'false_slashes', fmt.int);
+  one('false2', 'false_slashes', fmt.int);
+  one('lambda', 'lambda_live', (v) => {
+    const e = Math.floor(Math.log10(v));
+    return (v / 10 ** e).toFixed(1) + ' × 10' + String(e).replace('-', '⁻').replace(/\d/g, (c) => '⁰¹²³⁴⁵⁶⁷⁸⁹'[c]);
+  });
+  one('ljobs', 'lambda_live_jobs', fmt.int);
   one('overhead', 'verification_overhead', (v) => fmt.two(v) + '×');
   one('ojobs', 'overhead_jobs', fmt.int);
   one('price', 'client_price_vs_rent', (v) => fmt.two(v) + '×');
@@ -180,7 +192,7 @@
     const labels = svg.append('g');
     let lw = 0;
     rows.forEach((r, i) => { const t = labels.append('text').attr('x', 0).attr('y', i * (barH + gap) + barH / 2 + 4)
-      .attr('fill', 'var(--color-fg-muted)').attr('font-size', 12).text(r.gpu.replace('RTX 3080 (box 71, ', '').replace(')', ''));
+      .attr('fill', 'var(--color-fg-muted)').attr('font-size', 12).text(r.gpu);
       lw = Math.max(lw, t.node().getComputedTextLength()); });
     const x0 = lw + 10, right = 64;
     const x = d3.scaleLinear([0, d3.max(rows, (r) => r.noise_tmac_s) * 1.1], [x0, W - right]);

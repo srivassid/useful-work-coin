@@ -31,11 +31,11 @@ def runtime_hash() -> bytes:
     return h.digest()
 
 
-def load(model_dir: str, device: str, hadamard_block: int, max_pos: int) -> DetQwen3:
+def load(model_dir: str, device: str, hadamard_block: int, max_pos: int, mine: bool = False) -> DetQwen3:
     from transformers import AutoModelForCausalLM
     core.setup_determinism()
     hf = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.bfloat16, device_map="cpu").eval()
-    return DetQwen3(hf, device, hadamard_block=hadamard_block, mine=False, max_pos=max_pos)
+    return DetQwen3(hf, device, hadamard_block=hadamard_block, mine=mine, max_pos=max_pos)
 
 
 def go_cfg(m: DetQwen3, max_pos: int) -> dict:

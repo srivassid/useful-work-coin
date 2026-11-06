@@ -34,6 +34,15 @@ DATA_URL = "http://192.168.29.71:18680"
 GAME_REVEAL = 1  # jobstate.GReveal
 
 
+def torch_sync():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
@@ -75,7 +84,8 @@ class Agent:
         with self.rt_lock:
             if self._rt is None:
                 from .compute import Runtime
-                self._rt = Runtime(self.a.model, self.a.device)
+                sock = os.path.join(self.a.devnet, "pearlgw.sock") if getattr(self.a, "mine", False) else None
+                self._rt = Runtime(self.a.model, self.a.device, mine_socket=sock)
             return self._rt
 
     lock = threading.Lock()
@@ -302,6 +312,8 @@ class Provider(Agent):
 
     def compute_job(self, jid: str, b: list[list[int]]):
         t = time.time()
+        mined0 = self.rt.miner.hashed if self.rt.miner else 0
+        torch_sync()
         roots, embs = [], []
         for toks in b:
             r, e = self.rt.batch(toks)
@@ -312,9 +324,15 @@ class Provider(Agent):
         buf = io.BytesIO()
         np.save(buf, np.stack(embs))
         self.data.put(f"/outputs/{jid}.npy", buf.getvalue())
+        torch_sync()
+        extra = {}
+        if self.rt.miner:
+            import torch
+            extra = {"hashed_macs": self.rt.miner.hashed - mined0, "device": self.a.device,
+                     "gpu": torch.cuda.get_device_name(torch.device(self.a.device))}
         with self.lock:
             self.st["jobs"].setdefault(jid, {}).update(roots=[r.hex() for r in roots], salts=[x.hex() for x in salts],
-                                                       outputroot=out_root, computed=round(time.time() - t, 1))
+                                                       outputroot=out_root, computed=round(time.time() - t, 1), **extra)
         self.save()
         log(f"job {jid[:8]}: {len(roots)} stages in {time.time() - t:.0f}s")
 
@@ -645,6 +663,7 @@ def main() -> None:
     ap.add_argument("--max-jobs", type=int, default=1)
     ap.add_argument("--pool", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--prefer", default="", help="provider: claim from categories with this id prefix first")
+    ap.add_argument("--mine", action="store_true", help="provider: mine on every job GEMM (needs this box's gateway)")
     # verifier
     ap.add_argument("--stake", type=int, default=100_000_000)
     # watcher

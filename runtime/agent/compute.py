@@ -15,12 +15,16 @@ from .proto import pooled
 
 
 class Runtime:
-    def __init__(self, model_json: str, device: str):
+    def __init__(self, model_json: str, device: str, mine_socket: str | None = None):
         info = json.load(open(model_json))
         self.info = info
         self.G = info["layer_groups"]
         t = time.time()
-        self.m = load(info["model_dir"], device, info["rotation_block"], info["cfg"]["MaxPos"])
+        self.m = load(info["model_dir"], device, info["rotation_block"], info["cfg"]["MaxPos"], mine=bool(mine_socket))
+        self.miner = None
+        if mine_socket:
+            from .mining import JobMiner
+            self.miner = JobMiner(self.m, mine_socket)
         self.lpg = len(self.m.layers) // self.G
         self.cache: dict[tuple, tuple[list[bytes], np.ndarray]] = {}
         print(f"runtime: {info['model_dir']} on {device} in {time.time() - t:.0f}s", flush=True)
@@ -36,6 +40,8 @@ class Runtime:
         if roots:  # resume from the cached last output is not kept; recompute from the start
             roots = []
         toks = torch.tensor(tokens, dtype=torch.long)
+        if self.miner is not None:
+            self.miner.refresh()
         for g in range(upto + 1):
             st = run_stage(self.m, toks if g == 0 else None, x, g * self.lpg, (g + 1) * self.lpg)
             roots.append(st.root)
