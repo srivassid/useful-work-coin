@@ -1,0 +1,29 @@
+From 9f3900dc162314b2554101a4cb3747203f473301 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 14:18:39 +0530
+Subject: [PATCH] UWC devnet: 20-block challenge window
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/chaincfg/uwc_devnet.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/node/chaincfg/uwc_devnet.go b/node/chaincfg/uwc_devnet.go
+index 703faa6f..0062e17d 100644
+--- a/node/chaincfg/uwc_devnet.go
++++ b/node/chaincfg/uwc_devnet.go
+@@ -37,8 +37,8 @@ func uwcDevNetJobParams() *jobstate.Params {
+ 		p.Council = append(p.Council, a)
+ 	}
+ 	p.CouncilThreshold = 2
+-	// devnet timing: an hour of challenge window instead of a day, so jobs settle while we watch
+-	p.ChallengeWindow = 60
++	// devnet timing: 20 blocks of challenge window instead of a day, so jobs settle while we watch
++	p.ChallengeWindow = 20
+ 	p.UnbondDelay = 120
+ 	return &p
+ }
+-- 
+2.30.2
+

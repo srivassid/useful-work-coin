@@ -22,6 +22,11 @@ exactly as on unmodified Pearl.
 | 0005 | fix: snapshots no longer share dispute-game state; the state root commits games and model architecture |
 | 0006 | public-good pool, canary units, watcher checks, forced errors with a t-of-m council |
 | 0007 | step-6 retune: jobs with fee ≥ 5 block rewards need k ≥ 3 (committee re-rolls by block withholding) |
+| 0008 | UWC devnet (`--uwcdevnet`, real proof of work), job-state RPCs, job coinbase outputs in `getblocktemplate`, gateway support |
+| 0009 | `uwcclient` and `uwcctl`: Taproot-signed deposits, job ops and council proposals |
+| 0010 | `uwcctl ops` (any op as JSON); devnet windows |
+| 0011 | one-step proofs for providers (`BuildOneStep`, `uwcctl onestep`); pool bonds capped at the reference unit cost |
+| 0012 | devnet: 20-block challenge window |
 
 Design: `spec/job-module.md`, `spec/stage-program.md`, `spec/pool-and-watchers.md`. Results:
 `spec/step3-results.md`, `spec/step4-results.md`, `spec/step5-results.md`, `spec/step6-results.md`.
