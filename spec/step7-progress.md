@@ -208,6 +208,17 @@ single rule set.
 | false slashes | 4, all operational, the last before the agent fixes |
 | useful share | 9.5 × 10⁻⁷ |
 
+**Forced errors, end to end (block ~350):** the last decoy ended at 15:05 and the decoy runner
+revealed the council's record in the next transaction. The chain counted 5 decoys: 1 caught
+(by the watcher that checked stage 3 of `606731b3`) and 4 missed. It paid the 5,000,000-grain
+jackpot to that watcher, reimbursed the decoy's bond, returned the rest of the reserve to the
+treasury and removed the commitment. Canary unit 7 settled. 27 jobs settled in total
+(217 stages).
+
+The catch rate, 1 in 5, fits the odds for one wrong stage in 7 with two verifiers sampling two
+stages each and a watcher checking half the jobs at one stage: about 0.49 + 0.51 × 0.5/7 ≈ 0.53
+per decoy. With five decoys the sample is far too small to test that.
+
 ## Where to resume (2026-11-06, end of session)
 
 The devnet keeps running on its own: nodes, gateways, miners (box 71 GPUs 0 and 2, the 5090),
