@@ -1,0 +1,100 @@
+From 732abdf38889fdb7db73cee1aa086b546da18497 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 08:14:30 +0530
+Subject: [PATCH 1/2] jobstate: snapshots no longer share dispute-game state;
+ state root commits games, data requests and model architecture
+
+Job.clone copied the Game pointer and DataReqs' Served slices, so evaluating a block on a
+clone of a cached parent state could mutate the parent. The state root also left out the
+game, data requests, SeqLen, ChallengeEnd and the model architecture. The test harness now
+checks after every block that the parent snapshot is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/jobstate/jobstate_test.go |  6 ++++++
+ node/jobstate/state.go         | 34 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/node/jobstate/jobstate_test.go b/node/jobstate/jobstate_test.go
+index 996313cd..f3f87c8f 100644
+--- a/node/jobstate/jobstate_test.go
++++ b/node/jobstate/jobstate_test.go
+@@ -60,8 +60,14 @@ func (s *sim) block(deps []Deposit, ops []*Op, verdicts []Verdict) *BlockResult
+ 	}
+ 	prev := s.randHash()
+ 	before := s.st.Clone()
++	parentRoot := before.Root()
+ 	in := BlockInput{Height: s.h, PrevHash: prev, Deposits: deps, Ops: ops, Verdicts: verdicts}
+ 	res := ApplyBlock(s.st, s.p, in)
++	// a snapshot must not share mutable state with the state a block is applied to (the node
++	// evaluates competing blocks on clones of one cached parent state)
++	if before.Root() != parentRoot {
++		s.t.Fatalf("block %d changed a clone of its parent state", s.h)
++	}
+ 	// replay determinism: the same block on the pre-state gives the same root and payouts
+ 	again := ApplyBlock(before, s.p, in)
+ 	if again.Root != res.Root || !reflect.DeepEqual(again.Withdrawals, res.Withdrawals) {
+diff --git a/node/jobstate/state.go b/node/jobstate/state.go
+index f484d133..cdda54e3 100644
+--- a/node/jobstate/state.go
++++ b/node/jobstate/state.go
+@@ -65,6 +65,17 @@ func (j *Job) clone() *Job {
+ 		c.Revealed[i] = r
+ 	}
+ 	c.Disputes = append([]Challenge(nil), j.Disputes...)
++	if j.Game != nil { // games are mutated in place, so a snapshot must not share them
++		g := *j.Game
++		g.PData = append([]byte(nil), j.Game.PData...)
++		g.CData = append([]byte(nil), j.Game.CData...)
++		c.Game = &g
++	}
++	c.DataReqs = make([]DataReq, len(j.DataReqs))
++	for i, r := range j.DataReqs {
++		r.Served = append([]bool(nil), r.Served...)
++		c.DataReqs[i] = r
++	}
+ 	return &c
+ }
+ 
+@@ -161,7 +172,23 @@ func encodeJob(j *Job) []byte {
+ 	}
+ 	e.u(uint64(len(j.Disputes)))
+ 	for _, d := range j.Disputes {
+-		e.w(d.Challenger, d.Stage, d.ClaimedRoot, d.Bond, d.Height)
++		e.w(d.Verifier, d.Challenger, d.Stage, d.ClaimedRoot, d.Bond, d.Height)
++	}
++	e.w(j.SeqLen, j.ChallengeEnd)
++	if g := j.Game; g != nil {
++		e.w(true, g.Stage, g.Phase, g.ProvRoot, g.ChalRoot, int64(g.N), int64(g.Lo), int64(g.Size), g.HP, g.HC,
++			g.PMoved, g.CMoved, g.PL, g.PR, g.CL, g.CR, g.PData, g.CData, int64(g.Leaf), int64(g.RowLen),
++			int64(g.Block), int64(g.Elem), g.PWord, g.CWord, g.Deadline)
++	} else {
++		e.w(false)
++	}
++	e.u(uint64(len(j.DataReqs)))
++	for _, r := range j.DataReqs {
++		e.w(r.Stage, r.Requester, r.Due)
++		e.u(uint64(len(r.Served)))
++		for _, x := range r.Served {
++			e.w(x)
++		}
+ 	}
+ 	return e.Bytes()
+ }
+@@ -192,7 +219,12 @@ func (s *State) Root() Hash {
+ 	}
+ 	for id, m := range s.Models {
+ 		var e enc
++		c := m.Cfg
+ 		e.w(m.Registrant, m.WeightsRoot, m.RuntimeHash, m.LayerGroups, m.RotationBlock, m.Bond)
++		for _, v := range []int{c.D, c.H, c.Hkv, c.Hd, c.I, c.L, c.V, c.Bs, c.MaxPos} {
++			e.w(int64(v))
++		}
++		e.w(c.Eps)
+ 		add('m', id[:], e.Bytes())
+ 	}
+ 	for id, j := range s.Jobs {
+-- 
+2.30.2
+

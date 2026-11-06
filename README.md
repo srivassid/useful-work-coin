@@ -9,10 +9,12 @@ plus a verified job market. Work follows the doc's build plan.
 | 2. Reference runtime (bit-exact across GPU families) | **done**: see `spec/step2-results.md` |
 | 3. Job module in Pearl's node | **done**: see `spec/step3-results.md`, code in `chain/patches/` |
 | 4. Verification (bisection to one op, serve-or-slash) | **done**: see `spec/step4-results.md`, `spec/stage-program.md` |
-| 5–7. Pool and watchers, simulator, testnet | not started |
+| 5. Pool and watchers (budget, unit pricing, canaries, forced errors with threshold keys) | **done**: see `spec/step5-results.md`, `spec/pool-and-watchers.md` |
+| 6–7. Simulator extended, testnet | not started |
 
 Layout (from the doc): `chain/`, `miner/` (`miner/ampere`: Ampere port of Pearl's NoisyGEMM
-miner), `runtime/`, `verifier/`, `sim/` (`sim.py`), `spec/`, `results/` (raw benchmark output).
+miner), `runtime/`, `verifier/` (`forced_errors.py`: keyholder shares and curator trees),
+`sim/` (`sim.py`), `spec/`, `results/` (raw benchmark output).
 
 Running `miner/ampere` needs an NVIDIA Ampere-or-newer GPU, Python 3.12, torch 2.11 (cu130),
 cupy-cuda13x, and `pearl_mining` built from Pearl's `py-pearl-mining` with maturin. Tests:

@@ -19,5 +19,8 @@ exactly as on unmodified Pearl.
 | 0002 | consensus integration: `chaincfg.Params.JobModule`, coinbase rules, state persistence, mining templates, mempool policy |
 | 0003 | stage programs and the bit-exact referee (with Python fixtures in `jobstate/testdata`) |
 | 0004 | dispute games, one-step proofs, serve-or-slash, fault-injection suite |
+| 0005 | fix: snapshots no longer share dispute-game state; the state root commits games and model architecture |
+| 0006 | public-good pool, canary units, watcher checks, forced errors with a t-of-m council |
 
-Design: `spec/job-module.md`, `spec/stage-program.md`. Results: `spec/step3-results.md`, `spec/step4-results.md`.
+Design: `spec/job-module.md`, `spec/stage-program.md`, `spec/pool-and-watchers.md`. Results:
+`spec/step3-results.md`, `spec/step4-results.md`, `spec/step5-results.md`.

@@ -1,0 +1,2380 @@
+From 23ae49386160079cdf5e798b3c5cc6660e089c95 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 08:29:18 +0530
+Subject: [PATCH 2/2] jobstate: public-good pool, canary units, watcher checks
+ and forced errors (build step 5)
+
+- Council: t-of-m keyholders (Params.Council) approve actions by PROPOSE/APPROVE; actions run
+  as CouncilAccount.
+- Pool: council-created categories (fixed public work lists for one model, cap shares of pool
+  income, curator). POOL_CLAIM opens a unit as a job whose client is the pool; verifier pay is
+  escrowed from the category budget; units settled in an epoch share PoolSpendBP of the budget
+  equally (the unit price), minus the treasury share. Abandoned or failed units are released.
+- Canary units: CANARY_REVEAL opens a hidden canary leaf after TRACE_COMMIT; every stage is
+  then opened and the first mismatch is disputed by the curator down to one operation.
+- Watchers: a CHALLENGE whose claimed root equals the provider's is a check: it costs
+  WatchFee (paid to the provider) instead of the bond.
+- Forced errors: FE_COMMIT reserves treasury funds against H(record || salt); FE_REVEAL, once
+  every decoy has ended, pays Jackpot to the catchers of each caught decoy, reimburses its
+  bond, and returns the rest. Stats count settled work, checks, and caught and missed decoys.
+
+Tests: council threshold, exact pool accounting and unit pricing, claim rules, exhaustion and
+retirement, canaries and forced errors with real games on the tiny Qwen3, watcher checks, a
+randomized run (pool, canaries, cheaters, decoys, watchers; decoy catch rate matches the
+sampling odds), cross-language vectors for verifier/forced_errors.py. The harness now also
+continues every 5th block from a gob round trip of the state.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/jobstate/apply.go                    |   50 +-
+ node/jobstate/dispute.go                  |   29 +-
+ node/jobstate/jobstate_test.go            |   32 +-
+ node/jobstate/ops.go                      |  104 ++
+ node/jobstate/pool.go                     |  567 +++++++++++
+ node/jobstate/pool_test.go                | 1119 +++++++++++++++++++++
+ node/jobstate/state.go                    |   69 +-
+ node/jobstate/testdata/step5_vectors.json |   16 +
+ node/jobstate/types.go                    |   31 +
+ 9 files changed, 2006 insertions(+), 11 deletions(-)
+ create mode 100644 node/jobstate/pool.go
+ create mode 100644 node/jobstate/pool_test.go
+ create mode 100644 node/jobstate/testdata/step5_vectors.json
+
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+index 9d384659..c3013042 100644
+--- a/node/jobstate/apply.go
++++ b/node/jobstate/apply.go
+@@ -46,10 +46,14 @@ func PoolIssuance(p Params, subsidy Amount) Amount { return subsidy * p.PoolShar
+ // failed op is reported in OpErrors and has no effect.
+ func ApplyBlock(st *State, p Params, b BlockInput) *BlockResult {
+ 	res := &BlockResult{}
++	income := Amount(0) // this block's pool income (the coinbase's pool deposit, plus any donations)
+ 	for _, d := range b.Deposits {
+ 		if d.Amount > 0 {
+ 			st.credit(d.Account, d.Amount)
+ 			st.TotalIn += d.Amount
++			if d.Account == PoolAccount {
++				income += d.Amount
++			}
+ 		}
+ 	}
+ 	for _, op := range b.Ops {
+@@ -65,6 +69,7 @@ func ApplyBlock(st *State, p Params, b BlockInput) *BlockResult {
+ 		st.applyVerdict(p, b.Height, v)
+ 	}
+ 	st.endBlock(p, b.Height, b.PrevHash, res)
++	st.endBlockPool(p, b.Height, income)
+ 	res.Root = st.Root()
+ 	return res
+ }
+@@ -187,7 +192,7 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		if err := s.debit(o.Actor, o.Amount); err != nil {
+ 			return err
+ 		}
+-		j.Provider, j.Bond, j.Status = o.Actor, o.Amount, StatusAccepted
++		j.Provider, j.Bond, j.Status, j.AcceptHeight = o.Actor, o.Amount, StatusAccepted, h
+ 	case OpTraceCommit:
+ 		j, err := s.job(o.Job, StatusAccepted)
+ 		if err != nil {
+@@ -279,6 +284,22 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		}
+ 		j.Disputes = append(j.Disputes, Challenge{Challenger: o.Actor, Stage: o.U1, ClaimedRoot: o.H1, Bond: o.Amount, Height: h})
+ 		j.Status, j.PhaseEnd = StatusDisputed, 0
++	case OpPropose:
++		return s.propose(p, h, o)
++	case OpApprove:
++		return s.approve(p, h, o)
++	case OpPoolCategory:
++		return s.poolCategory(p, o)
++	case OpPoolRetire:
++		return s.poolRetire(o)
++	case OpFECommit:
++		return s.feCommit(p, h, o)
++	case OpPoolClaim:
++		return s.poolClaim(p, h, o)
++	case OpCanary:
++		return s.canaryReveal(p, h, o)
++	case OpFEReveal:
++		return s.feReveal(p, o)
+ 	case OpDisputeMove, OpOneStep, OpDataRequest, OpDataServe:
+ 		j := s.Jobs[o.Job]
+ 		if j == nil || j.Status.Terminal() {
+@@ -373,6 +394,11 @@ func (j *Job) seat(a AccountID) *Verifier {
+ 
+ func (j *Job) requested() map[uint32]bool {
+ 	want := map[uint32]bool{}
++	if j.Canary != nil { // a revealed canary is checked in full
++		for st := uint32(0); st < j.Stages; st++ {
++			want[st] = true
++		}
++	}
+ 	for _, v := range j.Committee {
+ 		if v.Revealed {
+ 			for _, p := range v.Positions {
+@@ -488,7 +514,9 @@ func (s *State) applyVerdict(p Params, h int32, v Verdict) {
+ 
+ // failProvider: fee back to the client; bond half to catchers (equal split), half (plus remainder) to treasury.
+ func (s *State) failProvider(j *Job, catchers []AccountID) {
+-	s.credit(j.Client, j.Fee)
++	s.refundClient(j, j.Fee)
++	s.refundCanaryBond(j)
++	j.Catchers = append([]AccountID(nil), catchers...)
+ 	toCatchers := Amount(0)
+ 	if len(catchers) > 0 {
+ 		each := (j.Bond / 2) / Amount(len(catchers))
+@@ -520,7 +548,17 @@ func (s *State) settle(j *Job) {
+ 	}
+ 	s.credit(TreasuryAccount, j.TreasuryCut+(j.VerifierPay-vp))
+ 	s.credit(j.Provider, j.Fee-j.VerifierPay-j.TreasuryCut+j.Bond)
++	s.refundCanaryBond(j)
+ 	j.Status, j.PhaseEnd = StatusSettled, 0
++	s.Stats.SettledJobs++
++	s.Stats.SettledStages += uint64(j.Stages)
++}
++
++func (s *State) refundCanaryBond(j *Job) {
++	if j.CanaryBond > 0 {
++		s.credit(j.CanaryBy, j.CanaryBond)
++		j.CanaryBond = 0
++	}
+ }
+ 
+ func (s *State) endBlock(p Params, h int32, prevHash Hash, res *BlockResult) {
+@@ -562,13 +600,13 @@ func (s *State) advance(p Params, h int32, prevHash Hash, j *Job) {
+ 	switch j.Status {
+ 	case StatusPosted:
+ 		if h >= j.Deadline {
+-			s.credit(j.Client, j.Fee)
++			s.refundClient(j, j.Fee)
+ 			j.Status = StatusExpired
+ 		}
+ 	case StatusAccepted:
+ 		if h >= j.Deadline { // accepted but never committed: provider at fault, client compensated
+ 			half := j.Bond / 2
+-			s.credit(j.Client, j.Fee+half)
++			s.refundClient(j, j.Fee+half)
+ 			s.credit(TreasuryAccount, j.Bond-half)
+ 			j.Status = StatusFailed
+ 		}
+@@ -663,6 +701,9 @@ func (s *State) advanceProviderReveal(p Params, h int32, j *Job) {
+ 					catchers = append(catchers, v.Account)
+ 				}
+ 			}
++			if j.Canary != nil {
++				catchers = append(catchers, j.CanaryBy)
++			}
+ 			s.failProvider(j, catchers)
+ 			return
+ 		}
+@@ -676,6 +717,7 @@ func (s *State) advanceProviderReveal(p Params, h int32, j *Job) {
+ 				}
+ 			}
+ 		}
++		s.canaryCheck(h, j, got)
+ 		j.ChallengeEnd = h + p.ChallengeWindow
+ 		if len(j.Disputes) > 0 {
+ 			j.Status, j.PhaseEnd = StatusDisputed, 0
+diff --git a/node/jobstate/dispute.go b/node/jobstate/dispute.go
+index 0340e9f6..d37c7987 100644
+--- a/node/jobstate/dispute.go
++++ b/node/jobstate/dispute.go
+@@ -210,7 +210,11 @@ func (s *State) startGame(p Params, h int32, j *Job) {
+ func (s *State) beginTree(p Params, h int32, j *Job, provRoot Hash) {
+ 	g := j.Game
+ 	g.ProvRoot = provRoot
+-	if provRoot == g.ChalRoot { // nothing to dispute: the disputant was wrong
++	if provRoot == g.ChalRoot {
++		if !j.Disputes[0].Verifier && j.Disputes[0].Bond >= p.WatchFee {
++			s.agreedCheck(p, h, j) // a watcher's check that confirmed the provider
++			return
++		}
+ 		s.endGame(p, h, j, false, true)
+ 		return
+ 	}
+@@ -421,6 +425,29 @@ func (s *State) endGame(p Params, h int32, j *Job, providerWrong, challengerWron
+ 	}
+ }
+ 
++// agreedCheck ends a bonded CHALLENGE whose claimed root equals the provider's: the watcher
++// checked the stage and found it right. It pays WatchFee to the provider for opening the stage
++// and gets the rest of its bond back. Copying is impossible, because the claim is posted
++// before the provider opens the stage, and a guessed root loses the whole bond in the game.
++func (s *State) agreedCheck(p Params, h int32, j *Job) {
++	d := j.Disputes[0]
++	j.Game = nil
++	s.credit(j.Provider, p.WatchFee)
++	s.credit(d.Challenger, d.Bond-p.WatchFee)
++	s.Stats.Checks++
++	j.Disputes = j.Disputes[1:]
++	if len(j.Disputes) > 0 {
++		s.startGame(p, h, j)
++		return
++	}
++	j.Disputes = nil
++	if h < j.ChallengeEnd {
++		j.Status, j.PhaseEnd = StatusChallenge, j.ChallengeEnd
++	} else {
++		s.settle(j)
++	}
++}
++
+ // ---------------------------------------------------------------- serve-or-slash
+ 
+ func (s *State) dataRequest(p Params, h int32, j *Job, o *Op) error {
+diff --git a/node/jobstate/jobstate_test.go b/node/jobstate/jobstate_test.go
+index f3f87c8f..f1fe5690 100644
+--- a/node/jobstate/jobstate_test.go
++++ b/node/jobstate/jobstate_test.go
+@@ -3,6 +3,7 @@ package jobstate
+ import (
+ 	"bytes"
+ 	"crypto/sha256"
++	"encoding/gob"
+ 	"math/rand/v2"
+ 	"reflect"
+ 	"testing"
+@@ -29,6 +30,8 @@ type sim struct {
+ 	h    int32
+ 	rng  *rand.Rand
+ 	refN uint64
++	// income is deposited to PoolAccount in every block (the coinbase's pool share)
++	income Amount
+ }
+ 
+ func newSim(t *testing.T, seed uint64) *sim {
+@@ -59,6 +62,9 @@ func (s *sim) block(deps []Deposit, ops []*Op, verdicts []Verdict) *BlockResult
+ 		}
+ 	}
+ 	prev := s.randHash()
++	if s.income > 0 {
++		deps = append([]Deposit{{PoolAccount, s.income}}, deps...)
++	}
+ 	before := s.st.Clone()
+ 	parentRoot := before.Root()
+ 	in := BlockInput{Height: s.h, PrevHash: prev, Deposits: deps, Ops: ops, Verdicts: verdicts}
+@@ -74,6 +80,22 @@ func (s *sim) block(deps []Deposit, ops []*Op, verdicts []Verdict) *BlockResult
+ 		s.t.Fatalf("block %d not deterministic", s.h)
+ 	}
+ 	s.check()
++	// every few blocks continue from a gob round trip of the state, as a restarted node does
++	// (node/blockchain persists job state with gob, which drops empty maps and slices)
++	if s.h%5 == 0 {
++		var buf bytes.Buffer
++		if err := gob.NewEncoder(&buf).Encode(s.st); err != nil {
++			s.t.Fatal(err)
++		}
++		re := NewState()
++		if err := gob.NewDecoder(&buf).Decode(re); err != nil {
++			s.t.Fatal(err)
++		}
++		if re.Root() != s.st.Root() {
++			s.t.Fatalf("height %d: state root changed through persistence", s.h)
++		}
++		s.st = re
++	}
+ 	return res
+ }
+ 
+@@ -587,7 +609,7 @@ func TestOpEncodingRoundTrip(t *testing.T) {
+ 		return
+ 	}
+ 	for i := 0; i < 2000; i++ {
+-		o := &Op{Kind: OpKind(1 + rng.IntN(15)), Amount: rng.Int64(), Job: rh(), Model: rh(), H1: rh(), H2: rh(),
++		o := &Op{Kind: OpKind(1 + rng.IntN(int(numOpKinds))), Amount: rng.Int64(), Job: rh(), Model: rh(), H1: rh(), H2: rh(),
+ 			U1: rng.Uint32(), U2: rng.Uint32(), Deadline: int32(rng.Uint32()), K: uint8(rng.Uint32()), N: uint8(rng.Uint32()),
+ 			Cfg:  ModelCfg{D: rng.IntN(1 << 20), H: rng.IntN(99), Hkv: 3, Hd: 64, I: 7, L: 2, V: 9, Eps: 1e-5, Bs: 128, MaxPos: 5},
+ 			Data: make([]byte, rng.IntN(RowBlock))}
+@@ -606,6 +628,12 @@ func TestOpEncodingRoundTrip(t *testing.T) {
+ 			}
+ 			o.Inputs = append(o.Inputs, in)
+ 		}
++		o.Cat = CategorySpec{Model: rh(), WorkRoot: rh(), Units: rng.Uint32(), StagesPerUnit: rng.Uint32(), SeqLen: 9,
++			K: 2, N: 3, UnitDeadline: -4, CapBP: rng.Int64(), InitPrice: 5, Grant: -1, CanaryRoot: rh(), CanaryLeaves: 3}
++		o.Cat.Curator = AccountID(rh())
++		for k := 0; k < rng.IntN(4); k++ {
++			o.Proof = append(o.Proof, rh())
++		}
+ 		o.PkScript = make([]byte, rng.IntN(40))
+ 		for k := 0; k < rng.IntN(5); k++ {
+ 			o.Roots = append(o.Roots, rh())
+@@ -760,7 +788,7 @@ func randomizedRun(t *testing.T, seed uint64) {
+ 			case 3:
+ 				if len(jobs) > 0 {
+ 					lj := jobs[r.IntN(len(jobs))]
+-					ops = append(ops, &Op{Kind: OpKind(1 + r.IntN(15)), Actor: u, Job: lj.id, Amount: Amount(r.IntN(1 << 20)), H1: w.randHash(),
++					ops = append(ops, &Op{Kind: OpKind(1 + r.IntN(int(numOpKinds))), Actor: u, Job: lj.id, Amount: Amount(r.IntN(1 << 20)), H1: w.randHash(),
+ 						U1: uint32(r.IntN(8)), Data: make([]byte, r.IntN(64))})
+ 				}
+ 			case 4:
+diff --git a/node/jobstate/ops.go b/node/jobstate/ops.go
+index 8541a5bc..f5272d79 100644
+--- a/node/jobstate/ops.go
++++ b/node/jobstate/ops.go
+@@ -27,6 +27,15 @@ const (
+ 	OpOneStep
+ 	OpDataRequest
+ 	OpDataServe
++	OpPropose      // council member proposes an action
++	OpApprove      // council member approves a proposal
++	OpPoolCategory // council action: open a pool category
++	OpPoolRetire   // council action: retire a category
++	OpFECommit     // council action: forced-error commitment and reserve
++	OpPoolClaim    // provider claims a pool unit
++	OpCanary       // curator reveals a canary unit's expected stage roots
++	OpFEReveal     // anyone opens a forced-error commitment
++	numOpKinds     = OpFEReveal
+ )
+ 
+ var opNames = map[OpKind]string{
+@@ -35,6 +44,8 @@ var opNames = map[OpKind]string{
+ 	OpVerifyCommit: "VERIFY_COMMIT", OpVerifyReveal: "VERIFY_REVEAL", OpTraceReveal: "TRACE_REVEAL",
+ 	OpChallenge: "CHALLENGE", OpDisputeMove: "DISPUTE_MOVE", OpOneStep: "ONE_STEP",
+ 	OpDataRequest: "DATA_REQUEST", OpDataServe: "DATA_SERVE",
++	OpPropose: "PROPOSE", OpApprove: "APPROVE", OpPoolCategory: "POOL_CATEGORY", OpPoolRetire: "POOL_RETIRE",
++	OpFECommit: "FE_COMMIT", OpPoolClaim: "POOL_CLAIM", OpCanary: "CANARY_REVEAL", OpFEReveal: "FE_REVEAL",
+ }
+ 
+ func (k OpKind) String() string { return opNames[k] }
+@@ -60,6 +71,14 @@ func (k OpKind) String() string { return opNames[k] }
+ //	ONE_STEP       Job, Reveals (optional: previous stage opened), Inputs (proven input rows)
+ //	DATA_REQUEST   Job, U1 stage
+ //	DATA_SERVE     Job, U1 stage, Reveals (previous stage opened), Inputs (proven stage-input rows)
++//	PROPOSE        Data (an encoded POOL_CATEGORY, POOL_RETIRE or FE_COMMIT)
++//	APPROVE        Job (proposal id)
++//	POOL_CATEGORY  Cat
++//	POOL_RETIRE    Job (category id)
++//	FE_COMMIT      H1 commitment, Amount reserve
++//	POOL_CLAIM     Job (category id), U1 unit, H1 unit input_root, Proof (in the work list), Amount bond
++//	CANARY_REVEAL  Job, U1 leaf index, H1 salt, Roots (expected stage roots), Proof (in the canary tree)
++//	FE_REVEAL      Job (commitment id), H1 salt, Data (record)
+ type Op struct {
+ 	Kind     OpKind
+ 	Actor    AccountID
+@@ -77,6 +96,8 @@ type Op struct {
+ 	Cfg      ModelCfg
+ 	Data     []byte
+ 	Inputs   []ProvenRow
++	Cat      CategorySpec
++	Proof    []Hash
+ }
+ 
+ // ProvenRow is an input row for the referee or a served stage input, with its Merkle proof.
+@@ -115,6 +136,8 @@ const (
+ 	maxProofDepth   = 64
+ 	maxInputs       = 512
+ 	maxRowWords     = 1 << 18
++	maxProposal     = 4096
++	maxRecord       = 1 + binary.MaxVarintLen64 + 32*1024
+ 	MaxOpPayloadLen = 1 << 20
+ )
+ 
+@@ -191,6 +214,51 @@ func (o *Op) Encode() []byte {
+ 		b.Write(o.H2[:])
+ 		uv(uint64(len(o.Data)))
+ 		b.Write(o.Data)
++	case OpPropose:
++		uv(uint64(len(o.Data)))
++		b.Write(o.Data)
++	case OpApprove, OpPoolRetire:
++		b.Write(o.Job[:])
++	case OpPoolCategory:
++		c := o.Cat
++		b.Write(c.Model[:])
++		b.Write(c.WorkRoot[:])
++		w(c.Units)
++		w(c.StagesPerUnit)
++		w(c.SeqLen)
++		b.WriteByte(c.K)
++		b.WriteByte(c.N)
++		w(c.UnitDeadline)
++		w(c.CapBP)
++		w(c.InitPrice)
++		w(c.Grant)
++		b.Write(c.Curator[:])
++		b.Write(c.CanaryRoot[:])
++		w(c.CanaryLeaves)
++	case OpFECommit:
++		b.Write(o.H1[:])
++		w(o.Amount)
++	case OpPoolClaim, OpCanary:
++		b.Write(o.Job[:])
++		w(o.U1)
++		b.Write(o.H1[:])
++		if o.Kind == OpPoolClaim {
++			w(o.Amount)
++		} else {
++			uv(uint64(len(o.Roots)))
++			for _, r := range o.Roots {
++				b.Write(r[:])
++			}
++		}
++		uv(uint64(len(o.Proof)))
++		for _, p := range o.Proof {
++			b.Write(p[:])
++		}
++	case OpFEReveal:
++		b.Write(o.Job[:])
++		b.Write(o.H1[:])
++		uv(uint64(len(o.Data)))
++		b.Write(o.Data)
+ 	case OpOneStep, OpDataServe, OpDataRequest:
+ 		b.Write(o.Job[:])
+ 		w(o.U1)
+@@ -332,6 +400,42 @@ func DecodeOp(p []byte) (*Op, error) {
+ 	case OpDisputeMove:
+ 		o.Job, o.H1, o.H2 = r.hash(), r.hash(), r.hash()
+ 		o.Data = append([]byte(nil), r.take(r.uvar(RowBlock))...)
++	case OpPropose:
++		o.Data = append([]byte(nil), r.take(r.uvar(maxProposal))...)
++	case OpApprove, OpPoolRetire:
++		o.Job = r.hash()
++	case OpPoolCategory:
++		c := &o.Cat
++		c.Model, c.WorkRoot = r.hash(), r.hash()
++		c.Units, c.StagesPerUnit, c.SeqLen = r.u32(), r.u32(), r.u32()
++		c.K, c.N = r.u8(), r.u8()
++		c.UnitDeadline = r.i32()
++		c.CapBP, c.InitPrice, c.Grant = r.i64(), r.i64(), r.i64()
++		copy(c.Curator[:], r.take(32))
++		c.CanaryRoot = r.hash()
++		c.CanaryLeaves = r.u32()
++	case OpFECommit:
++		o.H1 = r.hash()
++		o.Amount = r.i64()
++	case OpPoolClaim, OpCanary:
++		o.Job = r.hash()
++		o.U1 = r.u32()
++		o.H1 = r.hash()
++		if o.Kind == OpPoolClaim {
++			o.Amount = r.i64()
++		} else {
++			n := r.uvar(maxRoots)
++			for i := 0; i < n && r.err == nil; i++ {
++				o.Roots = append(o.Roots, r.hash())
++			}
++		}
++		d := r.uvar(maxProofDepth)
++		for i := 0; i < d && r.err == nil; i++ {
++			o.Proof = append(o.Proof, r.hash())
++		}
++	case OpFEReveal:
++		o.Job, o.H1 = r.hash(), r.hash()
++		o.Data = append([]byte(nil), r.take(r.uvar(maxRecord))...)
+ 	case OpOneStep, OpDataServe, OpDataRequest:
+ 		o.Job = r.hash()
+ 		o.U1 = r.u32()
+diff --git a/node/jobstate/pool.go b/node/jobstate/pool.go
+new file mode 100644
+index 00000000..da279562
+--- /dev/null
++++ b/node/jobstate/pool.go
+@@ -0,0 +1,567 @@
++package jobstate
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"sort"
++)
++
++// Build step 5: the public-good pool, canary units, watchers' checks and forced errors.
++// See spec/pool-and-watchers.md in the Useful-Work Coin repository.
++//
++// Pool. ρ of every block's subsidy is deposited to PoolAccount. Each block, that income is
++// split between the open categories by their cap shares; the rest stays in the pool reserve.
++// A category is a fixed public work list (a Merkle root over unit input roots) for one model.
++// Any provider claims a free unit with a bond and runs it as an ordinary job whose client is
++// the pool. Units that settle during an epoch share PoolSpendBP of the category's budget
++// equally at the epoch's end: fewer providers means more per unit, with no price to set.
++//
++// Canary units are units whose answers the category's curator knows. A Merkle root over
++// H(unit ‖ expected roots ‖ salt) is fixed with the category, so nobody can tell canaries from
++// other units; after a canary is committed the curator opens its leaf, every stage of the unit
++// is then checked, and the first stage that differs is disputed down to one operation.
++//
++// Forced errors. The council commits H(record ‖ salt) and reserves a budget from the
++// treasury. The record lists decoy provider accounts; the jobs those accounts accept after the
++// commitment are decoys run by the keyholders with a deliberately wrong stage root. After the
++// decoys end, anyone holding the record and salt (the keyholders reconstruct it from threshold
++// shares) reveals it: each caught decoy pays Jackpot to its catchers and the decoy's bond is
++// reimbursed; the rest of the reserve returns to the treasury.
++
++// CategorySpec is fixed when the council creates a category.
++type CategorySpec struct {
++	Model         Hash
++	WorkRoot      Hash   // Merkle root over UnitLeaf(i, input_root_i)
++	Units         uint32 // work list length
++	StagesPerUnit uint32 // batches x layer groups
++	SeqLen        uint32
++	K, N          uint8
++	UnitDeadline  int32  // blocks from claim to TRACE_COMMIT
++	CapBP         int64  // share of pool income
++	InitPrice     Amount // unit price used for bonds until the first payout
++	Grant         Amount // starting budget taken from the pool reserve
++	Curator       AccountID
++	CanaryRoot    Hash   // Merkle root over CanaryLeaf entries (zero: no canaries)
++	CanaryLeaves  uint32 // size of that tree (pad with dummy leaves to hide the count)
++}
++
++// UnitLeaf commits unit i of a work list to its input root.
++func UnitLeaf(i uint32, inputRoot Hash) Hash { return tagHash("unit", u32b(i), inputRoot[:]) }
++
++// CanaryLeaf commits a canary unit's expected stage roots (as their Merkle root).
++func CanaryLeaf(unit uint32, expected Hash, salt Hash) Hash {
++	return tagHash("canary", u32b(unit), expected[:], salt[:])
++}
++
++// FECommitment binds a forced-error record (decoy provider accounts) to a secret salt.
++func FECommitment(record []byte, salt Hash) Hash { return tagHash("fe-record", record, salt[:]) }
++
++// EncodeFERecord / DecodeFERecord: version byte, count, accounts.
++func EncodeFERecord(decoys []AccountID) []byte {
++	var e enc
++	e.WriteByte(1)
++	e.u(uint64(len(decoys)))
++	for _, a := range decoys {
++		e.Write(a[:])
++	}
++	return e.Bytes()
++}
++
++func DecodeFERecord(b []byte) ([]AccountID, error) {
++	r := &reader{b: b}
++	if r.u8() != 1 {
++		return nil, errors.New("bad forced-error record version")
++	}
++	n := r.uvar(1024)
++	var out []AccountID
++	for i := 0; i < n && r.err == nil; i++ {
++		var a AccountID
++		copy(a[:], r.take(32))
++		out = append(out, a)
++	}
++	if r.err != nil || len(r.b) != 0 {
++		return nil, errors.New("malformed forced-error record")
++	}
++	return out, nil
++}
++
++// UnitState is a unit that is in flight (Job set) or delivered (Done).
++type UnitState struct {
++	Job  Hash
++	Done bool
++}
++
++// Delivery is a unit settled in the current epoch, waiting for the epoch's payout.
++type Delivery struct {
++	Provider AccountID
++	Unit     uint32
++}
++
++// Category is a public-good work list and its budget.
++type Category struct {
++	ID       Hash
++	Spec     CategorySpec
++	Budget   Amount
++	Price    Amount // last per-unit payout (bond basis for new claims)
++	Retired  bool   // no new claims, no new income
++	Closed   bool   // retired or exhausted, nothing in flight; budget returned to the reserve
++	InFlight uint32
++	Done     uint32
++	Units    map[uint32]UnitState
++	Epoch    []Delivery
++}
++
++// Proposal is a council action waiting for approvals.
++type Proposal struct {
++	ID        Hash
++	Action    []byte
++	Approvals []AccountID // sorted
++	Expires   int32
++}
++
++// FECommit is a forced-error commitment with its reserved budget.
++type FECommit struct {
++	ID         Hash
++	Commitment Hash
++	Reserve    Amount
++	Height     int32
++	Expires    int32
++}
++
++// Stats are the testnet metrics the design asks for (useful share, decoy catch rate).
++type Stats struct {
++	SettledJobs   uint64
++	SettledStages uint64 // useful share: settled stage compute per block
++	PoolUnits     uint64
++	PoolPaid      Amount
++	Checks        uint64 // watcher checks that agreed with the provider
++	DecoysCaught  uint64
++	DecoysMissed  uint64
++	JackpotsPaid  Amount
++}
++
++// ---------------------------------------------------------------- council
++
++func (p Params) isCouncil(a AccountID) bool {
++	for _, c := range p.Council {
++		if c == a {
++			return true
++		}
++	}
++	return false
++}
++
++func isAction(k OpKind) bool { return k == OpPoolCategory || k == OpPoolRetire || k == OpFECommit }
++
++func (s *State) propose(p Params, h int32, o *Op) error {
++	if !p.isCouncil(o.Actor) || p.CouncilThreshold <= 0 || p.CouncilThreshold > len(p.Council) {
++		return errors.New("not a council member")
++	}
++	a, err := DecodeOp(o.Data)
++	if err != nil || !isAction(a.Kind) {
++		return errors.New("not a council action")
++	}
++	id := tagHash("proposal", o.Ref[:])
++	if _, ok := s.Proposals[id]; ok {
++		return errors.New("duplicate proposal")
++	}
++	pr := &Proposal{ID: id, Action: append([]byte(nil), o.Data...), Expires: h + p.ProposalWindow}
++	s.Proposals[id] = pr
++	return s.approveWith(p, h, pr, o.Actor)
++}
++
++func (s *State) approve(p Params, h int32, o *Op) error {
++	pr := s.Proposals[o.Job]
++	if pr == nil || !p.isCouncil(o.Actor) {
++		return errors.New("unknown proposal or not a council member")
++	}
++	return s.approveWith(p, h, pr, o.Actor)
++}
++
++// approveWith records an approval and executes the action once the threshold is reached. If
++// the action fails, the approving op fails, so the approval is not recorded either.
++func (s *State) approveWith(p Params, h int32, pr *Proposal, a AccountID) error {
++	for _, x := range pr.Approvals {
++		if x == a {
++			return errors.New("already approved")
++		}
++	}
++	pr.Approvals = append(pr.Approvals, a)
++	sort.Slice(pr.Approvals, func(i, j int) bool { return bytes.Compare(pr.Approvals[i][:], pr.Approvals[j][:]) < 0 })
++	if len(pr.Approvals) < p.CouncilThreshold {
++		return nil
++	}
++	act, _ := DecodeOp(pr.Action)
++	act.Actor, act.Ref = CouncilAccount, pr.ID
++	delete(s.Proposals, pr.ID)
++	return s.applyOp(p, h, act)
++}
++
++// ---------------------------------------------------------------- categories
++
++func (s *State) openCapBP() int64 {
++	t := int64(0)
++	for _, c := range s.Categories {
++		if !c.Retired {
++			t += c.Spec.CapBP
++		}
++	}
++	return t
++}
++
++func (s *State) poolCategory(p Params, o *Op) error {
++	if o.Actor != CouncilAccount {
++		return errors.New("only the council creates categories")
++	}
++	c := o.Cat
++	m := s.Models[c.Model]
++	switch {
++	case m == nil:
++		return errors.New("unknown model")
++	case c.Units == 0 || c.StagesPerUnit == 0 || c.StagesPerUnit > p.MaxStages || c.StagesPerUnit%m.LayerGroups != 0:
++		return errors.New("bad units or stages")
++	case int(c.K) < p.MinK || int(c.K) > p.MaxK || int(c.N) < p.MinN || int(c.N) > p.MaxN:
++		return errors.New("k or n out of range")
++	case c.SeqLen == 0 || int(c.SeqLen) > m.Cfg.MaxPos:
++		return errors.New("bad sequence length")
++	case c.UnitDeadline <= 0 || c.UnitDeadline > p.MaxDeadlineBlocks:
++		return errors.New("bad unit deadline")
++	case c.CapBP < 0 || s.openCapBP()+c.CapBP > 10_000 || c.InitPrice <= 0 || c.Grant < 0:
++		return errors.New("bad cap, price or grant")
++	case (c.CanaryRoot == Hash{}) != (c.CanaryLeaves == 0):
++		return errors.New("canary root and size must both be set")
++	case c.CanaryLeaves > 0 && c.StagesPerUnit > maxRoots:
++		return errors.New("canary units must fit one CANARY_REVEAL")
++	}
++	id := tagHash("category", o.Ref[:])
++	if _, ok := s.Categories[id]; ok {
++		return errors.New("duplicate category")
++	}
++	if err := s.debit(PoolAccount, c.Grant); err != nil {
++		return err
++	}
++	s.Categories[id] = &Category{ID: id, Spec: c, Budget: c.Grant, Price: c.InitPrice, Units: map[uint32]UnitState{}}
++	return nil
++}
++
++func (s *State) poolRetire(o *Op) error {
++	c := s.Categories[o.Job]
++	if o.Actor != CouncilAccount || c == nil || c.Retired {
++		return errors.New("only the council retires an open category")
++	}
++	c.Retired = true
++	return nil
++}
++
++// poolVerifierPay is escrowed from the category budget when a unit is claimed.
++func poolVerifierPay(p Params, c *CategorySpec) Amount {
++	return Amount(int(c.K)*int(c.N)) * p.VerifierFloorPerSample
++}
++
++func (s *State) poolClaim(p Params, h int32, o *Op) error {
++	c := s.Categories[o.Job]
++	switch {
++	case c == nil || c.Retired:
++		return errors.New("category is not open")
++	case o.U1 >= c.Spec.Units:
++		return errors.New("unit out of range")
++	case o.Actor == PoolAccount || o.Actor == TreasuryAccount || o.Actor == CouncilAccount:
++		return errors.New("system accounts cannot claim")
++	}
++	if u, ok := c.Units[o.U1]; ok {
++		if u.Done {
++			return errors.New("unit already delivered")
++		}
++		return errors.New("unit in flight")
++	}
++	if !VerifyMerkleProof(c.Spec.WorkRoot, UnitLeaf(o.U1, o.H1), int(o.U1), int(c.Spec.Units), o.Proof) {
++		return errors.New("input root is not this unit of the work list")
++	}
++	if o.Amount < minBond(p, c.Price) {
++		return errors.New("bond below minimum")
++	}
++	vp := poolVerifierPay(p, &c.Spec)
++	if c.Budget < vp {
++		return errors.New("category budget cannot pay verification")
++	}
++	id := tagHash("job", o.Ref[:])
++	if _, ok := s.Jobs[id]; ok {
++		return errors.New("duplicate job")
++	}
++	if err := s.debit(o.Actor, o.Amount); err != nil {
++		return err
++	}
++	c.Budget -= vp
++	c.Units[o.U1] = UnitState{Job: id}
++	c.InFlight++
++	sp := c.Spec
++	s.Jobs[id] = &Job{ID: id, Client: PoolAccount, Provider: o.Actor, Model: sp.Model, InputRoot: o.H1,
++		Stages: sp.StagesPerUnit, K: sp.K, N: sp.N, Fee: vp, VerifierPay: vp, Bond: o.Amount,
++		Deadline: h + sp.UnitDeadline, Status: StatusAccepted, PostHeight: h, AcceptHeight: h, SeqLen: sp.SeqLen,
++		Pool: c.ID, Unit: o.U1}
++	return nil
++}
++
++// refundClient returns money owed to a job's client; a pool unit's goes back to its category.
++func (s *State) refundClient(j *Job, v Amount) {
++	if j.IsPool() {
++		if c := s.Categories[j.Pool]; c != nil {
++			c.Budget += v
++			return
++		}
++	}
++	s.credit(j.Client, v)
++}
++
++// ---------------------------------------------------------------- canaries
++
++func (s *State) canaryReveal(p Params, h int32, o *Op) error {
++	j := s.Jobs[o.Job]
++	if j == nil || !j.IsPool() || j.Canary != nil {
++		return errors.New("not an unrevealed pool unit")
++	}
++	c := s.Categories[j.Pool]
++	if c == nil || o.Actor != c.Spec.Curator || c.Spec.CanaryLeaves == 0 {
++		return errors.New("not the category's curator")
++	}
++	switch j.Status {
++	case StatusCommitted, StatusVerifyCommit, StatusVerifyReveal, StatusProviderReveal, StatusChallenge:
++	default:
++		return errors.New("canaries are revealed after TRACE_COMMIT and outside disputes")
++	}
++	if len(o.Roots) != int(j.Stages) {
++		return errors.New("need one expected root per stage")
++	}
++	leaf := CanaryLeaf(j.Unit, MerkleRoot(o.Roots), o.H1)
++	if o.U1 >= c.Spec.CanaryLeaves || !VerifyMerkleProof(c.Spec.CanaryRoot, leaf, int(o.U1), int(c.Spec.CanaryLeaves), o.Proof) {
++		return errors.New("not a committed canary")
++	}
++	if err := s.debit(o.Actor, p.ChallengeBondMin); err != nil {
++		return err
++	}
++	j.Canary, j.CanaryBy, j.CanaryBond = append([]Hash(nil), o.Roots...), o.Actor, p.ChallengeBondMin
++	switch j.Status {
++	case StatusChallenge: // reopen the reveal phase: every stage must now be opened
++		j.Status, j.PhaseEnd = StatusProviderReveal, h+p.ProviderRevealWindow
++	case StatusProviderReveal:
++		j.PhaseEnd = max(j.PhaseEnd, h+p.ProviderRevealWindow)
++	}
++	return nil
++}
++
++// canaryCheck runs once every stage of a canary unit is open: the first stage whose root
++// differs from the expected one becomes a dispute played by the curator.
++func (s *State) canaryCheck(h int32, j *Job, got map[uint32]Hash) {
++	if j.Canary == nil || j.CanaryBond == 0 {
++		return
++	}
++	for st := uint32(0); st < j.Stages; st++ {
++		if got[st] != j.Canary[st] {
++			j.Disputes = append(j.Disputes, Challenge{Challenger: j.CanaryBy, Stage: st, ClaimedRoot: j.Canary[st],
++				Bond: j.CanaryBond, Height: h})
++			j.CanaryBond = 0
++			return
++		}
++	}
++	s.credit(j.CanaryBy, j.CanaryBond) // the provider matched every expected root
++	j.CanaryBond = 0
++}
++
++// ---------------------------------------------------------------- forced errors
++
++func (s *State) feCommit(p Params, h int32, o *Op) error {
++	if o.Actor != CouncilAccount || o.Amount < 0 {
++		return errors.New("only the council commits forced errors")
++	}
++	if err := s.debit(TreasuryAccount, o.Amount); err != nil {
++		return err
++	}
++	id := tagHash("fe", o.Ref[:])
++	s.FECommits[id] = &FECommit{ID: id, Commitment: o.H1, Reserve: o.Amount, Height: h, Expires: h + p.FERevealWindow}
++	return nil
++}
++
++// feReveal opens a commitment. It succeeds only once every decoy job has ended.
++func (s *State) feReveal(p Params, o *Op) error {
++	fc := s.FECommits[o.Job]
++	if fc == nil {
++		return errors.New("unknown forced-error commitment")
++	}
++	if FECommitment(o.Data, o.H1) != fc.Commitment {
++		return errors.New("record and salt do not open the commitment")
++	}
++	decoys, err := DecodeFERecord(o.Data)
++	if err != nil {
++		return err
++	}
++	set := map[AccountID]bool{}
++	for _, a := range decoys {
++		set[a] = true
++	}
++	var jobs []*Job
++	for _, j := range s.Jobs {
++		if set[j.Provider] && j.AcceptHeight > fc.Height && !j.Decoy {
++			if !j.Status.Terminal() {
++				return errors.New("a decoy job has not ended yet")
++			}
++			jobs = append(jobs, j)
++		}
++	}
++	sort.Slice(jobs, func(a, b int) bool { return bytes.Compare(jobs[a].ID[:], jobs[b].ID[:]) < 0 })
++	reserve := fc.Reserve
++	for _, j := range jobs {
++		j.Decoy = true
++		switch {
++		case j.Status == StatusFailed && len(j.Catchers) > 0:
++			s.Stats.DecoysCaught++
++			jp := min(p.Jackpot, reserve)
++			each := jp / Amount(len(j.Catchers))
++			for _, c := range j.Catchers {
++				s.credit(c, each)
++			}
++			paid := each * Amount(len(j.Catchers))
++			reserve -= paid
++			s.Stats.JackpotsPaid += paid
++			back := min(j.Bond, reserve) // the keyholders' decoy bond is reimbursed
++			s.credit(j.Provider, back)
++			reserve -= back
++		case j.Status == StatusSettled:
++			s.Stats.DecoysMissed++
++		}
++	}
++	s.credit(TreasuryAccount, reserve)
++	delete(s.FECommits, fc.ID)
++	return nil
++}
++
++// ---------------------------------------------------------------- end of block
++
++// endBlockPool resolves finished pool units, allocates this block's pool income, closes
++// epochs, and expires proposals and forced-error commitments.
++func (s *State) endBlockPool(p Params, h int32, income Amount) {
++	ids := make([]Hash, 0, len(s.Categories))
++	for id := range s.Categories {
++		ids = append(ids, id)
++	}
++	sort.Slice(ids, func(a, b int) bool { return bytes.Compare(ids[a][:], ids[b][:]) < 0 })
++	// finished units: delivered (settled) or released for another claim
++	for _, id := range ids {
++		c := s.Categories[id]
++		idx := make([]uint32, 0)
++		for i, u := range c.Units {
++			if !u.Done {
++				idx = append(idx, i)
++			}
++		}
++		sort.Slice(idx, func(a, b int) bool { return idx[a] < idx[b] })
++		for _, i := range idx {
++			j := s.Jobs[c.Units[i].Job]
++			if j == nil || !j.Status.Terminal() {
++				continue
++			}
++			c.InFlight--
++			if j.Status == StatusSettled {
++				c.Units[i] = UnitState{Job: j.ID, Done: true}
++				c.Done++
++				c.Epoch = append(c.Epoch, Delivery{Provider: j.Provider, Unit: i})
++			} else {
++				delete(c.Units, i)
++			}
++		}
++	}
++	// income allocation by cap share; the remainder stays in the pool reserve
++	if income > 0 {
++		for _, id := range ids {
++			c := s.Categories[id]
++			if c.Retired {
++				continue
++			}
++			share := income * c.Spec.CapBP / 10_000
++			if share > 0 && s.debit(PoolAccount, share) == nil {
++				c.Budget += share
++			}
++		}
++	}
++	// epoch close: equal payout per delivered unit
++	if p.PoolEpoch > 0 && (h+1)%p.PoolEpoch == 0 {
++		for _, id := range ids {
++			c := s.Categories[id]
++			if n := Amount(len(c.Epoch)); n > 0 {
++				per := c.Budget * p.PoolSpendBP / 10_000 / n
++				if per > 0 {
++					c.Price = per
++				}
++				for _, d := range c.Epoch {
++					tc := per * p.TreasuryShareBP / 10_000
++					s.credit(d.Provider, per-tc)
++					s.credit(TreasuryAccount, tc)
++				}
++				c.Budget -= per * n
++				s.Stats.PoolUnits += uint64(n)
++				s.Stats.PoolPaid += per * n
++				c.Epoch = nil
++			}
++			if !c.Closed && (c.Retired || c.Done == c.Spec.Units) && c.InFlight == 0 {
++				c.Retired, c.Closed = true, true
++				s.credit(PoolAccount, c.Budget)
++				c.Budget = 0
++			}
++		}
++	}
++	for id, pr := range s.Proposals {
++		if pr.Expires <= h {
++			delete(s.Proposals, id)
++		}
++	}
++	for id, fc := range s.FECommits {
++		if fc.Expires <= h {
++			s.credit(TreasuryAccount, fc.Reserve)
++			delete(s.FECommits, id)
++		}
++	}
++}
++
++// ---------------------------------------------------------------- encoding helpers
++
++func encodeCategory(c *Category) []byte {
++	var e enc
++	sp := c.Spec
++	e.w(sp.Model, sp.WorkRoot, sp.Units, sp.StagesPerUnit, sp.SeqLen, sp.K, sp.N, sp.UnitDeadline, sp.CapBP,
++		sp.InitPrice, sp.Grant, sp.Curator, sp.CanaryRoot, sp.CanaryLeaves,
++		c.Budget, c.Price, c.Retired, c.Closed, c.InFlight, c.Done)
++	e.u(uint64(len(c.Epoch)))
++	for _, d := range c.Epoch {
++		e.w(d.Provider, d.Unit)
++	}
++	return e.Bytes()
++}
++
++func unitKey(cat Hash, i uint32) []byte {
++	var b [36]byte
++	copy(b[:], cat[:])
++	binary.BigEndian.PutUint32(b[32:], i) // big-endian so keys sort by unit
++	return b[:]
++}
++
++func encodeUnit(u UnitState) []byte {
++	var e enc
++	e.w(u.Job, u.Done)
++	return e.Bytes()
++}
++
++func encodeProposal(pr *Proposal) []byte {
++	var e enc
++	e.w(pr.Action, pr.Expires)
++	e.u(uint64(len(pr.Approvals)))
++	for _, a := range pr.Approvals {
++		e.w(a)
++	}
++	return e.Bytes()
++}
++
++func encodeFECommit(f *FECommit) []byte {
++	var e enc
++	e.w(f.Commitment, f.Reserve, f.Height, f.Expires)
++	return e.Bytes()
++}
+diff --git a/node/jobstate/pool_test.go b/node/jobstate/pool_test.go
+new file mode 100644
+index 00000000..25f32b02
+--- /dev/null
++++ b/node/jobstate/pool_test.go
+@@ -0,0 +1,1119 @@
++package jobstate
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"os"
++	"testing"
++)
++
++// Build step 5 tests: council threshold, pool budget accounting and unit pricing, claims,
++// canary units, watchers' checks and forced-error jackpots.
++
++// ---------------------------------------------------------------- harness
++
++type poolWorld struct {
++	*world
++	council []AccountID
++	inputs  []Hash // unit input roots of the last work list made
++	wleaves []Hash
++}
++
++func newPoolWorld(t *testing.T, seed uint64, nVerifiers int) *poolWorld {
++	w := newWorld(t, seed, nVerifiers)
++	pw := &poolWorld{world: w, council: []AccountID{acct(900), acct(901), acct(902)}}
++	w.p.Council, w.p.CouncilThreshold = pw.council, 2
++	w.p.PoolEpoch = 40
++	return pw
++}
++
++// councilDo proposes an action (council[0]) and approves it (council[1]); returns the proposal id.
++func (w *poolWorld) councilDo(action *Op) (Hash, *BlockResult) {
++	prop := &Op{Kind: OpPropose, Actor: w.council[0], Data: action.Encode()}
++	mustOK(w.t, w.block(nil, []*Op{prop}, nil))
++	id := tagHash("proposal", prop.Ref[:])
++	return id, w.block(nil, []*Op{{Kind: OpApprove, Actor: w.council[1], Job: id}}, nil)
++}
++
++// workList makes n units with random input roots.
++func (w *poolWorld) workList(n int) Hash {
++	w.inputs, w.wleaves = nil, nil
++	for i := 0; i < n; i++ {
++		in := w.randHash()
++		w.inputs = append(w.inputs, in)
++		w.wleaves = append(w.wleaves, UnitLeaf(uint32(i), in))
++	}
++	return MerkleRoot(w.wleaves)
++}
++
++func (w *poolWorld) spec(units int) CategorySpec {
++	return CategorySpec{Model: w.model, WorkRoot: w.workList(units), Units: uint32(units), StagesPerUnit: 8, SeqLen: 4,
++		K: 2, N: 2, UnitDeadline: 30, CapBP: 6000, InitPrice: 2_000_000, Curator: acct(950)}
++}
++
++func (w *poolWorld) openCategory(sp CategorySpec) Hash {
++	id, res := w.councilDo(&Op{Kind: OpPoolCategory, Cat: sp})
++	mustOK(w.t, res)
++	return tagHash("category", id[:])
++}
++
++func (w *poolWorld) claimOp(cat Hash, prov AccountID, unit int) *Op {
++	c := w.st.Categories[cat]
++	return &Op{Kind: OpPoolClaim, Actor: prov, Job: cat, U1: uint32(unit), H1: w.inputs[unit],
++		Proof: MerkleProof(w.wleaves, unit), Amount: minBond(w.p, c.Price), Ref: w.ref()}
++}
++
++// runUnit claims a unit, commits tr, lets the committee verify honestly against truth, and
++// reveals. It returns the job id with the job in its challenge window (or disputed).
++func (w *poolWorld) runUnit(cat Hash, prov AccountID, unit int, tr, truth *trace) Hash {
++	o := w.claimOp(cat, prov, unit)
++	mustOK(w.t, w.block(nil, []*Op{o}, nil))
++	id := tagHash("job", o.Ref[:])
++	w.commitAndVerify(id, prov, tr, truth)
++	return id
++}
++
++func (w *poolWorld) commitAndVerify(id Hash, prov AccountID, tr, truth *trace) {
++	mustOK(w.t, w.block(nil, []*Op{{Kind: OpTraceCommit, Actor: prov, Job: id, H1: tr.commit(), H2: w.randHash()}}, nil))
++	for w.st.Jobs[id].Status == StatusCommitted {
++		w.block(nil, nil, nil)
++	}
++	j := w.st.Jobs[id]
++	if j.Status == StatusVerifyCommit {
++		w.verify(j, truth, nil)
++	}
++	w.revealRequested(id, prov, tr)
++}
++
++func (w *poolWorld) revealRequested(id Hash, prov AccountID, tr *trace) {
++	j := w.st.Jobs[id]
++	if j.Status != StatusProviderReveal {
++		return
++	}
++	var want []uint32
++	for st := range j.requested() {
++		if _, ok := revealedRoot(j, st); !ok {
++			want = append(want, st)
++		}
++	}
++	mustOK(w.t, w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: prov, Job: id, Reveals: tr.reveal(want)}}, nil))
++	w.block(nil, nil, nil)
++}
++
++// runTo runs empty blocks until height h (inclusive).
++func (w *poolWorld) runTo(h int32) {
++	for w.h < h {
++		w.block(nil, nil, nil)
++	}
++}
++
++// nextEpochEnd is the next height (after the current one) whose block closes an epoch.
++func (w *poolWorld) nextEpochEnd() int32 {
++	e := w.h + 1
++	for (e+1)%w.p.PoolEpoch != 0 {
++		e++
++	}
++	return e
++}
++
++// ---------------------------------------------------------------- council
++
++func TestCouncilThreshold(t *testing.T) {
++	w := newPoolWorld(t, 501, 3)
++	w.income = 1_000_000
++	w.run(3)
++	sp := w.spec(4)
++	// an ordinary account cannot run a council action directly
++	r := w.block(nil, []*Op{{Kind: OpPoolCategory, Actor: w.client, Cat: sp}}, nil)
++	if r.OpErrors[0] == nil {
++		t.Fatal("POOL_CATEGORY outside the council accepted")
++	}
++	// non-members cannot propose or approve
++	r = w.block(nil, []*Op{{Kind: OpPropose, Actor: w.client, Data: (&Op{Kind: OpPoolCategory, Cat: sp}).Encode()}}, nil)
++	if r.OpErrors[0] == nil {
++		t.Fatal("non-member proposal accepted")
++	}
++	// a proposal may only carry council actions
++	r = w.block(nil, []*Op{{Kind: OpPropose, Actor: w.council[0], Data: (&Op{Kind: OpWithdraw, Amount: 1, PkScript: payTo(1)}).Encode()}}, nil)
++	if r.OpErrors[0] == nil {
++		t.Fatal("proposal of an ordinary op accepted")
++	}
++	prop := &Op{Kind: OpPropose, Actor: w.council[0], Data: (&Op{Kind: OpPoolCategory, Cat: sp}).Encode()}
++	mustOK(t, w.block(nil, []*Op{prop}, nil))
++	pid := tagHash("proposal", prop.Ref[:])
++	if len(w.st.Categories) != 0 || w.st.Proposals[pid] == nil {
++		t.Fatal("one approval of a 2-of-3 council must not execute")
++	}
++	r = w.block(nil, []*Op{{Kind: OpApprove, Actor: w.council[0], Job: pid}, {Kind: OpApprove, Actor: w.client, Job: pid}}, nil)
++	if r.OpErrors[0] == nil || r.OpErrors[1] == nil || len(w.st.Categories) != 0 {
++		t.Fatal("double or outside approval counted")
++	}
++	mustOK(t, w.block(nil, []*Op{{Kind: OpApprove, Actor: w.council[2], Job: pid}}, nil))
++	if len(w.st.Categories) != 1 || w.st.Proposals[pid] != nil {
++		t.Fatal("second approval did not execute the action")
++	}
++	// proposals expire
++	prop2 := &Op{Kind: OpPropose, Actor: w.council[1], Data: (&Op{Kind: OpFECommit, H1: Hash{1}, Amount: 0}).Encode()}
++	mustOK(t, w.block(nil, []*Op{prop2}, nil))
++	pid2 := tagHash("proposal", prop2.Ref[:])
++	w.run(int(w.p.ProposalWindow) + 1)
++	if w.st.Proposals[pid2] != nil {
++		t.Fatal("proposal did not expire")
++	}
++	if r := w.block(nil, []*Op{{Kind: OpApprove, Actor: w.council[0], Job: pid2}}, nil); r.OpErrors[0] == nil {
++		t.Fatal("expired proposal approved")
++	}
++	// caps of open categories cannot exceed 100% of pool income
++	sp2 := w.spec(2)
++	sp2.CapBP = 5000
++	if _, r := w.councilDo(&Op{Kind: OpPoolCategory, Cat: sp2}); r.OpErrors[0] == nil {
++		t.Fatal("caps above 100% accepted")
++	}
++}
++
++// ---------------------------------------------------------------- pool accounting and pricing
++
++func TestPoolBudgetAndUnitPricing(t *testing.T) {
++	w := newPoolWorld(t, 502, 4)
++	w.p.PoolEpoch = 100
++	const income = 1_000_000
++	w.income = income
++	cat := w.openCategory(w.spec(6))
++	c := w.st.Categories[cat]
++	// allocation: every block from now on moves CapBP of the income into the budget
++	b0, r0 := c.Budget, w.bal(PoolAccount)
++	w.run(5)
++	c = w.st.Categories[cat]
++	if c.Budget-b0 != 5*income*6000/10_000 || w.bal(PoolAccount)-r0 != 5*income*4000/10_000 {
++		t.Fatalf("allocation: budget +%d, reserve +%d", c.Budget-b0, w.bal(PoolAccount)-r0)
++	}
++	// claim rules
++	provs := []AccountID{acct(60), acct(61), acct(62)}
++	var deps []Deposit
++	for _, p := range provs {
++		deps = append(deps, Deposit{p, 1e9})
++	}
++	w.block(deps, nil, nil)
++	bad := w.claimOp(cat, provs[0], 0)
++	bad.H1 = w.randHash()
++	low := w.claimOp(cat, provs[0], 1)
++	low.Amount--
++	if r := w.block(nil, []*Op{bad, low, {Kind: OpPoolClaim, Actor: provs[0], Job: cat, U1: 99}}, nil); r.OpErrors[0] == nil || r.OpErrors[1] == nil || r.OpErrors[2] == nil {
++		t.Fatalf("bad claims accepted: %v", r.OpErrors)
++	}
++	c0 := w.claimOp(cat, provs[0], 0)
++	dup := w.claimOp(cat, provs[1], 0)
++	if r := w.block(nil, []*Op{c0, dup}, nil); r.OpErrors[0] != nil || r.OpErrors[1] == nil {
++		t.Fatalf("claim / double claim: %v", r.OpErrors)
++	}
++	j0 := tagHash("job", c0.Ref[:])
++	if j := w.st.Jobs[j0]; j.Client != PoolAccount || j.Fee != poolVerifierPay(w.p, &w.st.Categories[cat].Spec) || j.Status != StatusAccepted {
++		t.Fatalf("pool job %+v", j)
++	}
++	// unit 0 is abandoned: past the deadline the provider loses its bond, half to the category
++	budget := w.st.Categories[cat].Budget
++	w.run(int(w.st.Jobs[j0].Deadline-w.h) + 1)
++	if w.st.Jobs[j0].Status != StatusFailed || w.st.Categories[cat].Units[0] != (UnitState{}) {
++		t.Fatal("abandoned unit not released")
++	}
++	bond := w.st.Jobs[j0].Bond
++	grown := w.st.Categories[cat].Budget - budget
++	if grown < w.st.Jobs[j0].Fee+bond/2 { // plus income allocated meanwhile
++		t.Fatalf("abandoned unit's escrow not returned to the category (+%d)", grown)
++	}
++	// three units delivered by three providers in one epoch
++	end := w.nextEpochEnd()
++	if end-w.h < 60 {
++		w.runTo(end)
++		end = w.nextEpochEnd()
++	}
++	var ids []Hash
++	for i, p := range provs {
++		tr := w.newTrace(8)
++		ids = append(ids, w.runUnit(cat, p, i+1, tr, tr))
++	}
++	for _, id := range ids {
++		for w.st.Jobs[id].Status != StatusSettled {
++			w.block(nil, nil, nil)
++		}
++	}
++	w.block(nil, nil, nil)
++	if w.h >= end {
++		t.Fatalf("units took too long for the epoch (h %d, end %d)", w.h, end)
++	}
++	c = w.st.Categories[cat]
++	if len(c.Epoch) != 3 || c.Done != 3 || c.InFlight != 0 {
++		t.Fatalf("epoch deliveries %d done %d in flight %d", len(c.Epoch), c.Done, c.InFlight)
++	}
++	w.runTo(end - 1)
++	before := map[AccountID]Amount{}
++	for _, p := range provs {
++		before[p] = w.bal(p)
++	}
++	tr0 := w.bal(TreasuryAccount)
++	B := w.st.Categories[cat].Budget + income*6000/10_000 // the closing block's allocation comes first
++	w.block(nil, nil, nil)
++	per := B / 3
++	tc := per * w.p.TreasuryShareBP / 10_000
++	for _, p := range provs {
++		if d := w.bal(p) - before[p]; d != per-tc {
++			t.Fatalf("unit payout %d, want %d", d, per-tc)
++		}
++	}
++	if w.bal(TreasuryAccount)-tr0 != 3*tc {
++		t.Fatal("treasury share of unit payouts")
++	}
++	c = w.st.Categories[cat]
++	if c.Price != per || c.Budget != B-3*per || w.st.Stats.PoolUnits != 3 || w.st.Stats.PoolPaid != 3*per {
++		t.Fatalf("price %d budget %d stats %+v", c.Price, c.Budget, w.st.Stats)
++	}
++	// the next epoch has one delivery: the same budget goes to fewer units, so more per unit
++	end = w.nextEpochEnd()
++	if r := w.block(nil, []*Op{w.claimOp(cat, provs[0], 4)}, nil); r.OpErrors[0] == nil {
++		t.Fatal("a fully paid-out budget must not escrow verification before new income arrives")
++	}
++	tr := w.newTrace(8)
++	id := w.runUnit(cat, provs[0], 4, tr, tr)
++	for w.st.Jobs[id].Status != StatusSettled {
++		w.block(nil, nil, nil)
++	}
++	w.runTo(end - 1)
++	B1 := w.st.Categories[cat].Budget + income*6000/10_000
++	p0 := w.bal(provs[0])
++	w.block(nil, nil, nil)
++	if d := w.bal(provs[0]) - p0; d != B1-B1*w.p.TreasuryShareBP/10_000 || B1 <= per {
++		t.Fatalf("single delivery got %d of budget %d", d, B1)
++	}
++	if w.st.Categories[cat].Price != B1 {
++		t.Fatal("price is the last per-unit payout")
++	}
++	// a delivered unit cannot be claimed again
++	if r := w.block(nil, []*Op{w.claimOp(cat, provs[1], 4)}, nil); r.OpErrors[0] == nil {
++		t.Fatal("delivered unit claimed again")
++	}
++}
++
++func TestPoolCategoryExhaustionAndRetirement(t *testing.T) {
++	w := newPoolWorld(t, 503, 3)
++	w.income = 500_000
++	w.run(2)
++	sp := w.spec(1)
++	sp.Grant = 300_000 // from the reserve
++	r0 := w.bal(PoolAccount)
++	cat := w.openCategory(sp)
++	if w.st.Categories[cat].Budget < sp.Grant || w.bal(PoolAccount) >= r0+3*w.income {
++		t.Fatal("grant not moved from the reserve")
++	}
++	prov := acct(70)
++	w.block([]Deposit{{prov, 1e9}}, nil, nil)
++	tr := w.newTrace(8)
++	id := w.runUnit(cat, prov, 0, tr, tr)
++	for w.st.Jobs[id].Status != StatusSettled {
++		w.block(nil, nil, nil)
++	}
++	w.runTo(w.nextEpochEnd())
++	c := w.st.Categories[cat]
++	if !c.Closed || c.Budget != 0 {
++		t.Fatalf("exhausted category not closed: %+v", c)
++	}
++	// closed categories receive no income and free their cap
++	res := w.st.Categories[cat].Budget
++	w.run(3)
++	if w.st.Categories[cat].Budget != res {
++		t.Fatal("closed category still allocated income")
++	}
++	cat2 := w.openCategory(w.spec(3)) // 60% cap available again
++	_, rr := w.councilDo(&Op{Kind: OpPoolRetire, Job: cat2})
++	mustOK(t, rr)
++	if r := w.block(nil, []*Op{w.claimOp(cat2, prov, 0)}, nil); r.OpErrors[0] == nil {
++		t.Fatal("claim on a retired category accepted")
++	}
++	w.runTo(w.nextEpochEnd())
++	if !w.st.Categories[cat2].Closed || w.st.Categories[cat2].Budget != 0 {
++		t.Fatal("retired category not closed")
++	}
++}
++
++// ---------------------------------------------------------------- canaries
++
++// canaryCategory makes a category whose unit 1 is a canary with the given expected roots,
++// hidden among dummy leaves.
++func (w *poolWorld) canaryCategory(expected []Hash) (cat Hash, salt Hash, leaves []Hash, pos int) {
++	sp := w.spec(4)
++	salt = w.randHash()
++	leaves = []Hash{w.randHash(), w.randHash(), CanaryLeaf(1, MerkleRoot(expected), salt), w.randHash()}
++	sp.CanaryRoot, sp.CanaryLeaves = MerkleRoot(leaves), 4
++	return w.openCategory(sp), salt, leaves, 2
++}
++
++func TestCanaryUnits(t *testing.T) {
++	for _, substituted := range []bool{false, true} {
++		w := newPoolWorld(t, 504, 3)
++		w.income = 1_000_000
++		w.run(2)
++		truth := w.newTrace(8)
++		cat, salt, leaves, pos := w.canaryCategory(truth.roots)
++		curator, prov := acct(950), acct(71)
++		w.block([]Deposit{{curator, 1e8}, {prov, 1e9}}, nil, nil)
++		// the provider runs unit 1; with a substituted model every stage root differs
++		tr := truth
++		if substituted {
++			tr = w.newTrace(8)
++		}
++		o := w.claimOp(cat, prov, 1)
++		mustOK(t, w.block(nil, []*Op{o}, nil))
++		id := tagHash("job", o.Ref[:])
++		mustOK(t, w.block(nil, []*Op{{Kind: OpTraceCommit, Actor: prov, Job: id, H1: tr.commit(), H2: w.randHash()}}, nil))
++		reveal := &Op{Kind: OpCanary, Actor: curator, Job: id, U1: uint32(pos), H1: salt, Roots: truth.roots, Proof: MerkleProof(leaves, pos)}
++		wrong := *reveal
++		wrong.Ref, wrong.H1 = Hash{}, w.randHash()
++		other := *reveal
++		other.Ref, other.Actor = Hash{}, acct(951)
++		r := w.block([]Deposit{{acct(951), 1e8}}, []*Op{&wrong, &other, reveal}, nil)
++		if r.OpErrors[0] == nil || r.OpErrors[1] == nil || r.OpErrors[2] != nil {
++			t.Fatalf("canary reveal checks: %v", r.OpErrors)
++		}
++		cur0 := w.bal(curator)
++		for w.st.Jobs[id].Status == StatusCommitted {
++			w.block(nil, nil, nil)
++		}
++		j := w.st.Jobs[id]
++		if j.Status == StatusVerifyCommit {
++			w.verify(j, truth, nil)
++		}
++		if got := len(w.st.Jobs[id].requested()); got != 8 {
++			t.Fatalf("canary must open all stages, requested %d", got)
++		}
++		w.revealRequested(id, prov, tr)
++		j = w.st.Jobs[id]
++		if !substituted {
++			if j.Status != StatusChallenge || w.bal(curator)-cur0 != w.p.ChallengeBondMin {
++				t.Fatalf("honest canary: status %v, curator %+d", j.Status, w.bal(curator)-cur0)
++			}
++			continue
++		}
++		if j.Status != StatusDisputed {
++			t.Fatalf("substituted model not disputed: %v", j.Status)
++		}
++		var mine bool
++		for _, d := range j.Disputes {
++			mine = mine || (d.Challenger == curator && d.ClaimedRoot == truth.roots[d.Stage])
++		}
++		if !mine {
++			t.Fatal("no curator dispute")
++		}
++		p0 := w.bal(prov)
++		w.block(nil, nil, []Verdict{{Job: id, ProviderAtFault: true}}) // the game's verdict (played for real in TestCanaryAndDecoyGamesOnTinyModel)
++		j = w.st.Jobs[id]
++		if j.Status != StatusFailed || w.bal(prov) != p0 || w.st.Categories[cat].Units[1] != (UnitState{}) {
++			t.Fatalf("substituted canary: status %v", j.Status)
++		}
++	}
++}
++
++// ---------------------------------------------------------------- watchers
++
++func TestWatcherCheckAgreesOrDisputes(t *testing.T) {
++	w := newPoolWorld(t, 505, 3)
++	watcher := acct(80)
++	w.block([]Deposit{{watcher, 1e8}}, nil, nil)
++	fee := Amount(10_000_000)
++	tr := w.newTrace(8)
++	j := w.startJob(fee, 8, 2, 2, tr)
++	w.verify(j, tr, nil)
++	w.revealRequested(j.ID, w.provider, tr)
++	// the watcher recomputes an unsampled stage and gets it right: a cheap check
++	var st uint32
++	for st = 0; st < 8; st++ {
++		if _, ok := revealedRoot(w.st.Jobs[j.ID], st); !ok {
++			break
++		}
++	}
++	w0, p0 := w.bal(watcher), w.bal(w.provider)
++	mustOK(t, w.block(nil, []*Op{{Kind: OpChallenge, Actor: watcher, Job: j.ID, U1: st, H1: tr.roots[st], Amount: w.p.ChallengeBondMin}}, nil))
++	if w.st.Jobs[j.ID].Game == nil || w.st.Jobs[j.ID].Game.Phase != GReveal {
++		t.Fatal("provider must open the checked stage")
++	}
++	mustOK(t, w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: w.provider, Job: j.ID, Reveals: tr.reveal([]uint32{st})}}, nil))
++	if s := w.st.Jobs[j.ID].Status; s != StatusChallenge {
++		t.Fatalf("after an agreeing check: %v", s)
++	}
++	if w.bal(watcher)-w0 != -w.p.WatchFee || w.bal(w.provider)-p0 != w.p.WatchFee || w.st.Stats.Checks != 1 {
++		t.Fatalf("check cost: watcher %d provider %d", w.bal(watcher)-w0, w.bal(w.provider)-p0)
++	}
++	// checking an already-open stage with the same root resolves at once
++	mustOK(t, w.block(nil, []*Op{{Kind: OpChallenge, Actor: watcher, Job: j.ID, U1: st, H1: tr.roots[st], Amount: w.p.ChallengeBondMin}}, nil))
++	if w.st.Jobs[j.ID].Status != StatusChallenge || w.st.Stats.Checks != 2 {
++		t.Fatal("check of an open stage not resolved immediately")
++	}
++	// a wrong claim is a dispute, and the liar loses its whole bond
++	w0 = w.bal(watcher)
++	mustOK(t, w.block(nil, []*Op{{Kind: OpChallenge, Actor: watcher, Job: j.ID, U1: st, H1: w.randHash(), Amount: w.p.ChallengeBondMin}}, nil))
++	if w.st.Jobs[j.ID].Status != StatusDisputed {
++		t.Fatal("mismatching claim not disputed")
++	}
++	w.block(nil, nil, []Verdict{{Job: j.ID, ProviderAtFault: false}})
++	if w.bal(watcher)-w0 != -w.p.ChallengeBondMin {
++		t.Fatal("wrong watcher kept part of its bond")
++	}
++	w.run(int(w.p.ChallengeWindow) + 2)
++	if w.st.Jobs[j.ID].Status != StatusSettled {
++		t.Fatal("job did not settle")
++	}
++}
++
++// ---------------------------------------------------------------- forced errors
++
++func TestForcedErrorJackpots(t *testing.T) {
++	w := newPoolWorld(t, 506, 3)
++	w.block([]Deposit{{TreasuryAccount, 100_000_000}}, nil, nil)
++	decoyClient, caught, missed, early := acct(300), acct(301), acct(302), acct(303)
++	watcher := acct(81)
++	w.block([]Deposit{{decoyClient, 1e9}, {caught, 1e9}, {missed, 1e9}, {early, 1e9}, {watcher, 1e8}}, nil, nil)
++
++	// a decoy accepted before the commitment does not count
++	fee := Amount(8_000_000)
++	postEarly := &Op{Kind: OpJobPost, Actor: decoyClient, Model: w.model, H1: w.randHash(), U1: 8, Amount: fee, Deadline: w.h + 60, K: 2, N: 2, U2: 4}
++	mustOK(t, w.block(nil, []*Op{postEarly}, nil))
++	earlyID := tagHash("job", postEarly.Ref[:])
++	mustOK(t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: early, Job: earlyID, Amount: minBond(w.p, fee)}}, nil))
++
++	record := EncodeFERecord([]AccountID{caught, missed, early})
++	salt := w.randHash()
++	const reserve = 20_000_000
++	t0 := w.bal(TreasuryAccount)
++	pid, res := w.councilDo(&Op{Kind: OpFECommit, H1: FECommitment(record, salt), Amount: reserve})
++	mustOK(t, res)
++	fe := tagHash("fe", pid[:])
++	if w.bal(TreasuryAccount) != t0-reserve || w.st.FECommits[fe] == nil {
++		t.Fatal("reserve not taken from the treasury")
++	}
++
++	// two decoys, each with one wrong stage root
++	run := func(prov AccountID) (Hash, *trace, uint32) {
++		post := &Op{Kind: OpJobPost, Actor: decoyClient, Model: w.model, H1: w.randHash(), U1: 8, Amount: fee, Deadline: w.h + 60, K: 2, N: 2, U2: 4}
++		mustOK(t, w.block(nil, []*Op{post}, nil))
++		id := tagHash("job", post.Ref[:])
++		mustOK(t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: prov, Job: id, Amount: minBond(w.p, fee)}}, nil))
++		committed := w.newTrace(8)
++		truth := &trace{roots: append([]Hash(nil), committed.roots...)}
++		mustOK(t, w.block(nil, []*Op{{Kind: OpTraceCommit, Actor: prov, Job: id, H1: committed.commit(), H2: w.randHash()}}, nil))
++		for w.st.Jobs[id].Status == StatusCommitted {
++			w.block(nil, nil, nil)
++		}
++		j := w.st.Jobs[id]
++		// the forced error sits on a stage the committee did not sample (decided after their draw,
++		// so this test is deterministic; real decoys pick it in advance)
++		w.verify(j, committed, nil)
++		j = w.st.Jobs[id]
++		bad := uint32(0)
++		for ; j.requested()[bad]; bad++ {
++		}
++		truth.roots[bad] = w.randHash() // what an honest recomputation gives
++		w.revealRequested(id, prov, committed)
++		return id, truth, bad
++	}
++	idC, truthC, badC := run(caught)
++	idM, _, _ := run(missed)
++	mustOK(t, w.block(nil, []*Op{{Kind: OpChallenge, Actor: watcher, Job: idC, U1: badC, H1: truthC.roots[badC], Amount: w.p.ChallengeBondMin}}, nil))
++	if w.st.Jobs[idC].Status != StatusDisputed {
++		t.Fatal("watcher's catch not disputed")
++	}
++	// reveal fails while a decoy is still running
++	reveal := &Op{Kind: OpFEReveal, Actor: acct(5), Job: fe, H1: salt, Data: record}
++	if r := w.block(nil, []*Op{reveal}, nil); r.OpErrors[0] == nil {
++		t.Fatal("reveal accepted before the decoys ended")
++	}
++	w.block(nil, nil, []Verdict{{Job: idC, ProviderAtFault: true}})
++	w.run(int(w.p.ChallengeWindow) + 2)
++	if w.st.Jobs[idC].Status != StatusFailed || w.st.Jobs[idM].Status != StatusSettled {
++		t.Fatalf("decoys: %v %v", w.st.Jobs[idC].Status, w.st.Jobs[idM].Status)
++	}
++	for !w.st.Jobs[earlyID].Status.Terminal() {
++		w.block(nil, nil, nil)
++	}
++	// a wrong salt does not open the commitment
++	bad := *reveal
++	bad.Ref, bad.H1 = Hash{}, w.randHash()
++	wb, cb, t1 := w.bal(watcher), w.bal(caught), w.bal(TreasuryAccount)
++	r := w.block(nil, []*Op{&bad, {Kind: OpFEReveal, Actor: acct(5), Job: fe, H1: salt, Data: record}}, nil)
++	if r.OpErrors[0] == nil || r.OpErrors[1] != nil {
++		t.Fatalf("reveal: %v", r.OpErrors)
++	}
++	bond := w.st.Jobs[idC].Bond
++	if w.bal(watcher)-wb != w.p.Jackpot || w.bal(caught)-cb != bond {
++		t.Fatalf("jackpot %d (want %d), decoy bond back %d (want %d)", w.bal(watcher)-wb, w.p.Jackpot, w.bal(caught)-cb, bond)
++	}
++	if w.bal(TreasuryAccount)-t1 != reserve-w.p.Jackpot-bond {
++		t.Fatal("rest of the reserve not returned")
++	}
++	st := w.st.Stats
++	if st.DecoysCaught != 1 || st.DecoysMissed != 1 || st.JackpotsPaid != w.p.Jackpot || !w.st.Jobs[earlyID].Status.Terminal() || w.st.Jobs[earlyID].Decoy {
++		t.Fatalf("stats %+v", st)
++	}
++	if w.st.FECommits[fe] != nil {
++		t.Fatal("commitment not consumed")
++	}
++	// an unrevealed commitment expires and its reserve returns
++	pid2, res2 := w.councilDo(&Op{Kind: OpFECommit, H1: w.randHash(), Amount: 1_000_000})
++	mustOK(t, res2)
++	t2 := w.bal(TreasuryAccount)
++	w.run(int(w.p.FERevealWindow) + 1)
++	if w.st.FECommits[tagHash("fe", pid2[:])] != nil || w.bal(TreasuryAccount) < t2+1_000_000 {
++		t.Fatal("commitment did not expire")
++	}
++}
++
++func TestFERecordRoundTrip(t *testing.T) {
++	a := []AccountID{acct(1), acct(2), acct(3)}
++	b := EncodeFERecord(a)
++	d, err := DecodeFERecord(b)
++	if err != nil || len(d) != 3 || d[2] != a[2] {
++		t.Fatal(err)
++	}
++	if _, err := DecodeFERecord(append(b, 0)); err == nil {
++		t.Fatal("trailing byte accepted")
++	}
++	if _, err := DecodeFERecord(b[:len(b)-1]); err == nil {
++		t.Fatal("truncated record accepted")
++	}
++}
++
++// ---------------------------------------------------------------- real games on the tiny model
++
++// tinyPool registers the tiny Qwen3 (2 layer groups) and opens a category whose units are the
++// tiny model's two-batch input (4 stages). With no stakers the committee is empty, so only
++// canaries and watchers check the units.
++func tinyPool(t *testing.T, tm *tinyModel, seed uint64, canary []Hash) (w *poolWorld, cat Hash, cSalt Hash, cLeaves []Hash) {
++	s := newSim(t, seed)
++	w = &poolWorld{world: &world{sim: s, client: acct(1), provider: acct(2)}, council: []AccountID{acct(900), acct(901), acct(902)}}
++	s.p.Council, s.p.CouncilThreshold, s.p.PoolEpoch = w.council, 2, 400
++	s.income = 1_000_000
++	reg := &Op{Kind: OpModelReg, Actor: w.client, H1: tm.wroot, H2: Hash{7}, U1: 2, U2: uint32(tm.cfg.Bs), Cfg: tm.cfg}
++	mustOK(t, s.block([]Deposit{{w.client, 1e9}, {acct(950), 1e9}, {TreasuryAccount, 1e8}}, []*Op{reg}, nil))
++	w.model = tagHash("model", reg.Ref[:])
++	lv, inRoot := tm.inputTree()
++	_ = lv
++	w.inputs = []Hash{inRoot, s.randHash()}
++	w.wleaves = []Hash{UnitLeaf(0, w.inputs[0]), UnitLeaf(1, w.inputs[1])}
++	sp := CategorySpec{Model: w.model, WorkRoot: MerkleRoot(w.wleaves), Units: 2, StagesPerUnit: 4,
++		SeqLen: uint32(len(tm.tokens[0])), K: 2, N: 2, UnitDeadline: 40, CapBP: 5000, InitPrice: 4_000_000, Curator: acct(950)}
++	if canary != nil {
++		cSalt = s.randHash()
++		cLeaves = []Hash{s.randHash(), CanaryLeaf(0, MerkleRoot(canary), cSalt)}
++		sp.CanaryRoot, sp.CanaryLeaves = MerkleRoot(cLeaves), 2
++	}
++	w.run(3)
++	cat = w.openCategory(sp)
++	w.run(2)
++	return
++}
++
++// playOut plays every dispute game on the job to the end with each party's real trace.
++func playOut(t *testing.T, w *poolWorld, tm *tinyModel, jid Hash, prov *party, salts, sl []Hash,
++	parties map[AccountID]*party) (games, oneStepOK int) {
++	for i := 0; i < 3000 && w.st.Jobs[jid].Status == StatusDisputed; i++ {
++		j := w.st.Jobs[jid]
++		var ops []*Op
++		if g := j.Game; g != nil {
++			if g.Phase == GTree && g.Lo == 0 && g.Size == g.N && !g.PMoved && !g.CMoved {
++				games++
++			}
++			disputant := parties[j.Disputes[0].Challenger]
++			switch g.Phase {
++			case GOneStep:
++				if o := prov.oneStep(tm, w.world, j, g, salts, sl); o != nil {
++					ops = append(ops, o)
++				}
++			case GReveal:
++				ops = append(ops, &Op{Kind: OpTraceReveal, Actor: prov.acct, Job: jid, Reveals: []StageReveal{
++					{Stage: g.Stage, Salt: salts[g.Stage], Root: prov.root(g.Stage), Proof: MerkleProof(sl, int(g.Stage))}}})
++			default:
++				if !g.PMoved {
++					if o := prov.move(tm, j, g); o != nil {
++						ops = append(ops, o)
++					}
++				}
++				if !g.CMoved {
++					if o := disputant.move(tm, j, g); o != nil {
++						ops = append(ops, o)
++					}
++				}
++			}
++		}
++		res := w.block(nil, ops, nil)
++		for k, o := range ops {
++			if o.Kind == OpOneStep && res.OpErrors[k] == nil {
++				oneStepOK++
++			}
++		}
++	}
++	if w.st.Jobs[jid].Status == StatusDisputed {
++		t.Fatal("game did not end")
++	}
++	return
++}
++
++// commitUnit claims unit 0 for prov and commits its trace with fixed salts.
++func commitUnit(t *testing.T, w *poolWorld, cat Hash, prov *party) (Hash, []Hash, []Hash) {
++	salts, sl := make([]Hash, 4), make([]Hash, 4)
++	for s := range salts {
++		salts[s] = tagHash("salt", u32b(uint32(s)), prov.acct[:])
++		sl[s] = StageLeaf(uint32(s), salts[s], prov.root(uint32(s)))
++	}
++	o := w.claimOp(cat, prov.acct, 0)
++	mustOK(t, w.block([]Deposit{{prov.acct, 1e9}}, []*Op{o}, nil))
++	id := tagHash("job", o.Ref[:])
++	mustOK(t, w.block(nil, []*Op{{Kind: OpTraceCommit, Actor: prov.acct, Job: id, H1: MerkleRoot(sl), H2: Hash{3}}}, nil))
++	for w.st.Jobs[id].Status == StatusCommitted {
++		w.block(nil, nil, nil)
++	}
++	return id, salts, sl
++}
++
++func TestCanaryAndDecoyGamesOnTinyModel(t *testing.T) {
++	tm := loadTiny(t)
++	t.Run("canary catches a substituted model through the game", func(t *testing.T) {
++		curatorAcct := acct(950)
++		curator := tm.newParty(t, curatorAcct, tm.weights, tm.tokens, nil, nil)
++		var expected []Hash
++		for s := uint32(0); s < 4; s++ {
++			expected = append(expected, curator.root(s))
++		}
++		w, cat, cSalt, cLeaves := tinyPool(t, tm, 601, expected)
++		sub := map[WeightRow][]uint32{}
++		for k, v := range tm.weights {
++			sub[k] = v
++		}
++		row := append([]uint32(nil), tm.weights[WeightRow{"o", 1, 2}]...)
++		row[1] = uint32(int32(row[1]) + 3)
++		sub[WeightRow{"o", 1, 2}] = row
++		prov := tm.newParty(t, acct(72), sub, tm.tokens, nil, nil)
++		id, salts, sl := commitUnit(t, w, cat, prov)
++		if w.st.Jobs[id].Status != StatusChallenge {
++			t.Fatalf("no committee: expected the challenge window, got %v", w.st.Jobs[id].Status)
++		}
++		cur0 := w.bal(curatorAcct)
++		mustOK(t, w.block(nil, []*Op{{Kind: OpCanary, Actor: curatorAcct, Job: id, U1: 1, H1: cSalt, Roots: expected, Proof: MerkleProof(cLeaves, 1)}}, nil))
++		if w.st.Jobs[id].Status != StatusProviderReveal {
++			t.Fatal("canary must reopen the reveal phase")
++		}
++		var rv []StageReveal
++		for s := uint32(0); s < 4; s++ {
++			rv = append(rv, StageReveal{Stage: s, Salt: salts[s], Root: prov.root(s), Proof: MerkleProof(sl, int(s))})
++		}
++		mustOK(t, w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: prov.acct, Job: id, Reveals: rv}}, nil))
++		w.block(nil, nil, nil)
++		j := w.st.Jobs[id]
++		if j.Status != StatusDisputed || j.Disputes[0].Stage != 1 {
++			t.Fatalf("expected a dispute at stage 1 (layer group 1 of batch 0), got %v %+v", j.Status, j.Disputes)
++		}
++		p0 := w.bal(prov.acct)
++		games, _ := playOut(t, w, tm, id, prov, salts, sl, map[AccountID]*party{curatorAcct: curator})
++		j = w.st.Jobs[id]
++		if games != 1 || j.Status != StatusFailed || w.bal(prov.acct) != p0 || w.bal(curatorAcct)-cur0 != j.Bond/2 {
++			t.Fatalf("games %d status %v provider %+d curator %+d", games, j.Status, w.bal(prov.acct)-p0, w.bal(curatorAcct)-cur0)
++		}
++		if w.st.Categories[cat].Units[0] != (UnitState{}) {
++			t.Fatal("failed canary unit not released")
++		}
++	})
++	t.Run("an honest provider passes the canary", func(t *testing.T) {
++		curator := tm.newParty(t, acct(950), tm.weights, tm.tokens, nil, nil)
++		var expected []Hash
++		for s := uint32(0); s < 4; s++ {
++			expected = append(expected, curator.root(s))
++		}
++		w, cat, cSalt, cLeaves := tinyPool(t, tm, 602, expected)
++		prov := tm.newParty(t, acct(73), tm.weights, tm.tokens, nil, nil)
++		id, salts, sl := commitUnit(t, w, cat, prov)
++		mustOK(t, w.block(nil, []*Op{{Kind: OpCanary, Actor: acct(950), Job: id, U1: 1, H1: cSalt, Roots: expected, Proof: MerkleProof(cLeaves, 1)}}, nil))
++		var rv []StageReveal
++		for s := uint32(0); s < 4; s++ {
++			rv = append(rv, StageReveal{Stage: s, Salt: salts[s], Root: prov.root(s), Proof: MerkleProof(sl, int(s))})
++		}
++		mustOK(t, w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: prov.acct, Job: id, Reveals: rv}}, nil))
++		w.run(int(w.p.ChallengeWindow) + 2)
++		w.runTo(w.nextEpochEnd())
++		if w.st.Jobs[id].Status != StatusSettled || w.st.Stats.PoolUnits != 1 {
++			t.Fatalf("honest canary: %v, units paid %d", w.st.Jobs[id].Status, w.st.Stats.PoolUnits)
++		}
++	})
++	t.Run("a watcher catches a forced error through the game and wins the jackpot", func(t *testing.T) {
++		w, _, _, _ := tinyPool(t, tm, 603, nil)
++		decoyClient, decoyProv, watcherAcct := acct(310), acct(311), acct(82)
++		record := EncodeFERecord([]AccountID{decoyProv})
++		salt := w.randHash()
++		pid, res := w.councilDo(&Op{Kind: OpFECommit, H1: FECommitment(record, salt), Amount: 30_000_000})
++		mustOK(t, res)
++		fe := tagHash("fe", pid[:])
++		// the decoy: an ordinary-looking client job whose provider puts a wrong value into one
++		// leaf of stage 3 and computes the rest of the stage consistently from it
++		prog := Program(tm.cfg, len(tm.tokens[0]), 1, 2)
++		prov := tm.newParty(t, decoyProv, tm.weights, tm.tokens, corruptAt(3, len(prog)/2, 5), nil)
++		watcher := tm.newParty(t, watcherAcct, tm.weights, tm.tokens, nil, nil)
++		_, inRoot := tm.inputTree()
++		const fee = 20_000_000
++		post := &Op{Kind: OpJobPost, Actor: decoyClient, Model: w.model, H1: inRoot, U1: 4, Amount: fee, Deadline: w.h + 40,
++			K: 2, N: 2, U2: uint32(len(tm.tokens[0]))}
++		mustOK(t, w.block([]Deposit{{decoyClient, 1e9}, {decoyProv, 1e9}, {watcherAcct, 1e8}}, []*Op{post}, nil))
++		id := tagHash("job", post.Ref[:])
++		salts, sl := make([]Hash, 4), make([]Hash, 4)
++		for s := range salts {
++			salts[s] = tagHash("salt", u32b(uint32(s)))
++			sl[s] = StageLeaf(uint32(s), salts[s], prov.root(uint32(s)))
++		}
++		mustOK(t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: decoyProv, Job: id, Amount: minBond(w.p, fee)}}, nil))
++		mustOK(t, w.block(nil, []*Op{{Kind: OpTraceCommit, Actor: decoyProv, Job: id, H1: MerkleRoot(sl), H2: Hash{3}}}, nil))
++		for w.st.Jobs[id].Status == StatusCommitted {
++			w.block(nil, nil, nil)
++		}
++		// the watcher samples two stages: stage 0 agrees (a cheap check), stage 3 is the forced error
++		w0 := w.bal(watcherAcct)
++		mustOK(t, w.block(nil, []*Op{
++			{Kind: OpChallenge, Actor: watcherAcct, Job: id, U1: 0, H1: watcher.root(0), Amount: w.p.ChallengeBondMin},
++			{Kind: OpChallenge, Actor: watcherAcct, Job: id, U1: 3, H1: watcher.root(3), Amount: w.p.ChallengeBondMin},
++		}, nil))
++		games, ok := playOut(t, w, tm, id, prov, salts, sl, map[AccountID]*party{watcherAcct: watcher})
++		j := w.st.Jobs[id]
++		if j.Status != StatusFailed || games != 1 || ok != 1 || w.st.Stats.Checks != 1 {
++			t.Fatalf("decoy: status %v games %d one-step %d checks %d", j.Status, games, ok, w.st.Stats.Checks)
++		}
++		bond := j.Bond
++		if d := w.bal(watcherAcct) - w0; d != bond/2-w.p.WatchFee {
++			t.Fatalf("watcher before the reveal: %+d, want %d", d, bond/2-w.p.WatchFee)
++		}
++		p0 := w.bal(decoyProv)
++		mustOK(t, w.block(nil, []*Op{{Kind: OpFEReveal, Actor: acct(9), Job: fe, H1: salt, Data: record}}, nil))
++		if d := w.bal(watcherAcct) - w0; d != bond/2-w.p.WatchFee+w.p.Jackpot {
++			t.Fatalf("watcher after the reveal: %+d", d)
++		}
++		if w.bal(decoyProv)-p0 != bond || w.st.Stats.DecoysCaught != 1 {
++			t.Fatal("decoy bond not reimbursed")
++		}
++	})
++}
++
++// ---------------------------------------------------------------- randomized property test
++
++// TestPoolAndWatchersRandomized runs pool units (honest, cheating, abandoned, canaries),
++// client jobs, forced-error decoys and watchers together. After every block the harness checks
++// conservation, replay determinism and that clones are independent. At the end: every job
++// ended, no honest provider was ever slashed, every cheater and every decoy found by a check was
++// caught, budgets add up, and the decoy catch rate matches the sampling odds.
++func TestPoolAndWatchersRandomized(t *testing.T) {
++	seeds := 6
++	if testing.Short() {
++		seeds = 2
++	}
++	var caught, decoys int
++	var wantP float64
++	for seed := 0; seed < seeds; seed++ {
++		c, d, p := poolRandomRun(t, uint64(700+seed))
++		caught, decoys, wantP = caught+c, decoys+d, p
++	}
++	rate := float64(caught) / float64(decoys)
++	sd := sqrt(wantP * (1 - wantP) / float64(decoys))
++	t.Logf("decoys %d, caught %d (%.3f); expected %.3f ± %.3f", decoys, caught, rate, wantP, sd)
++	if rate < wantP-4*sd || rate > wantP+4*sd {
++		t.Fatalf("decoy catch rate %.3f outside %.3f ± 4σ", rate, wantP)
++	}
++}
++
++func sqrt(x float64) float64 {
++	z := x
++	for i := 0; i < 50 && z > 0; i++ {
++		z = (z + x/z) / 2
++	}
++	return z
++}
++
++func poolRandomRun(t *testing.T, seed uint64) (caught, decoyCount int, wantP float64) {
++	w := newPoolWorld(t, seed, 6)
++	r := w.rng
++	w.income = 2_000_000
++	w.block([]Deposit{{TreasuryAccount, 500_000_000}}, nil, nil)
++	const units, S = 300, 8
++	sp := w.spec(units)
++	// canaries: every 10th unit, hidden among dummies
++	truths := make([]*trace, units)
++	for i := range truths {
++		truths[i] = w.newTrace(S)
++	}
++	cSalt := w.randHash()
++	var cLeaves []Hash
++	cPos := map[int]int{}
++	for i := 0; i < units; i += 10 {
++		cPos[i] = len(cLeaves)
++		cLeaves = append(cLeaves, CanaryLeaf(uint32(i), MerkleRoot(truths[i].roots), cSalt))
++		cLeaves = append(cLeaves, w.randHash())
++	}
++	sp.CanaryRoot, sp.CanaryLeaves = MerkleRoot(cLeaves), uint32(len(cLeaves))
++	sp.CapBP = 8000
++	cat := w.openCategory(sp)
++	curator := acct(950)
++	honest := []AccountID{acct(400), acct(401), acct(402)}
++	cheater, quitter := acct(410), acct(411)
++	watcher := acct(420)
++	decoyClient := acct(430)
++	var decoyProvs []AccountID
++	for i := 0; i < 40; i++ {
++		decoyProvs = append(decoyProvs, acct(440+i))
++	}
++	deps := []Deposit{{curator, 1e9}, {cheater, 1e10}, {quitter, 1e10}, {watcher, 1e10}, {decoyClient, 1e11}}
++	for _, a := range append(append([]AccountID{}, honest...), decoyProvs...) {
++		deps = append(deps, Deposit{a, 1e10})
++	}
++	w.block(deps, nil, nil)
++	record := EncodeFERecord(decoyProvs)
++	feSalt := w.randHash()
++	pid, res := w.councilDo(&Op{Kind: OpFECommit, H1: FECommitment(record, feSalt), Amount: 400_000_000})
++	mustOK(t, res)
++	fe := tagHash("fe", pid[:])
++
++	type live struct {
++		id         Hash
++		prov       AccountID
++		committed  *trace // what the provider committed
++		truth      *trace // what an honest recomputation gives
++		unit       int
++		pool, quit bool
++		decoy      bool
++		watched    bool
++		salts      map[AccountID]Hash
++	}
++	var jobs []*live
++	byID := map[Hash]*live{}
++	nextUnit := 0
++	const watchRate = 0.5
++	blocks := 500
++	for b := 0; b < blocks; b++ {
++		var ops []*Op
++		var verdicts []Verdict
++		if b < blocks-200 {
++			// pool claims
++			if r.IntN(2) == 0 && nextUnit < units {
++				prov := honest[r.IntN(len(honest))]
++				kind := r.IntN(10)
++				if kind == 0 {
++					prov = cheater
++				} else if kind == 1 {
++					prov = quitter
++				}
++				o := w.claimOp(cat, prov, nextUnit)
++				ops = append(ops, o)
++				truth := truths[nextUnit]
++				comm := truth
++				if prov == cheater { // a substituted model: every stage differs
++					comm = w.newTrace(S)
++				}
++				lj := &live{id: tagHash("job", o.Ref[:]), prov: prov, committed: comm, truth: truth, unit: nextUnit, pool: true,
++					quit: prov == quitter, salts: map[AccountID]Hash{}}
++				jobs, byID[lj.id] = append(jobs, lj), lj
++				nextUnit++
++			}
++			// decoys, looking like client jobs: one wrong stage root each
++			if r.IntN(3) == 0 {
++				fee := Amount(5_000_000 + r.IntN(5_000_000))
++				post := &Op{Kind: OpJobPost, Actor: decoyClient, Model: w.model, H1: w.randHash(), U1: S, Amount: fee,
++					Deadline: w.h + 30, K: 2, N: 2, U2: 4, Ref: w.ref()}
++				ops = append(ops, post)
++				comm := w.newTrace(S)
++				truth := &trace{roots: append([]Hash(nil), comm.roots...)}
++				truth.roots[r.IntN(S)] = w.randHash()
++				lj := &live{id: tagHash("job", post.Ref[:]), prov: decoyProvs[r.IntN(len(decoyProvs))], committed: comm, truth: truth,
++					decoy: true, salts: map[AccountID]Hash{}}
++				jobs, byID[lj.id] = append(jobs, lj), lj
++			}
++		}
++		for _, lj := range jobs {
++			j := w.st.Jobs[lj.id]
++			if j == nil || j.Status.Terminal() {
++				continue
++			}
++			switch j.Status {
++			case StatusPosted:
++				ops = append(ops, &Op{Kind: OpJobAccept, Actor: lj.prov, Job: j.ID, Amount: minBond(w.p, j.Fee)})
++			case StatusAccepted:
++				if !lj.quit {
++					ops = append(ops, &Op{Kind: OpTraceCommit, Actor: lj.prov, Job: j.ID, H1: lj.committed.commit(), H2: w.randHash()})
++				}
++			case StatusCommitted:
++				if p, ok := cPos[lj.unit]; ok && lj.pool && j.Canary == nil {
++					ops = append(ops, &Op{Kind: OpCanary, Actor: curator, Job: j.ID, U1: uint32(p), H1: cSalt,
++						Roots: truths[lj.unit].roots, Proof: MerkleProof(cLeaves, p)})
++				}
++			case StatusVerifyCommit, StatusVerifyReveal:
++				for _, v := range j.Committee {
++					if j.Status == StatusVerifyCommit && !v.Committed && lj.salts[v.Account] == (Hash{}) {
++						salt := w.randHash()
++						lj.salts[v.Account] = salt
++						pos := Positions(salt, j.Stages, int(j.N))
++						roots := make([]Hash, len(pos))
++						for i, p := range pos {
++							roots[i] = lj.truth.roots[p]
++						}
++						ops = append(ops, &Op{Kind: OpVerifyCommit, Actor: v.Account, Job: j.ID, H1: sha256.Sum256(salt[:]), H2: ResultHash(roots, v.Account, salt)})
++					}
++					if salt, ok := lj.salts[v.Account]; ok && j.Status == StatusVerifyReveal && v.Committed && !v.Revealed {
++						pos := Positions(salt, j.Stages, int(j.N))
++						roots := make([]Hash, len(pos))
++						for i, p := range pos {
++							roots[i] = lj.truth.roots[p]
++						}
++						ops = append(ops, &Op{Kind: OpVerifyReveal, Actor: v.Account, Job: j.ID, H1: salt, Roots: roots})
++					}
++				}
++			case StatusProviderReveal:
++				var want []uint32
++				for st := range j.requested() {
++					if _, ok := revealedRoot(j, st); !ok {
++						want = append(want, st)
++					}
++				}
++				if len(want) > 0 {
++					ops = append(ops, &Op{Kind: OpTraceReveal, Actor: lj.prov, Job: j.ID, Reveals: lj.committed.reveal(want)})
++				}
++			case StatusChallenge:
++				// a watcher checks a share of jobs (it cannot tell decoys from client jobs) with one sampled stage
++				if !lj.watched && !lj.pool {
++					lj.watched = true
++					if r.Float64() < watchRate {
++						st := uint32(r.IntN(S))
++						ops = append(ops, &Op{Kind: OpChallenge, Actor: watcher, Job: j.ID, U1: st, H1: lj.truth.roots[st], Amount: w.p.ChallengeBondMin})
++					}
++				}
++			case StatusDisputed:
++				g := j.Game
++				if g != nil && g.Phase == GReveal {
++					ops = append(ops, &Op{Kind: OpTraceReveal, Actor: lj.prov, Job: j.ID, Reveals: lj.committed.reveal([]uint32{g.Stage})})
++				} else if g != nil {
++					// the referee's verdict (step 4 plays these games for real): the provider is wrong iff
++					// its committed root differs from an honest recomputation
++					d := j.Disputes[0]
++					verdicts = append(verdicts, Verdict{Job: j.ID, ProviderAtFault: lj.committed.roots[d.Stage] != lj.truth.roots[d.Stage]})
++				}
++			}
++		}
++		w.block(nil, ops, verdicts)
++	}
++	w.run(int(w.p.ChallengeWindow + w.p.DisputeTimeout + 2*w.p.PoolEpoch))
++	// FE reveal
++	mustOK(t, w.block(nil, []*Op{{Kind: OpFEReveal, Actor: watcher, Job: fe, H1: feSalt, Data: record}}, nil))
++	w.runTo(w.nextEpochEnd())
++	settledUnits := 0
++	for _, lj := range jobs {
++		j := w.st.Jobs[lj.id]
++		if j == nil {
++			continue // a decoy posted in the same block as a junk op, or a claim that failed
++		}
++		if !j.Status.Terminal() {
++			t.Fatalf("job stuck in %v", j.Status)
++		}
++		cheat := false
++		for i := range lj.truth.roots {
++			cheat = cheat || lj.committed.roots[i] != lj.truth.roots[i]
++		}
++		switch {
++		case lj.quit:
++			if j.Status != StatusFailed {
++				t.Fatalf("abandoned unit %v", j.Status)
++			}
++		case !cheat && j.Status != StatusSettled:
++			t.Fatalf("honest provider not settled: %v (false slash)", j.Status)
++		case lj.pool && cheat && j.Canary != nil && j.Status != StatusFailed:
++			t.Fatal("canary missed a substituted model")
++		}
++		if lj.pool && j.Status == StatusSettled {
++			settledUnits++
++		}
++		if lj.decoy {
++			if !j.Decoy {
++				t.Fatal("decoy not revealed")
++			}
++			decoyCount++
++			if j.Status == StatusFailed {
++				caught++
++			}
++		}
++	}
++	st := w.st.Stats
++	if int(st.DecoysCaught) != caught || int(st.DecoysCaught+st.DecoysMissed) != decoyCount || int(st.PoolUnits) != settledUnits {
++		t.Fatalf("stats %+v vs caught %d decoys %d units %d", st, caught, decoyCount, settledUnits)
++	}
++	c := w.st.Categories[cat]
++	if c.InFlight != 0 || len(c.Epoch) != 0 || int(c.Done) != settledUnits {
++		t.Fatalf("category %+v", c)
++	}
++	if testing.Verbose() {
++		canaries, cheatersFailed := 0, 0
++		for _, lj := range jobs {
++			if j := w.st.Jobs[lj.id]; j != nil && lj.pool {
++				if j.Canary != nil {
++					canaries++
++				}
++				if lj.prov == cheater && j.Status == StatusFailed {
++					cheatersFailed++
++				}
++			}
++		}
++		t.Logf("seed %d: units settled %d, canaries opened %d, cheating units failed %d, checks %d, pool paid %d, jackpots %d",
++			seed, settledUnits, canaries, cheatersFailed, st.Checks, st.PoolPaid, st.JackpotsPaid)
++	}
++	// catch odds for one wrong stage of S: missed by both verifiers' n = 2 samples, and by the watcher
++	missV := float64((S-1)*(S-2)) / float64(S*(S-1))
++	wantP = 1 - missV*missV*(1-watchRate/float64(S))
++	return
++}
++
++// TestStep5Vectors checks the keyholder and curator tools (verifier/forced_errors.py) against
++// this package: record encoding, commitment, work-list and canary trees and proofs.
++func TestStep5Vectors(t *testing.T) {
++	raw, err := os.ReadFile("testdata/step5_vectors.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var v struct {
++		Record, Salt, Commitment string
++		Unit3Proof               []string `json:"unit3_proof"`
++		CanaryProof              []string `json:"canary_proof"`
++		WorkRootJ                string   `json:"work_root"`
++		CanaryRootJ              string   `json:"canary_root"`
++	}
++	if err := json.Unmarshal(raw, &v); err != nil {
++		t.Fatal(err)
++	}
++	hx := func(s string) Hash {
++		var h Hash
++		b, _ := hex.DecodeString(s)
++		copy(h[:], b)
++		return h
++	}
++	hs := func(ss []string) (o []Hash) {
++		for _, s := range ss {
++			o = append(o, hx(s))
++		}
++		return
++	}
++	record := EncodeFERecord([]AccountID{acct(1), acct(2), acct(3)})
++	salt := tagHash("salt")
++	if hex.EncodeToString(record) != v.Record || salt != hx(v.Salt) || FECommitment(record, salt) != hx(v.Commitment) {
++		t.Fatal("forced-error record or commitment differs from the Python tool")
++	}
++	var wl []Hash
++	for i := uint32(0); i < 5; i++ {
++		wl = append(wl, UnitLeaf(i, tagHash("in", u32b(i))))
++	}
++	if MerkleRoot(wl) != hx(v.WorkRootJ) || !VerifyMerkleProof(hx(v.WorkRootJ), wl[3], 3, 5, hs(v.Unit3Proof)) {
++		t.Fatal("work list tree differs")
++	}
++	var exp []Hash
++	for s := uint32(0); s < 4; s++ {
++		exp = append(exp, tagHash("root", u32b(s)))
++	}
++	leaf := CanaryLeaf(3, MerkleRoot(exp), salt)
++	if !VerifyMerkleProof(hx(v.CanaryRootJ), leaf, 1, 3, hs(v.CanaryProof)) {
++		t.Fatal("canary proof from the Python tool does not verify")
++	}
++}
+diff --git a/node/jobstate/state.go b/node/jobstate/state.go
+index cdda54e3..3ca4bc3b 100644
+--- a/node/jobstate/state.go
++++ b/node/jobstate/state.go
+@@ -18,18 +18,45 @@ type State struct {
+ 	NextSeq     uint64
+ 	TotalIn     Amount // all deposits and pool issuance ever credited
+ 	PaidOut     Amount // all withdrawals ever paid in a coinbase
++
++	Categories map[Hash]*Category // public-good pool work lists
++	Proposals  map[Hash]*Proposal // council actions waiting for approvals
++	FECommits  map[Hash]*FECommit // forced-error commitments and their reserves
++	Stats      Stats
+ }
+ 
+ func NewState() *State {
+ 	return &State{Accounts: map[AccountID]Amount{}, Stakes: map[AccountID]Amount{},
+-		Models: map[Hash]*Model{}, Jobs: map[Hash]*Job{}}
++		Models: map[Hash]*Model{}, Jobs: map[Hash]*Job{}, Categories: map[Hash]*Category{},
++		Proposals: map[Hash]*Proposal{}, FECommits: map[Hash]*FECommit{}}
+ }
+ 
+ // Clone is a deep copy (used to evaluate a block without touching the chain tip's state).
+ func (s *State) Clone() *State {
+ 	c := &State{Accounts: make(map[AccountID]Amount, len(s.Accounts)), Stakes: make(map[AccountID]Amount, len(s.Stakes)),
+ 		Models: make(map[Hash]*Model, len(s.Models)), Jobs: make(map[Hash]*Job, len(s.Jobs)),
+-		NextSeq: s.NextSeq, TotalIn: s.TotalIn, PaidOut: s.PaidOut}
++		NextSeq: s.NextSeq, TotalIn: s.TotalIn, PaidOut: s.PaidOut, Stats: s.Stats,
++		Categories: make(map[Hash]*Category, len(s.Categories)), Proposals: make(map[Hash]*Proposal, len(s.Proposals)),
++		FECommits: make(map[Hash]*FECommit, len(s.FECommits))}
++	for k, v := range s.Categories {
++		cc := *v
++		cc.Units = make(map[uint32]UnitState, len(v.Units))
++		for i, u := range v.Units {
++			cc.Units[i] = u
++		}
++		cc.Epoch = append([]Delivery(nil), v.Epoch...)
++		c.Categories[k] = &cc
++	}
++	for k, v := range s.Proposals {
++		pr := *v
++		pr.Action = append([]byte(nil), v.Action...)
++		pr.Approvals = append([]AccountID(nil), v.Approvals...)
++		c.Proposals[k] = &pr
++	}
++	for k, v := range s.FECommits {
++		f := *v
++		c.FECommits[k] = &f
++	}
+ 	for k, v := range s.Accounts {
+ 		c.Accounts[k] = v
+ 	}
+@@ -76,6 +103,11 @@ func (j *Job) clone() *Job {
+ 		r.Served = append([]bool(nil), r.Served...)
+ 		c.DataReqs[i] = r
+ 	}
++	c.Catchers = append([]AccountID(nil), j.Catchers...)
++	c.Canary = append([]Hash(nil), j.Canary...)
++	if j.Canary == nil {
++		c.Canary = nil
++	}
+ 	return &c
+ }
+ 
+@@ -101,6 +133,12 @@ func (s *State) Holdings() Amount {
+ 	for _, w := range s.Withdrawals {
+ 		t += w.Amount
+ 	}
++	for _, c := range s.Categories {
++		t += c.Budget
++	}
++	for _, f := range s.FECommits {
++		t += f.Reserve
++	}
+ 	return t
+ }
+ 
+@@ -116,7 +154,7 @@ func (j *Job) Held() Amount {
+ 	for _, d := range j.Disputes {
+ 		t += d.Bond
+ 	}
+-	return t
++	return t + j.CanaryBond
+ }
+ 
+ // ---------------------------------------------------------------- canonical encoding + root
+@@ -190,6 +228,15 @@ func encodeJob(j *Job) []byte {
+ 			e.w(x)
+ 		}
+ 	}
++	e.w(j.AcceptHeight, j.Pool, j.Unit, j.CanaryBy, j.CanaryBond, j.Decoy)
++	e.u(uint64(len(j.Catchers)))
++	for _, a := range j.Catchers {
++		e.w(a)
++	}
++	e.u(uint64(len(j.Canary)))
++	for _, h := range j.Canary {
++		e.w(h)
++	}
+ 	return e.Bytes()
+ }
+ 
+@@ -236,8 +283,22 @@ func (s *State) Root() Hash {
+ 		e.w(w.Account, w.PkScript, w.Amount, w.Due)
+ 		add('w', k.Bytes(), e.Bytes())
+ 	}
++	for id, c := range s.Categories {
++		add('k', id[:], encodeCategory(c))
++		for i, u := range c.Units {
++			add('q', unitKey(id, i), encodeUnit(u))
++		}
++	}
++	for id, pr := range s.Proposals {
++		add('r', id[:], encodeProposal(pr))
++	}
++	for id, f := range s.FECommits {
++		add('f', id[:], encodeFECommit(f))
++	}
+ 	var c enc
+-	c.w(s.NextSeq, s.TotalIn, s.PaidOut)
++	st := s.Stats
++	c.w(s.NextSeq, s.TotalIn, s.PaidOut, st.SettledJobs, st.SettledStages, st.PoolUnits, st.PoolPaid, st.Checks,
++		st.DecoysCaught, st.DecoysMissed, st.JackpotsPaid)
+ 	add('c', nil, c.Bytes())
+ 	sort.Slice(items, func(i, j int) bool { return bytes.Compare(items[i].k, items[j].k) < 0 })
+ 	leaves := make([]Hash, len(items))
+diff --git a/node/jobstate/testdata/step5_vectors.json b/node/jobstate/testdata/step5_vectors.json
+new file mode 100644
+index 00000000..696ae36c
+--- /dev/null
++++ b/node/jobstate/testdata/step5_vectors.json
+@@ -0,0 +1,16 @@
++{
++ "record": "0103927c63061211a67d303a262b5dd67d60075ebaea6965dde0abc5e76a723b05935dae8b2c17b58d5e65b1210566af29db0da204e1e749fef9bf411d460853ba13c0099335105247547749ba3b0fb1ff6b2fbfe1ee416599400d35065940e098f1",
++ "salt": "63479ad69a090b258277ec8fba6f99419a2ffb248981510657c944ccd1148e97",
++ "commitment": "d7666c5f3c04e48662f7bf86468dd1f36615b2a961db90a48ce871aa80321459",
++ "work_root": "bef74270d65f5c1a84fd71adc825adf5edee1746810b009dbd752202cb91f28c",
++ "unit3_proof": [
++  "5a93ed8fd53032d7bccb6bfac2292498e363945fb8659dafa6e14736b45005bd",
++  "476f712e120fc98e4032530cab58aa6e8d459ad25141e330be248e37c5e891b2",
++  "3c5d5175ef59dd7419a34ac67749b3a93c94392fbf3ea93f80b72101f887a577"
++ ],
++ "canary_root": "3eb27721ba3bbb29176a593feea87f5e52d94ca77ad901c856442b1a42a90490",
++ "canary_proof": [
++  "b5a2c96250612366ea272ffac6d9744aaf4b45aacd96aa7cfcb931ee3b558259",
++  "d6f175817f886ec6fbbc1515326465fa96c3bfd54a4ea06cfd6dbbd8340e0152"
++ ]
++}
+diff --git a/node/jobstate/types.go b/node/jobstate/types.go
+index 02eee6dd..ba050e09 100644
+--- a/node/jobstate/types.go
++++ b/node/jobstate/types.go
+@@ -29,6 +29,8 @@ func (a AccountID) String() string { return fmt.Sprintf("%x", a[:6]) }
+ var (
+ 	PoolAccount     = AccountID{'u', 'w', 'c', ':', 'p', 'o', 'o', 'l'}
+ 	TreasuryAccount = AccountID{'u', 'w', 'c', ':', 't', 'r', 'e', 'a', 's', 'u', 'r', 'y'}
++	// CouncilAccount is the actor of actions approved by a threshold of Params.Council.
++	CouncilAccount = AccountID{'u', 'w', 'c', ':', 'c', 'o', 'u', 'n', 'c', 'i', 'l'}
+ )
+ 
+ // AccountForScript is the module account controlled by whoever can spend pkScript.
+@@ -61,6 +63,21 @@ type Params struct {
+ 	ServeWindow          int32 // blocks for the provider to serve requested stage inputs
+ 	WithdrawDelay        int32
+ 	UnbondDelay          int32
++
++	// Public-good pool (build step 5)
++	PoolEpoch   int32 // units settled in an epoch share that epoch's payout
++	PoolSpendBP int64 // share of a category's budget paid out at the end of an epoch with deliveries
++
++	// Watchers and forced errors (build step 5)
++	WatchFee       Amount // a CHALLENGE whose root matches the provider's costs only this, paid to the provider
++	Jackpot        Amount // paid from a revealed forced-error reserve to whoever caught a decoy
++	FERevealWindow int32  // a forced-error commitment not revealed within this many blocks expires
++
++	// Council: a t-of-m set of keyholders that approves pool categories and forced-error
++	// commitments. Empty (the default) disables both.
++	Council          []AccountID
++	CouncilThreshold int
++	ProposalWindow   int32
+ }
+ 
+ // DefaultParams follow the starting values of Design v3 (fee split 98/1/1, bond >= 50% of fee,
+@@ -74,6 +91,8 @@ func DefaultParams() Params {
+ 		CommitteeDelay: 2, VerifyCommitWindow: 10, VerifyRevealWindow: 10, ProviderRevealWindow: 10,
+ 		ChallengeWindow: 1440, DisputeTimeout: 2880, WithdrawDelay: 6, UnbondDelay: 2880,
+ 		GameWindow: 10, ServeWindow: 10,
++		PoolEpoch: 60, PoolSpendBP: 10_000,
++		WatchFee: 10_000, Jackpot: 5_000_000, FERevealWindow: 20_160, ProposalWindow: 1440,
+ 	}
+ }
+ 
+@@ -182,8 +201,20 @@ type Job struct {
+ 	ChallengeEnd int32  // end of the challenge window (restored after a dispute the provider wins)
+ 	Game         *Game
+ 	DataReqs     []DataReq
++
++	AcceptHeight int32
++	Catchers     []AccountID // who caught the provider, when it failed (forced-error jackpots)
++	Pool         Hash        // category, for a pool unit (zero for client jobs)
++	Unit         uint32      // index of the unit in the category's work list
++	Canary       []Hash      // expected stage roots, once a canary unit is revealed (all stages are then checked)
++	CanaryBy     AccountID
++	CanaryBond   Amount
++	Decoy        bool // revealed as a forced-error decoy
+ }
+ 
++// IsPool reports whether the job is a public-good pool unit.
++func (j *Job) IsPool() bool { return j.Pool != (Hash{}) }
++
+ // Withdrawal is a pending payout from the module to a pkScript.
+ type Withdrawal struct {
+ 	Seq      uint64
+-- 
+2.30.2
+

@@ -63,4 +63,5 @@ sparse Merkle tree can replace it later without changing the rules above.
   their commit hash. It removes an off-chain request step: the provider learns which stages to reveal from the chain.
 - **Serve-or-slash for stage inputs** (doc step 7): the data itself is off-chain. On-chain
   request and serve evidence is left to step 4.
-- **Pool spending** (doc step 5): this step only credits ρ · subsidy to the POOL account.
+- **Pool spending** (doc step 5): step 3 only credits ρ · subsidy to the POOL account; categories,
+  unit pricing, canaries and forced errors are in `spec/pool-and-watchers.md`.
