@@ -107,6 +107,7 @@ class DetQwen3:
     def __init__(self, hf_model, device, hadamard_block: int = 512, mine: bool = True, max_pos: int = 8192):
         cfg = hf_model.config
         self.cfg, self.device = cfg, torch.device(device)
+        self.hadamard_block = hadamard_block
         self.D, self.H, self.Hkv = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads
         self.hd = getattr(cfg, "head_dim", None) or self.D // self.H
         self.eps = cfg.rms_norm_eps
