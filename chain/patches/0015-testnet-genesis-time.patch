@@ -1,0 +1,28 @@
+From 795e58ce9a73c6f89ff8de1452391ef268abf653 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 16:24:46 +0530
+Subject: [PATCH] uwc-testnet: genesis timestamp in the past (10:00 UTC) so
+ block times can advance
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/chaincfg/uwc_testnet.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/node/chaincfg/uwc_testnet.go b/node/chaincfg/uwc_testnet.go
+index d121bc00..41b27bbb 100644
+--- a/node/chaincfg/uwc_testnet.go
++++ b/node/chaincfg/uwc_testnet.go
+@@ -48,7 +48,7 @@ var uwcTestNetGenesisBlock = func() wire.MsgBlock {
+ 			BlockHeader: wire.BlockHeader{
+ 				Version:    1,
+ 				MerkleRoot: genesisMerkleRoot,
+-				Timestamp:  time.Unix(1793966400, 0), // 2026-11-06 12:00:00 UTC
++				Timestamp:  time.Unix(1793959200, 0), // 2026-11-06 10:00:00 UTC (in the past at launch)
+ 				Bits:       0x1a020000,               // 2^201: about one block a minute at 550 TMAC/s
+ 			},
+ 		},
+-- 
+2.30.2
+

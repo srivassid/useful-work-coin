@@ -291,3 +291,30 @@ Next:
    jobs have hundreds of stages, so verification overhead approaches the design's k·n/S.
 3. Testnet parameters: reply windows of 30+ blocks; mempool persistence or rebroadcast in `pearld`.
 4. Milestone 5 (public) needs the user's decision on exposure, hosting and outside clients.
+
+## Testnet launch (2026-11-06, in progress)
+
+`uwc-testnet` is running privately on the LAN (ports 18690–18692), with three nodes:
+- box 71: miners on GPUs 0 and 2;
+- the 5090 box: miner on GPU 0;
+- .245: miners on torch GPUs 1–4.
+
+All nodes were at height 5 with peers a few minutes after launch. Files are in
+`~/Documents/useful-work-coin/testnet/` on each box; keys are in `~/.uwc/testnet/keys` (council
+and all roles). The first launch used a genesis time in the future, so it was wiped and relaunched
+(patch 0015).
+
+Done: the main pool work list, `testnet/pool/wiki8x128` on box 71 (100 units of 8 sequences,
+56 stages each, work root `e751e6b8…`). The model file has the new runtime hash.
+
+Not done yet:
+1. After 20+ blocks, fund the role keys from `miner71` (send + deposit).
+2. Register the model (`uwc.sh modelreg … models/qwen3-1.7b.json`).
+3. Set the model id in `pool/wiki8x128.category.json`, then council0 proposes and council1 approves.
+4. Canary category (`agent.canary --per-unit 8 --devnet ~/…/testnet`) and the forced-error commit
+   (`agent.fe commit`), both with `UWC_HOME=~/.uwc/testnet`.
+5. Start `data.sh` and `metrics.sh` on box 71, then the agents with `agent.sh`:
+   provider `miner71 --mine` on GPU 1, `provider245 --mine` on GPU 0, verifiers, watchers (one
+   with `--lie`), client (`--batches 16`), curator, decoy.
+6. Check live: mempool persistence (restart a node with pending moves), served inputs, the new
+   game rounds, and the forced-error reveal.

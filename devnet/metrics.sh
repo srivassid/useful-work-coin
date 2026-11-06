@@ -5,7 +5,7 @@ D=$(cd "$(dirname "$0")" && pwd)
 source "$D/env"
 cd "$D/../repo/runtime"
 while true; do
-  "$VENV/bin/python" -m agent.metrics --devnet "$D" --extra "$@" --json "$D/data/metrics.json.tmp" > /dev/null 2>&1 \
+  UWC_HOME="${UWC_HOME:-$HOME/.uwc/devnet}" "$VENV/bin/python" -m agent.metrics --devnet "$D" --extra "$@" --json "$D/data/metrics.json.tmp" > /dev/null 2>&1 \
     && mv -f "$D/data/metrics.json.tmp" "$D/data/metrics.json"
   sleep 300
 done

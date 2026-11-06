@@ -50,12 +50,14 @@ def wikitext_sequences(dataset_dir: str, tokenizer_dir: str, seq_len: int, count
     return out
 
 
-def save_units(path: str, seqs: list[list[int]]) -> dict:
-    """A pool work list: unit i is one sequence. Writes the units and returns the commitment."""
-    roots = [input_root([s]) for s in seqs]
+def save_units(path: str, seqs: list[list[int]], per_unit: int = 1) -> dict:
+    """A pool work list: unit i is per_unit consecutive sequences (one batch each). Writes the
+    units and returns the commitment."""
+    groups = [seqs[i:i + per_unit] for i in range(0, len(seqs) - per_unit + 1, per_unit)]
+    roots = [input_root(g) for g in groups]
     leaves = [unit_leaf(i, r) for i, r in enumerate(roots)]
-    doc = {"units": [{"tokens": s, "input_root": r.hex()} for s, r in zip(seqs, roots)],
-           "work_root": merkle_root(leaves).hex()}
+    units = [({"tokens": g[0]} if per_unit == 1 else {"batches": g}) | {"input_root": r.hex()} for g, r in zip(groups, roots)]
+    doc = {"units": units, "work_root": merkle_root(leaves).hex()}
     with open(path, "w") as f:
         json.dump(doc, f)
     return doc

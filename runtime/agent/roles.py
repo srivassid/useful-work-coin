@@ -112,7 +112,10 @@ class Agent:
         data service (checked against input_root)."""
         if j.get("pool"):
             doc = self.lists.get(self.work_root(j["pool"]))
-            return [doc["units"][j["unit"]]["tokens"]] if doc else None
+            if not doc:
+                return None
+            u = doc["units"][j["unit"]]
+            return u["batches"] if "batches" in u else [u["tokens"]]
         raw = self.data.get(f"/inputs/{j['inputroot']}.json")
         if raw is None:
             return None
@@ -588,7 +591,7 @@ class Curator(Agent):
     role = "curator"
 
     def step(self):
-        secrets_dir = os.path.expanduser("~/.uwc/devnet/canary")
+        secrets_dir = os.path.join(os.path.expanduser(os.environ.get("UWC_HOME", "~/.uwc/devnet")), "canary")
         canaries = {}
         for f in os.listdir(secrets_dir) if os.path.isdir(secrets_dir) else []:
             c = json.load(open(os.path.join(secrets_dir, f)))

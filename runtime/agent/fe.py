@@ -18,8 +18,8 @@ import forced_errors as fe  # noqa: E402
 
 from .chain import Chain  # noqa: E402
 
-KEYS = os.path.expanduser("~/.uwc/devnet/keys")
-FE_DIR = os.path.expanduser("~/.uwc/devnet/fe")
+KEYS = os.path.join(os.path.expanduser(os.environ.get("UWC_HOME", "~/.uwc/devnet")), "keys")
+FE_DIR = os.path.join(os.path.expanduser(os.environ.get("UWC_HOME", "~/.uwc/devnet")), "fe")
 
 
 def wait_mempool(chain: Chain):
