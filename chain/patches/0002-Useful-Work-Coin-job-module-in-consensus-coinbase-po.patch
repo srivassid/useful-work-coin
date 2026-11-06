@@ -1,0 +1,1244 @@
+From 2060dad01993fd44da3cab9f37eac5cfde35c7b6 Mon Sep 17 00:00:00 2001
+From: Sid <sid7513@gmail.com>
+Date: Fri, 6 Nov 2026 06:49:34 +0530
+Subject: [PATCH 2/2] Useful-Work Coin job module in consensus: coinbase pool
+ share, job-state commitment, withdrawals, templates, policy
+
+- chaincfg: Params.JobModule (nil for Pearl networks), UWCSimNetParams
+- blockchain: job deposits/ops from OP_RETURN outputs, ApplyBlock per block, coinbase rules,
+  state cached by block hash and persisted in the uwcjobstate bucket (reorg- and restart-safe)
+- jobstate: withdrawals limited to P2TR/P2MR payout scripts (anything else could never be paid)
+- mining: templates carry pool deposit, due withdrawals and the state root
+- mempool: job outputs exempt from the one-OP_RETURN rule; state commitments only in coinbases
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuAcGXiQmWtSPUcEzo
+---
+ node/blockchain/chain.go          |  14 +
+ node/blockchain/jobs.go           | 361 +++++++++++++++++++++++
+ node/blockchain/jobs_test.go      | 462 ++++++++++++++++++++++++++++++
+ node/blockchain/validate.go       |  15 +
+ node/chaincfg/params.go           |  16 ++
+ node/jobstate/apply.go            |   9 +-
+ node/jobstate/jobstate_test.go    |  18 +-
+ node/mempool/jobs_policy_test.go  |  50 ++++
+ node/mempool/policy.go            |  10 +-
+ node/mining/jobs_template_test.go |  52 ++++
+ node/mining/mining.go             |  18 ++
+ 11 files changed, 1018 insertions(+), 7 deletions(-)
+ create mode 100644 node/blockchain/jobs.go
+ create mode 100644 node/blockchain/jobs_test.go
+ create mode 100644 node/mempool/jobs_policy_test.go
+ create mode 100644 node/mining/jobs_template_test.go
+
+diff --git a/node/blockchain/chain.go b/node/blockchain/chain.go
+index ba9e6cfd..a9eea352 100644
+--- a/node/blockchain/chain.go
++++ b/node/blockchain/chain.go
+@@ -131,6 +131,9 @@ type BlockChain struct {
+ 	// It is protected by the chain lock.
+ 	utxoCache *utxoCache
+ 
++	// jobs caches Useful-Work Coin job states by block hash (see jobs.go).
++	jobs jobCache
++
+ 	// These fields are related to handling of orphan blocks.  They are
+ 	// protected by a combination of the chain lock and the orphan lock.
+ 	orphanLock   sync.RWMutex
+@@ -685,6 +688,17 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
+ 			return err
+ 		}
+ 
++		// Useful-Work Coin: persist the job state after this block.
++		if b.chainParams.JobModule != nil {
++			st, err := b.ensureJobState(node, block, stxos)
++			if err != nil {
++				return err
++			}
++			if err := dbPutJobState(dbTx, &node.hash, st); err != nil {
++				return err
++			}
++		}
++
+ 		// Allow the index manager to call each of the currently active
+ 		// optional indexes with the block being connected so they can
+ 		// update themselves accordingly.
+diff --git a/node/blockchain/jobs.go b/node/blockchain/jobs.go
+new file mode 100644
+index 00000000..63a776d4
+--- /dev/null
++++ b/node/blockchain/jobs.go
+@@ -0,0 +1,361 @@
++// Useful-Work Coin job module integration (spec/job-module.md).
++//
++// When chainParams.JobModule is non-nil every block must, in its coinbase:
++//   - deposit at least PoolIssuance(subsidy) to the pool account ("UWCD" output),
++//   - commit the job-state root after the block ("UWCS" output, exactly one),
++//   - pay every withdrawal that falls due at this height (exact value and script),
++// and the coinbase may pay out subsidy + fees + due withdrawals in total.
++// Job operations never make a block invalid: a failed op is a no-op.
++
++package blockchain
++
++import (
++	"bytes"
++	"encoding/gob"
++	"fmt"
++	"sync"
++
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/database"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/txscript"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++// Output tags (first push after OP_RETURN).
++var (
++	JobDepositTag     = []byte("UWCD")
++	JobOpTag          = []byte("UWCJ")
++	JobStateRootTag   = []byte("UWCS")
++	jobStateBucket    = []byte("uwcjobstate")
++	maxJobDataPerPush = txscript.MaxScriptElementSize
++)
++
++// JobDepositScript credits the output's value to a module account.
++func JobDepositScript(a jobstate.AccountID) []byte {
++	s, _ := txscript.NewScriptBuilder().AddOp(txscript.OP_RETURN).AddData(JobDepositTag).AddData(a[:]).Script()
++	return s
++}
++
++// JobOpScript carries one encoded job operation, split into pushes of at most 520 bytes.
++func JobOpScript(payload []byte) ([]byte, error) {
++	b := txscript.NewScriptBuilder().AddOp(txscript.OP_RETURN).AddData(JobOpTag)
++	for len(payload) > 0 {
++		n := min(len(payload), maxJobDataPerPush)
++		b.AddFullData(payload[:n])
++		payload = payload[n:]
++	}
++	return b.Script()
++}
++
++// JobStateRootScript is the coinbase commitment to the job-state root.
++func JobStateRootScript(root jobstate.Hash) []byte {
++	s, _ := txscript.NewScriptBuilder().AddOp(txscript.OP_RETURN).AddData(JobStateRootTag).AddData(root[:]).Script()
++	return s
++}
++
++// ParseJobOutput returns the tag and the concatenated data pushes of a job-module output,
++// or nil tag if the script is not one.
++func ParseJobOutput(pkScript []byte) (tag []byte, data []byte) {
++	if len(pkScript) < 6 || pkScript[0] != txscript.OP_RETURN {
++		return nil, nil
++	}
++	tok := txscript.MakeScriptTokenizer(0, pkScript[1:])
++	first := true
++	for tok.Next() {
++		if tok.Opcode() > txscript.OP_PUSHDATA4 {
++			return nil, nil // only data pushes are allowed
++		}
++		if first {
++			t := tok.Data()
++			if !bytes.Equal(t, JobDepositTag) && !bytes.Equal(t, JobOpTag) && !bytes.Equal(t, JobStateRootTag) {
++				return nil, nil
++			}
++			tag, first = t, false
++			continue
++		}
++		data = append(data, tok.Data()...)
++	}
++	if tok.Err() != nil || first {
++		return nil, nil
++	}
++	return tag, data
++}
++
++// ---------------------------------------------------------------- state cache
++
++type jobCache struct {
++	mu     sync.Mutex
++	states map[chainhash.Hash]*jobstate.State
++}
++
++func (c *jobCache) get(h chainhash.Hash) *jobstate.State {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.states[h]
++}
++
++func (c *jobCache) put(h chainhash.Hash, s *jobstate.State) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.states == nil {
++		c.states = map[chainhash.Hash]*jobstate.State{}
++	}
++	c.states[h] = s
++}
++
++// jobStateAfter is the job state after block h (empty at genesis). It is read from the
++// in-memory cache, else from the database. The returned state must not be modified.
++func (b *BlockChain) jobStateAfter(h *chainhash.Hash) (*jobstate.State, error) {
++	if h.IsEqual(b.chainParams.GenesisHash) {
++		return jobstate.NewState(), nil
++	}
++	if s := b.jobs.get(*h); s != nil {
++		return s, nil
++	}
++	var st *jobstate.State
++	err := b.db.View(func(dbTx database.Tx) error {
++		bkt := dbTx.Metadata().Bucket(jobStateBucket)
++		if bkt == nil {
++			return nil
++		}
++		raw := bkt.Get(h[:])
++		if raw == nil {
++			return nil
++		}
++		st = jobstate.NewState()
++		return gob.NewDecoder(bytes.NewReader(raw)).Decode(st)
++	})
++	if err != nil {
++		return nil, err
++	}
++	if st == nil {
++		return nil, AssertError(fmt.Sprintf("no job state for block %v", h))
++	}
++	b.jobs.put(*h, st)
++	return st, nil
++}
++
++func dbPutJobState(dbTx database.Tx, h *chainhash.Hash, s *jobstate.State) error {
++	bkt, err := dbTx.Metadata().CreateBucketIfNotExists(jobStateBucket)
++	if err != nil {
++		return err
++	}
++	var buf bytes.Buffer
++	if err := gob.NewEncoder(&buf).Encode(s); err != nil {
++		return err
++	}
++	return bkt.Put(h[:], buf.Bytes())
++}
++
++// ---------------------------------------------------------------- block rules
++
++// jobOpsFromBlock collects deposits and ops in transaction order. It must run before the
++// block's transactions are connected to the view, so the first input's previous output
++// (which authorizes the op) is still there.
++func jobOpsFromBlock(block *btcutil.Block, view *UtxoViewpoint) ([]jobstate.Deposit, []*jobstate.Op) {
++	inBlock := map[chainhash.Hash]*wire.MsgTx{}
++	prevScript := func(_ *btcutil.Tx, op wire.OutPoint) []byte {
++		if tx, ok := inBlock[op.Hash]; ok { // created earlier in this block
++			if int(op.Index) < len(tx.TxOut) {
++				return tx.TxOut[op.Index].PkScript
++			}
++			return nil
++		}
++		if e := view.LookupEntry(op); e != nil {
++			return e.PkScript()
++		}
++		return nil
++	}
++	return extractJobOps(block, prevScript, func(tx *btcutil.Tx) { inBlock[*tx.Hash()] = tx.MsgTx() })
++}
++
++// jobOpsFromStxos does the same for a block already connected, using its spend journal
++// (spent outputs in input order, coinbase excluded).
++func jobOpsFromStxos(block *btcutil.Block, stxos []SpentTxOut) ([]jobstate.Deposit, []*jobstate.Op) {
++	first := map[chainhash.Hash][]byte{}
++	i := 0
++	for _, tx := range block.Transactions()[1:] {
++		if i < len(stxos) {
++			first[*tx.Hash()] = stxos[i].PkScript
++		}
++		i += len(tx.MsgTx().TxIn)
++	}
++	return extractJobOps(block, func(tx *btcutil.Tx, _ wire.OutPoint) []byte { return first[*tx.Hash()] },
++		func(*btcutil.Tx) {})
++}
++
++// extractJobOps walks the block in order. prevScript returns the pkScript spent by a
++// transaction's first input; seen is called after each transaction.
++func extractJobOps(block *btcutil.Block, prevScript func(*btcutil.Tx, wire.OutPoint) []byte,
++	seen func(*btcutil.Tx)) ([]jobstate.Deposit, []*jobstate.Op) {
++	var deps []jobstate.Deposit
++	var ops []*jobstate.Op
++	for ti, tx := range block.Transactions() {
++		var actor *jobstate.AccountID
++		for oi, out := range tx.MsgTx().TxOut {
++			tag, data := ParseJobOutput(out.PkScript)
++			switch {
++			case tag == nil:
++				continue
++			case bytes.Equal(tag, JobDepositTag):
++				if len(data) == 32 && out.Value > 0 {
++					var a jobstate.AccountID
++					copy(a[:], data)
++					deps = append(deps, jobstate.Deposit{Account: a, Amount: out.Value})
++				}
++			case bytes.Equal(tag, JobOpTag):
++				if ti == 0 {
++					continue // the coinbase cannot act: it has no authorizing input
++				}
++				op, err := jobstate.DecodeOp(data)
++				if err != nil {
++					continue
++				}
++				if actor == nil {
++					ps := prevScript(tx, tx.MsgTx().TxIn[0].PreviousOutPoint)
++					if ps == nil {
++						break
++					}
++					a := jobstate.AccountForScript(ps)
++					actor = &a
++				}
++				op.Actor = *actor
++				var ref [36]byte
++				copy(ref[:32], tx.Hash()[:])
++				ref[32], ref[33], ref[34], ref[35] = byte(oi), byte(oi>>8), byte(oi>>16), byte(oi>>24)
++				op.Ref = jobstate.Hash(chainhash.HashH(ref[:]))
++				ops = append(ops, op)
++			}
++		}
++		seen(tx)
++	}
++	return deps, ops
++}
++
++// checkJobRules applies the block to its parent's job state and checks the coinbase. It
++// returns the total of withdrawals paid by this coinbase (allowed on top of subsidy + fees)
++// and caches the resulting state under the block hash.
++func (b *BlockChain) checkJobRules(node *blockNode, block *btcutil.Block, deps []jobstate.Deposit,
++	ops []*jobstate.Op) (int64, error) {
++
++	jp := b.chainParams.JobModule
++	parentState, err := b.jobStateAfter(&node.parent.hash)
++	if err != nil {
++		return 0, err
++	}
++	st := parentState.Clone()
++	res := jobstate.ApplyBlock(st, *jp, jobstate.BlockInput{Height: node.height,
++		PrevHash: jobstate.Hash(node.parent.hash), Deposits: deps, Ops: ops})
++
++	subsidy := CalcBlockSubsidy(node.height, b.chainParams)
++	coinbase := block.Transactions()[0].MsgTx()
++	var pool int64
++	var commits [][]byte
++	for _, out := range coinbase.TxOut {
++		tag, data := ParseJobOutput(out.PkScript)
++		switch {
++		case bytes.Equal(tag, JobDepositTag) && len(data) == 32 && jobstate.AccountID(data) == jobstate.PoolAccount:
++			pool += out.Value
++		case bytes.Equal(tag, JobStateRootTag):
++			commits = append(commits, data)
++		}
++	}
++	if need := jobstate.PoolIssuance(*jp, subsidy); pool < need {
++		return 0, ruleError(ErrBadCoinbaseValue, fmt.Sprintf("coinbase deposits %d to the pool, needs %d", pool, need))
++	}
++	if len(commits) != 1 || !bytes.Equal(commits[0], res.Root[:]) {
++		return 0, ruleError(ErrBadCoinbaseValue, fmt.Sprintf("coinbase must commit job-state root %x", res.Root))
++	}
++	// every due withdrawal must be paid by a distinct coinbase output with that exact value and script
++	used := make([]bool, len(coinbase.TxOut))
++	var total int64
++	for _, w := range res.Withdrawals {
++		found := false
++		for i, out := range coinbase.TxOut {
++			if !used[i] && out.Value == w.Amount && bytes.Equal(out.PkScript, w.PkScript) {
++				used[i], found = true, true
++				break
++			}
++		}
++		if !found {
++			return 0, ruleError(ErrBadCoinbaseValue, fmt.Sprintf("coinbase does not pay due withdrawal %d of %d", w.Seq, w.Amount))
++		}
++		total += w.Amount
++	}
++	b.jobs.put(node.hash, st)
++	return total, nil
++}
++
++// ensureJobState computes the state for a block connected without checkConnectBlock
++// (checkpointed fast-add), from its spend journal. Coinbase rules are not re-checked.
++func (b *BlockChain) ensureJobState(node *blockNode, block *btcutil.Block, stxos []SpentTxOut) (*jobstate.State, error) {
++	if st := b.jobs.get(node.hash); st != nil {
++		return st, nil
++	}
++	parentState, err := b.jobStateAfter(&node.parent.hash)
++	if err != nil {
++		return nil, err
++	}
++	deps, ops := jobOpsFromStxos(block, stxos)
++	st := parentState.Clone()
++	jobstate.ApplyBlock(st, *b.chainParams.JobModule, jobstate.BlockInput{Height: node.height,
++		PrevHash: jobstate.Hash(node.parent.hash), Deposits: deps, Ops: ops})
++	b.jobs.put(node.hash, st)
++	return st, nil
++}
++
++// JobTemplate is what a miner must add to a coinbase for a block with the given
++// non-coinbase transactions on top of the current tip.
++type JobTemplate struct {
++	PoolDeposit int64                 // value of the pool deposit output
++	Withdrawals []jobstate.Withdrawal // outputs to pay
++	Root        jobstate.Hash         // state commitment
++}
++
++// JobTemplateFor evaluates txs (without the coinbase) on top of the tip. extraDeposits are
++// deposit outputs the miner itself puts in the coinbase besides the pool share.
++func (b *BlockChain) JobTemplateFor(txs []*btcutil.Tx, extraDeposits []jobstate.Deposit) (*JobTemplate, error) {
++	jp := b.chainParams.JobModule
++	if jp == nil {
++		return nil, nil
++	}
++	b.chainLock.RLock()
++	defer b.chainLock.RUnlock()
++	tip := b.bestChain.Tip()
++	height := tip.height + 1
++	parentState, err := b.jobStateAfter(&tip.hash)
++	if err != nil {
++		return nil, err
++	}
++	// A throwaway block (coinbase placeholder + txs) lets us reuse the same extraction code.
++	msg := &wire.MsgBlock{Transactions: []*wire.MsgTx{wire.NewMsgTx(1)}}
++	for _, tx := range txs {
++		msg.Transactions = append(msg.Transactions, tx.MsgTx())
++	}
++	blk := btcutil.NewBlock(msg)
++	view := NewUtxoViewpoint()
++	view.SetBestHash(&tip.hash)
++	if err := view.fetchInputUtxos(b.utxoCache, blk); err != nil {
++		return nil, err
++	}
++	deps, ops := jobOpsFromBlock(blk, view)
++	pool := jobstate.PoolIssuance(*jp, CalcBlockSubsidy(height, b.chainParams))
++	deps = append(append([]jobstate.Deposit{{Account: jobstate.PoolAccount, Amount: pool}}, extraDeposits...), deps...)
++	st := parentState.Clone()
++	res := jobstate.ApplyBlock(st, *jp, jobstate.BlockInput{Height: height, PrevHash: jobstate.Hash(tip.hash),
++		Deposits: deps, Ops: ops})
++	return &JobTemplate{PoolDeposit: pool, Withdrawals: res.Withdrawals, Root: res.Root}, nil
++}
++
++// JobStateAtTip returns a copy of the job state after the current best block.
++func (b *BlockChain) JobStateAtTip() (*jobstate.State, error) {
++	b.chainLock.RLock()
++	defer b.chainLock.RUnlock()
++	st, err := b.jobStateAfter(&b.bestChain.Tip().hash)
++	if err != nil {
++		return nil, err
++	}
++	return st.Clone(), nil
++}
+diff --git a/node/blockchain/jobs_test.go b/node/blockchain/jobs_test.go
+new file mode 100644
+index 00000000..339defb0
+--- /dev/null
++++ b/node/blockchain/jobs_test.go
+@@ -0,0 +1,462 @@
++package blockchain
++
++import (
++	"crypto/sha256"
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/pearl-research-labs/pearl/node/btcec"
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg"
++	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/txscript"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++// ---------------------------------------------------------------- harness
++
++type jkey struct {
++	priv   *btcec.PrivateKey
++	script []byte
++	acct   jobstate.AccountID
++}
++
++func newJKey(i byte) jkey {
++	priv, _ := btcec.PrivKeyFromBytes([]byte{i, 0x55, 0xaa})
++	script, _ := txscript.PayToTaprootScript(txscript.ComputeTaprootKeyNoScript(priv.PubKey()))
++	return jkey{priv, script, jobstate.AccountForScript(script)}
++}
++
++type jutxo struct {
++	op    wire.OutPoint
++	value int64
++	key   jkey
++}
++
++type jchain struct {
++	t     *testing.T
++	chain *BlockChain
++	tip   *btcutil.Block
++	miner jkey
++	coins map[jobstate.AccountID][]jutxo
++	jp    jobstate.Params
++}
++
++func uwcTestParams() *chaincfg.Params {
++	p := chaincfg.UWCSimNetParams
++	jp := *p.JobModule
++	jp.ChallengeWindow, jp.DisputeTimeout, jp.WithdrawDelay, jp.UnbondDelay = 4, 6, 3, 5
++	jp.VerifyCommitWindow, jp.VerifyRevealWindow, jp.ProviderRevealWindow = 3, 3, 3
++	p.JobModule = &jp
++	return &p
++}
++
++func newJChain(t *testing.T) (*jchain, func()) {
++	params := uwcTestParams()
++	chain, teardown, err := chainSetup("jobmodule", params)
++	if err != nil {
++		t.Fatal(err)
++	}
++	chain.TstSetCoinbaseMaturity(1)
++	genesis := btcutil.NewBlock(params.GenesisBlock)
++	genesis.SetHeight(0)
++	return &jchain{t: t, chain: chain, tip: genesis, miner: newJKey(200), coins: map[jobstate.AccountID][]jutxo{},
++		jp: *params.JobModule}, teardown
++}
++
++// buildBlock assembles a block on the tip: coinbase with the job template's outputs, then txs.
++// mutate may tamper with the coinbase (negative tests).
++func (c *jchain) buildBlock(txs []*wire.MsgTx, mutate func(cb *wire.MsgTx, tpl *JobTemplate)) *btcutil.Block {
++	c.t.Helper()
++	height := c.tip.Height() + 1
++	utx := make([]*btcutil.Tx, len(txs))
++	for i, tx := range txs {
++		utx[i] = btcutil.NewTx(tx)
++	}
++	tpl, err := c.chain.JobTemplateFor(utx, nil)
++	if err != nil {
++		c.t.Fatal(err)
++	}
++	subsidy := CalcBlockSubsidy(height, c.chain.chainParams)
++	cbScript, _ := txscript.NewScriptBuilder().AddInt64(int64(height)).AddInt64(time.Now().UnixNano()).Script()
++	cb := wire.NewMsgTx(1)
++	cb.AddTxIn(&wire.TxIn{PreviousOutPoint: *wire.NewOutPoint(&chainhash.Hash{}, wire.MaxPrevOutIndex),
++		Sequence: wire.MaxTxInSequenceNum, SignatureScript: cbScript})
++	cb.AddTxOut(wire.NewTxOut(subsidy-tpl.PoolDeposit, c.miner.script))
++	cb.AddTxOut(wire.NewTxOut(tpl.PoolDeposit, JobDepositScript(jobstate.PoolAccount)))
++	for _, w := range tpl.Withdrawals {
++		cb.AddTxOut(wire.NewTxOut(w.Amount, w.PkScript))
++	}
++	cb.AddTxOut(wire.NewTxOut(0, JobStateRootScript(tpl.Root)))
++	if mutate != nil {
++		mutate(cb, tpl)
++	}
++	all := append([]*wire.MsgTx{cb}, txs...)
++	if len(txs) > 0 { // Taproot spends carry witnesses: commit them like mining.AddWitnessCommitment
++		ut := make([]*btcutil.Tx, len(all))
++		for i, tx := range all {
++			ut[i] = btcutil.NewTx(tx)
++		}
++		addTestWitnessCommitment(ut)
++	}
++	header := wire.BlockHeader{Version: 1, PrevBlock: *c.tip.Hash(), MerkleRoot: calcMerkleRoot(all),
++		Bits: c.chain.chainParams.PowLimitBits, Timestamp: c.tip.MsgBlock().BlockHeader().Timestamp.Add(time.Second)}
++	if height == 1 {
++		header.Timestamp = time.Unix(time.Now().Unix(), 0)
++	}
++	cert, err := SolveBlock(&header, c.chain.chainParams, height)
++	if err != nil {
++		c.t.Fatal(err)
++	}
++	blk := btcutil.NewBlock(&wire.MsgBlock{MsgHeader: wire.MsgHeader{BlockHeader: header,
++		MsgCertificate: wire.MsgCertificate{Certificate: cert}}, Transactions: all})
++	blk.SetHeight(height)
++	return blk
++}
++
++// mine processes a block and, if accepted onto the main chain, tracks its spendable outputs.
++func (c *jchain) mine(txs []*wire.MsgTx, mutate func(*wire.MsgTx, *JobTemplate)) error {
++	c.t.Helper()
++	blk := c.buildBlock(txs, mutate)
++	isMain, _, err := c.chain.ProcessBlock(blk, BFNone)
++	if err != nil {
++		return err
++	}
++	if !isMain {
++		return errors.New("block not on main chain")
++	}
++	c.tip = blk
++	for _, tx := range blk.Transactions() {
++		for _, in := range tx.MsgTx().TxIn {
++			c.spent(in.PreviousOutPoint)
++		}
++		for i, out := range tx.MsgTx().TxOut {
++			for _, k := range c.keys() {
++				if string(out.PkScript) == string(k.script) {
++					c.coins[k.acct] = append(c.coins[k.acct], jutxo{wire.OutPoint{Hash: *tx.Hash(), Index: uint32(i)}, out.Value, k})
++				}
++			}
++		}
++	}
++	return nil
++}
++
++func (c *jchain) mustMine(txs ...*wire.MsgTx) {
++	c.t.Helper()
++	if err := c.mine(txs, nil); err != nil {
++		c.t.Fatalf("block rejected: %v", err)
++	}
++}
++
++var jkeys = map[jobstate.AccountID]jkey{}
++
++func (c *jchain) keys() []jkey {
++	out := []jkey{c.miner}
++	for _, k := range jkeys {
++		out = append(out, k)
++	}
++	return out
++}
++
++func (c *jchain) spent(op wire.OutPoint) {
++	for a, list := range c.coins {
++		kept := list[:0]
++		for _, u := range list {
++			if u.op != op {
++				kept = append(kept, u)
++			}
++		}
++		c.coins[a] = kept
++	}
++}
++
++// tx spends one coin of `from` (so `from` authorizes any job op in it), pays the outputs and
++// returns the change to `from`.
++func (c *jchain) tx(from jkey, outs ...*wire.TxOut) *wire.MsgTx {
++	c.t.Helper()
++	coins := c.coins[from.acct]
++	if len(coins) == 0 {
++		c.t.Fatalf("no coins for %v", from.acct)
++	}
++	u := coins[len(coins)-1]
++	tx := wire.NewMsgTx(1)
++	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: u.op, Sequence: wire.MaxTxInSequenceNum})
++	var sum int64
++	for _, o := range outs {
++		tx.AddTxOut(o)
++		sum += o.Value
++	}
++	const fee = 2_000
++	if change := u.value - sum - fee; change > 0 {
++		tx.AddTxOut(wire.NewTxOut(change, from.script))
++	} else if change < 0 {
++		c.t.Fatalf("coin %d too small for %d", u.value, sum)
++	}
++	fetcher := txscript.NewMultiPrevOutFetcher(map[wire.OutPoint]*wire.TxOut{u.op: {Value: u.value, PkScript: from.script}})
++	wit, err := txscript.TaprootWitnessSignature(tx, txscript.NewTxSigHashes(tx, fetcher), 0, u.value, from.script,
++		txscript.SigHashDefault, from.priv)
++	if err != nil {
++		c.t.Fatal(err)
++	}
++	tx.TxIn[0].SetWitness(wit)
++	c.coins[from.acct] = coins[:len(coins)-1]
++	return tx
++}
++
++func opOut(t *testing.T, o *jobstate.Op) *wire.TxOut {
++	s, err := JobOpScript(o.Encode())
++	if err != nil {
++		t.Fatal(err)
++	}
++	return wire.NewTxOut(0, s)
++}
++
++func (c *jchain) state() *jobstate.State {
++	c.t.Helper()
++	st, err := c.chain.JobStateAtTip()
++	if err != nil {
++		c.t.Fatal(err)
++	}
++	return st
++}
++
++func expectRule(t *testing.T, err error, what string) {
++	t.Helper()
++	var re RuleError
++	if !errors.As(err, &re) {
++		t.Fatalf("%s: expected a rule error, got %v", what, err)
++	}
++}
++
++// ---------------------------------------------------------------- the test
++
++func TestJobModuleConsensus(t *testing.T) {
++	c, teardown := newJChain(t)
++	defer teardown()
++	client, provider := newJKey(1), newJKey(2)
++	vs := []jkey{newJKey(10), newJKey(11), newJKey(12)}
++	for _, k := range append([]jkey{client, provider}, vs...) {
++		jkeys[k.acct] = k
++	}
++
++	// pool issuance is credited every block and the root is committed
++	var pool int64
++	for i := 0; i < 3; i++ {
++		c.mustMine()
++		pool += jobstate.PoolIssuance(c.jp, CalcBlockSubsidy(c.tip.Height(), c.chain.chainParams))
++	}
++	if got := c.state().Accounts[jobstate.PoolAccount]; got != pool || pool == 0 {
++		t.Fatalf("pool balance %d, want %d", got, pool)
++	}
++
++	// coinbase rules: wrong root, short pool deposit, overpaying miner are all rejected
++	expectRule(t, c.mine(nil, func(cb *wire.MsgTx, _ *JobTemplate) {
++		cb.TxOut[len(cb.TxOut)-1].PkScript = JobStateRootScript(jobstate.Hash{1})
++	}), "wrong state root")
++	expectRule(t, c.mine(nil, func(cb *wire.MsgTx, tpl *JobTemplate) {
++		cb.TxOut[0].Value += 1
++		cb.TxOut[1].Value -= 1
++	}), "short pool deposit")
++	expectRule(t, c.mine(nil, func(cb *wire.MsgTx, _ *JobTemplate) { cb.TxOut[0].Value += 1 }), "overpaying coinbase")
++
++	// fund everyone: one P2TR coin each, plus module deposits
++	var outs []*wire.TxOut
++	for _, k := range append([]jkey{client, provider}, vs...) {
++		outs = append(outs, wire.NewTxOut(50_000_000, k.script), wire.NewTxOut(30_000_000, JobDepositScript(k.acct)))
++	}
++	c.mustMine(c.tx(c.miner, outs...))
++	for _, k := range append([]jkey{client, provider}, vs...) {
++		if c.state().Accounts[k.acct] != 30_000_000 {
++			t.Fatalf("deposit not credited to %v", k.acct)
++		}
++	}
++
++	// a withdrawal must be paid by the coinbase exactly at its due height
++	wd := &jobstate.Op{Kind: jobstate.OpWithdraw, Amount: 1_234_567, PkScript: client.script}
++	c.mustMine(c.tx(client, opOut(t, wd)))
++	due := c.tip.Height() + c.jp.WithdrawDelay
++	for c.tip.Height() < due-1 {
++		c.mustMine()
++	}
++	expectRule(t, c.mine(nil, func(cb *wire.MsgTx, tpl *JobTemplate) {
++		if len(tpl.Withdrawals) != 1 {
++			t.Fatalf("template has %d withdrawals", len(tpl.Withdrawals))
++		}
++		cb.TxOut = append(cb.TxOut[:2], cb.TxOut[3:]...) // drop the payout
++	}), "unpaid withdrawal")
++	before := len(c.coins[client.acct])
++	c.mustMine()
++	if len(c.coins[client.acct]) != before+1 || c.coins[client.acct][before].value != 1_234_567 {
++		t.Fatal("withdrawal not paid to the client's script")
++	}
++
++	// stake verifiers, register a model, run one honest job end to end through consensus
++	var stakeTxs []*wire.MsgTx
++	for _, v := range vs {
++		stakeTxs = append(stakeTxs, c.tx(v, opOut(t, &jobstate.Op{Kind: jobstate.OpStake, Amount: c.jp.MinVerifierStake * 2})))
++	}
++	reg := &jobstate.Op{Kind: jobstate.OpModelReg, H1: jobstate.Hash{7}, H2: jobstate.Hash{8}, U1: 2, U2: 512}
++	regTx := c.tx(client, opOut(t, reg))
++	c.mustMine(append(stakeTxs, regTx)...)
++	var model jobstate.Hash
++	for id := range c.state().Models {
++		model = id
++	}
++	const stages, fee = 8, 4_000_000
++	roots, salts, leaves := make([]jobstate.Hash, stages), make([]jobstate.Hash, stages), make([]jobstate.Hash, stages)
++	for i := range roots {
++		roots[i], salts[i] = sha256.Sum256([]byte{byte(i), 1}), sha256.Sum256([]byte{byte(i), 2})
++		leaves[i] = jobstate.StageLeaf(uint32(i), salts[i], roots[i])
++	}
++	post := &jobstate.Op{Kind: jobstate.OpJobPost, Model: model, H1: jobstate.Hash{9}, U1: stages, Amount: fee,
++		Deadline: c.tip.Height() + 30, K: 2, N: 2}
++	c.mustMine(c.tx(client, opOut(t, post)))
++	var job *jobstate.Job
++	for _, j := range c.state().Jobs {
++		job = j
++	}
++	if job == nil || job.Status != jobstate.StatusPosted {
++		t.Fatal("job not posted")
++	}
++	bond := (fee*c.jp.MinBondBP + 9_999) / 10_000
++	c.mustMine(c.tx(provider, opOut(t, &jobstate.Op{Kind: jobstate.OpJobAccept, Job: job.ID, Amount: bond})))
++	c.mustMine(c.tx(provider, opOut(t, &jobstate.Op{Kind: jobstate.OpTraceCommit, Job: job.ID,
++		H1: jobstate.MerkleRoot(leaves), H2: jobstate.Hash{3}})))
++	for c.state().Jobs[job.ID].Status == jobstate.StatusCommitted {
++		c.mustMine()
++	}
++	job = c.state().Jobs[job.ID]
++	if job.Status != jobstate.StatusVerifyCommit || len(job.Committee) != 2 {
++		t.Fatalf("after draw: %v with %d seats", job.Status, len(job.Committee))
++	}
++	vsalt := map[jobstate.AccountID]jobstate.Hash{}
++	var commits []*wire.MsgTx
++	for i, seat := range job.Committee {
++		salt := sha256.Sum256([]byte{byte(i), 9})
++		vsalt[seat.Account] = salt
++		pos := jobstate.Positions(salt, stages, 2)
++		rs := []jobstate.Hash{roots[pos[0]], roots[pos[1]]}
++		commits = append(commits, c.tx(jkeys[seat.Account], opOut(t, &jobstate.Op{Kind: jobstate.OpVerifyCommit, Job: job.ID,
++			H1: sha256.Sum256(salt[:]), H2: jobstate.ResultHash(rs, seat.Account, salt)})))
++	}
++	c.mustMine(commits...)
++	var reveals []*wire.MsgTx
++	want := map[uint32]bool{}
++	for _, seat := range job.Committee {
++		salt := vsalt[seat.Account]
++		pos := jobstate.Positions(salt, stages, 2)
++		want[pos[0]], want[pos[1]] = true, true
++		reveals = append(reveals, c.tx(jkeys[seat.Account], opOut(t, &jobstate.Op{Kind: jobstate.OpVerifyReveal, Job: job.ID,
++			H1: salt, Roots: []jobstate.Hash{roots[pos[0]], roots[pos[1]]}})))
++	}
++	c.mustMine(reveals...)
++	var sr []jobstate.StageReveal
++	for st := range want {
++		sr = append(sr, jobstate.StageReveal{Stage: st, Salt: salts[st], Root: roots[st], Proof: jobstate.MerkleProof(leaves, int(st))})
++	}
++	c.mustMine(c.tx(provider, opOut(t, &jobstate.Op{Kind: jobstate.OpTraceReveal, Job: job.ID, Reveals: sr})))
++	p0 := c.state().Accounts[provider.acct]
++	for c.state().Jobs[job.ID].Status != jobstate.StatusSettled {
++		if c.tip.Height() > post.Deadline+50 {
++			t.Fatalf("job stuck in %v", c.state().Jobs[job.ID].Status)
++		}
++		c.mustMine()
++	}
++	vp, tc := jobstate.JobPay(c.jp, fee, 2, 2)
++	if got := c.state().Accounts[provider.acct] - p0; got != fee-vp-tc+bond {
++		t.Fatalf("provider received %d, want %d", got, fee-vp-tc+bond)
++	}
++
++	// conservation across UTXO set and module is implied by the coinbase rules; check the module side
++	st := c.state()
++	if st.Holdings() != st.TotalIn-st.PaidOut {
++		t.Fatal("module conservation broken on chain")
++	}
++
++	// restart: a fresh BlockChain on the same database reloads the job state from disk
++	chain2, err := New(&Config{DB: c.chain.db, ChainParams: c.chain.chainParams, TimeSource: NewMedianTime(),
++		SigCache: txscript.NewSigCache(10), HashCache: txscript.NewHashCache(10)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	st2, err := chain2.JobStateAtTip()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if st2.Root() != st.Root() {
++		t.Fatal("job state differs after reload from the database")
++	}
++}
++
++func TestJobModuleReorg(t *testing.T) {
++	c, teardown := newJChain(t)
++	defer teardown()
++	v := newJKey(30)
++	jkeys[v.acct] = v
++	c.mustMine()
++	c.mustMine(c.tx(c.miner, wire.NewTxOut(10_000_000, v.script), wire.NewTxOut(5_000_000, JobDepositScript(v.acct))))
++	fork := c.tip // common ancestor
++	forkCoins := map[jobstate.AccountID][]jutxo{}
++	for a, l := range c.coins {
++		forkCoins[a] = append([]jutxo(nil), l...)
++	}
++	// branch A: stake 2M
++	c.mustMine(c.tx(v, opOut(t, &jobstate.Op{Kind: jobstate.OpStake, Amount: 2_000_000})))
++	if c.state().Stakes[v.acct] != 2_000_000 {
++		t.Fatal("stake not applied on branch A")
++	}
++	// branch B from the ancestor: two empty blocks, so it becomes the best chain
++	c.tip, c.coins = fork, forkCoins
++	forkState, err := c.chain.jobStateAfter(fork.Hash())
++	if err != nil {
++		t.Fatal(err)
++	}
++	b1, s1 := c.buildBlockOn(fork, forkState)
++	if _, _, err := c.chain.ProcessBlock(b1, BFNone); err != nil {
++		t.Fatal(err)
++	}
++	b2, _ := c.buildBlockOn(b1, s1)
++	isMain, _, err := c.chain.ProcessBlock(b2, BFNone)
++	if err != nil || !isMain {
++		t.Fatalf("reorg block: main=%v err=%v", isMain, err)
++	}
++	st := c.state()
++	if st.Stakes[v.acct] != 0 || st.Accounts[v.acct] != 5_000_000 {
++		t.Fatalf("after reorg: stake %d balance %d (branch A's stake must be gone)", st.Stakes[v.acct], st.Accounts[v.acct])
++	}
++}
++
++// buildBlockOn builds an empty block on any parent from the parent's job state (side-chain
++// parents have no cached state until the chain validates them), returning the new state.
++func (c *jchain) buildBlockOn(parent *btcutil.Block, ps *jobstate.State) (*btcutil.Block, *jobstate.State) {
++	c.t.Helper()
++	height := parent.Height() + 1
++	subsidy := CalcBlockSubsidy(height, c.chain.chainParams)
++	pool := jobstate.PoolIssuance(c.jp, subsidy)
++	st := ps.Clone()
++	res := jobstate.ApplyBlock(st, c.jp, jobstate.BlockInput{Height: height, PrevHash: jobstate.Hash(*parent.Hash()),
++		Deposits: []jobstate.Deposit{{Account: jobstate.PoolAccount, Amount: pool}}})
++	cbScript, _ := txscript.NewScriptBuilder().AddInt64(int64(height)).AddInt64(time.Now().UnixNano()).Script()
++	cb := wire.NewMsgTx(1)
++	cb.AddTxIn(&wire.TxIn{PreviousOutPoint: *wire.NewOutPoint(&chainhash.Hash{}, wire.MaxPrevOutIndex),
++		Sequence: wire.MaxTxInSequenceNum, SignatureScript: cbScript})
++	cb.AddTxOut(wire.NewTxOut(subsidy-pool, c.miner.script))
++	cb.AddTxOut(wire.NewTxOut(pool, JobDepositScript(jobstate.PoolAccount)))
++	for _, w := range res.Withdrawals {
++		cb.AddTxOut(wire.NewTxOut(w.Amount, w.PkScript))
++	}
++	cb.AddTxOut(wire.NewTxOut(0, JobStateRootScript(res.Root)))
++	all := []*wire.MsgTx{cb}
++	header := wire.BlockHeader{Version: 1, PrevBlock: *parent.Hash(), MerkleRoot: calcMerkleRoot(all),
++		Bits: c.chain.chainParams.PowLimitBits, Timestamp: parent.MsgBlock().BlockHeader().Timestamp.Add(2 * time.Second)}
++	cert, err := SolveBlock(&header, c.chain.chainParams, height)
++	if err != nil {
++		c.t.Fatal(err)
++	}
++	blk := btcutil.NewBlock(&wire.MsgBlock{MsgHeader: wire.MsgHeader{BlockHeader: header,
++		MsgCertificate: wire.MsgCertificate{Certificate: cert}}, Transactions: all})
++	blk.SetHeight(height)
++	return blk, st
++}
+diff --git a/node/blockchain/validate.go b/node/blockchain/validate.go
+index 9db17e01..fb8d1814 100644
+--- a/node/blockchain/validate.go
++++ b/node/blockchain/validate.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/pearl-research-labs/pearl/node/btcutil"
+ 	"github.com/pearl-research-labs/pearl/node/chaincfg"
+ 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
+ 	"github.com/pearl-research-labs/pearl/node/txscript"
+ 	"github.com/pearl-research-labs/pearl/node/wire"
+ 	"github.com/pearl-research-labs/pearl/node/zkpow"
+@@ -1030,6 +1031,13 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
+ 		return err
+ 	}
+ 
++	// Useful-Work Coin: collect job deposits and ops while every authorizing input is unspent.
++	var jobDeps []jobstate.Deposit
++	var jobOps []*jobstate.Op
++	if b.chainParams.JobModule != nil {
++		jobDeps, jobOps = jobOpsFromBlock(block, view)
++	}
++
+ 	// Perform several checks on the inputs for each transaction.  Also
+ 	// accumulate the total fees.  This could technically be combined with
+ 	// the loop above instead of running another loop over the transactions,
+@@ -1076,6 +1084,13 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
+ 	}
+ 	expectedGrainOut := CalcBlockSubsidy(node.height, b.chainParams) +
+ 		totalFees
++	if b.chainParams.JobModule != nil {
++		withdrawn, err := b.checkJobRules(node, block, jobDeps, jobOps)
++		if err != nil {
++			return err
++		}
++		expectedGrainOut += withdrawn // module payouts are funded by earlier deposits
++	}
+ 	if totalGrainOut > expectedGrainOut {
+ 		str := fmt.Sprintf("coinbase transaction for block pays %v "+
+ 			"which is more than expected value of %v",
+diff --git a/node/chaincfg/params.go b/node/chaincfg/params.go
+index d0099506..619badb8 100644
+--- a/node/chaincfg/params.go
++++ b/node/chaincfg/params.go
+@@ -14,6 +14,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
+ 	"github.com/pearl-research-labs/pearl/node/wire"
+ )
+ 
+@@ -168,6 +169,11 @@ type Params struct {
+ 	// Name defines a human-readable identifier for the network.
+ 	Name string
+ 
++	// JobModule, when non-nil, enables the Useful-Work Coin job layer from genesis: the
++	// coinbase must deposit the pool share of the subsidy, commit the job-state root and pay
++	// due withdrawals (see node/jobstate and spec/job-module.md). Nil for Pearl networks.
++	JobModule *jobstate.Params
++
+ 	// Net defines the magic bytes used to identify the network.
+ 	Net wire.PearlNet
+ 
+@@ -971,6 +977,16 @@ func (d DNSSeed) String() string {
+ // as early as possible.  Then, library packages may lookup networks or network
+ // parameters based on inputs and work regardless of the network being standard
+ // or not.
++// UWCSimNetParams is SimNet with the Useful-Work Coin job module enabled from genesis. It is
++// not registered globally (it shares SimNet's network magic); tests and tools use it directly.
++var UWCSimNetParams = func() Params {
++	p := SimNetParams
++	p.Name = "uwc-simnet"
++	jp := jobstate.DefaultParams()
++	p.JobModule = &jp
++	return p
++}()
++
+ func Register(params *Params) error {
+ 	if _, ok := registeredNets[params.Net]; ok {
+ 		return ErrDuplicateNet
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+index 6d8c6151..f657eaf4 100644
+--- a/node/jobstate/apply.go
++++ b/node/jobstate/apply.go
+@@ -133,7 +133,7 @@ func u32b(v uint32) []byte { var b [4]byte; binary.LittleEndian.PutUint32(b[:],
+ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 	switch o.Kind {
+ 	case OpWithdraw:
+-		if o.Amount <= 0 || len(o.PkScript) == 0 || len(o.PkScript) > maxPkScript {
++		if o.Amount <= 0 || !ValidPayoutScript(o.PkScript) {
+ 			return errors.New("bad withdrawal")
+ 		}
+ 		if err := s.debit(o.Actor, o.Amount); err != nil {
+@@ -271,6 +271,13 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 	return nil
+ }
+ 
++// ValidPayoutScript accepts only scripts a coinbase output can pay on Pearl: P2TR
++// (OP_1 OP_DATA_32 <key>) and P2MR (OP_2 OP_DATA_32 <root>). Anything else could never be
++// paid, and a due withdrawal that cannot be paid would make every later block invalid.
++func ValidPayoutScript(s []byte) bool {
++	return len(s) == 34 && (s[0] == 0x51 || s[0] == 0x52) && s[1] == 0x20
++}
++
+ func minBond(p Params, fee Amount) Amount { return (fee*p.MinBondBP + 9_999) / 10_000 }
+ 
+ // JobPay is the verifier pay and treasury cut fixed when a job is posted.
+diff --git a/node/jobstate/jobstate_test.go b/node/jobstate/jobstate_test.go
+index dec687d4..6d939b24 100644
+--- a/node/jobstate/jobstate_test.go
++++ b/node/jobstate/jobstate_test.go
+@@ -12,6 +12,13 @@ import (
+ 
+ func acct(i int) AccountID { return AccountForScript([]byte{0x51, byte(i), byte(i >> 8)}) }
+ 
++// payTo is a valid P2TR payout script.
++func payTo(i int) []byte {
++	s := make([]byte, 34)
++	s[0], s[1], s[2], s[3] = 0x51, 0x20, byte(i), byte(i>>8)
++	return s
++}
++
+ type sim struct {
+ 	t    *testing.T
+ 	p    Params
+@@ -400,7 +407,7 @@ func TestEscrowCannotBeSpentTwice(t *testing.T) {
+ 	ops := []*Op{
+ 		{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: all, Deadline: w.h + 9, K: 2, N: 2},
+ 		{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1, Deadline: w.h + 9, K: 2, N: 2},
+-		{Kind: OpWithdraw, Actor: w.client, Amount: 1, PkScript: []byte{0x51}},
++		{Kind: OpWithdraw, Actor: w.client, Amount: 1, PkScript: payTo(1)},
+ 		{Kind: OpStake, Actor: w.client, Amount: 1},
+ 	}
+ 	r := w.block(nil, ops, nil)
+@@ -417,7 +424,8 @@ func TestFailedOpsAreNoOps(t *testing.T) {
+ 	before := w.st.Root()
+ 	junk := []*Op{
+ 		{Kind: OpJobAccept, Actor: w.provider, Job: w.randHash(), Amount: 5},
+-		{Kind: OpWithdraw, Actor: acct(999), Amount: 10, PkScript: []byte{1}},
++		{Kind: OpWithdraw, Actor: acct(999), Amount: 10, PkScript: payTo(9)},
++		{Kind: OpWithdraw, Actor: w.client, Amount: 10, PkScript: []byte{0x76, 0xa9, 0x14}}, // unpayable on Pearl
+ 		{Kind: OpUnstake, Actor: w.verifiers[0], Amount: 1 << 60},
+ 		{Kind: OpJobPost, Actor: w.client, Model: w.randHash(), U1: 4, Amount: 10, Deadline: w.h + 3, K: 2, N: 2},
+ 		{Kind: OpChallenge, Actor: w.client, Job: w.randHash(), Amount: 1 << 40},
+@@ -460,13 +468,13 @@ func TestUnbondingStaysSlashable(t *testing.T) {
+ func TestWithdrawalsBecomeDueOnce(t *testing.T) {
+ 	s := newSim(t, 10)
+ 	a := acct(3)
+-	mustOK(t, s.block([]Deposit{{a, 500}}, []*Op{{Kind: OpWithdraw, Actor: a, Amount: 200, PkScript: []byte{0x76, 0xa9}}}, nil))
++	mustOK(t, s.block([]Deposit{{a, 500}}, []*Op{{Kind: OpWithdraw, Actor: a, Amount: 200, PkScript: payTo(3)}}, nil))
+ 	due := s.h + s.p.WithdrawDelay
+ 	var seen int
+ 	for s.h < due+3 {
+ 		r := s.block(nil, nil, nil)
+ 		for _, w := range r.Withdrawals {
+-			if s.h != due || w.Amount != 200 || !bytes.Equal(w.PkScript, []byte{0x76, 0xa9}) {
++			if s.h != due || w.Amount != 200 || !bytes.Equal(w.PkScript, payTo(3)) {
+ 				t.Fatalf("withdrawal %+v at height %d", w, s.h)
+ 			}
+ 			seen++
+@@ -721,7 +729,7 @@ func randomizedRun(t *testing.T, seed uint64) {
+ 			case 1:
+ 				ops = append(ops, &Op{Kind: OpUnstake, Actor: w.verifiers[r.IntN(len(w.verifiers))], Amount: Amount(r.IntN(300_000))})
+ 			case 2:
+-				ops = append(ops, &Op{Kind: OpWithdraw, Actor: u, Amount: Amount(r.IntN(2_000_000)), PkScript: []byte{0x51, byte(k)}})
++				ops = append(ops, &Op{Kind: OpWithdraw, Actor: u, Amount: Amount(r.IntN(2_000_000)), PkScript: payTo(k)})
+ 			case 3:
+ 				if len(jobs) > 0 {
+ 					lj := jobs[r.IntN(len(jobs))]
+diff --git a/node/mempool/jobs_policy_test.go b/node/mempool/jobs_policy_test.go
+new file mode 100644
+index 00000000..a4b887b1
+--- /dev/null
++++ b/node/mempool/jobs_policy_test.go
+@@ -0,0 +1,50 @@
++package mempool
++
++import (
++	"testing"
++	"time"
++
++	"github.com/pearl-research-labs/pearl/node/blockchain"
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++func jobPolicyTx(outs ...*wire.TxOut) *btcutil.Tx {
++	tx := wire.NewMsgTx(1)
++	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{1}}, Sequence: wire.MaxTxInSequenceNum})
++	p2tr := append([]byte{0x51, 0x20}, make([]byte, 32)...)
++	tx.AddTxOut(wire.NewTxOut(100_000, p2tr))
++	for _, o := range outs {
++		tx.AddTxOut(o)
++	}
++	return btcutil.NewTx(tx)
++}
++
++func TestJobOutputsStandardness(t *testing.T) {
++	op := &jobstate.Op{Kind: jobstate.OpStake, Amount: 5}
++	opScript, err := blockchain.JobOpScript(op.Encode())
++	if err != nil {
++		t.Fatal(err)
++	}
++	dep := wire.NewTxOut(50_000, blockchain.JobDepositScript(jobstate.AccountID{7}))
++	check := func(tx *btcutil.Tx) error {
++		return CheckTransactionStandard(tx, 100, time.Now(), DefaultMinRelayTxFee, 1)
++	}
++	if err := check(jobPolicyTx(dep, wire.NewTxOut(0, opScript))); err != nil {
++		t.Fatalf("deposit + op should be standard: %v", err)
++	}
++	if err := check(jobPolicyTx(wire.NewTxOut(0, blockchain.JobStateRootScript(jobstate.Hash{})))); err == nil {
++		t.Fatal("a state commitment outside the coinbase must be non-standard")
++	}
++	plain := wire.NewTxOut(0, []byte{0x6a, 0x01, 0x01})
++	if err := check(jobPolicyTx(plain, wire.NewTxOut(0, []byte{0x6a, 0x01, 0x02}))); err == nil {
++		t.Fatal("two plain OP_RETURN outputs must stay non-standard")
++	}
++	big := make([]byte, 3000) // multi-push op payloads (e.g. TRACE_REVEAL proofs) are allowed
++	bigScript, _ := blockchain.JobOpScript(big)
++	if err := check(jobPolicyTx(wire.NewTxOut(0, bigScript))); err != nil {
++		t.Fatalf("multi-push op payload should be standard: %v", err)
++	}
++}
+diff --git a/node/mempool/policy.go b/node/mempool/policy.go
+index 1bafcf8b..297f570c 100644
+--- a/node/mempool/policy.go
++++ b/node/mempool/policy.go
+@@ -319,7 +319,15 @@ func CheckTransactionStandard(tx *btcutil.Tx, height int32,
+ 		// all other script types, ensure the output value is not
+ 		// "dust".
+ 		if scriptClass == txscript.NullDataTy {
+-			numNullDataOutputs++
++			// Useful-Work Coin job outputs (deposits, ops) are not counted: a deposit and
++			// an op may share a transaction. A state-root commitment belongs only in a coinbase.
++			tag, _ := blockchain.ParseJobOutput(txOut.PkScript)
++			if string(tag) == string(blockchain.JobStateRootTag) {
++				return txRuleError(wire.RejectNonstandard, "job-state commitment outside a coinbase")
++			}
++			if tag == nil {
++				numNullDataOutputs++
++			}
+ 		} else if IsDust(txOut, minRelayTxFee) {
+ 			str := fmt.Sprintf("transaction output %d: payment is "+
+ 				"dust: %v", i, txOut.Value)
+diff --git a/node/mining/jobs_template_test.go b/node/mining/jobs_template_test.go
+new file mode 100644
+index 00000000..563e2a5b
+--- /dev/null
++++ b/node/mining/jobs_template_test.go
+@@ -0,0 +1,52 @@
++package mining
++
++import (
++	"testing"
++
++	"github.com/pearl-research-labs/pearl/node/blockchain"
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/stretchr/testify/require"
++)
++
++// TestNewBlockTemplateJobModule mines a UWC SimNet chain from the production template
++// generator: every template must carry the pool deposit and the job-state commitment and
++// pass CheckConnectBlockTemplate (run inside NewBlockTemplate), then connect to the chain.
++func TestNewBlockTemplateJobModule(t *testing.T) {
++	params := chaincfg.UWCSimNetParams
++	g := newTestGenerator(t, &params)
++	var pool int64
++	for i := 0; i < 12; i++ {
++		tmpl, err := g.NewBlockTemplate(nil)
++		require.NoError(t, err)
++		msg := tmpl.Block
++		cb := msg.Transactions[0]
++		var deposits, roots int
++		for _, out := range cb.TxOut {
++			tag, data := blockchain.ParseJobOutput(out.PkScript)
++			switch string(tag) {
++			case string(blockchain.JobDepositTag):
++				require.Equal(t, jobstate.PoolAccount[:], data)
++				deposits++
++			case string(blockchain.JobStateRootTag):
++				roots++
++			}
++		}
++		require.Equal(t, 1, deposits, "one pool deposit")
++		require.Equal(t, 1, roots, "one state commitment")
++		height := tmpl.Height
++		cert, err := blockchain.SolveBlock(&msg.MsgHeader.BlockHeader, &params, height)
++		require.NoError(t, err)
++		msg.MsgHeader.MsgCertificate.Certificate = cert
++		blk := btcutil.NewBlock(msg)
++		isMain, _, err := g.chain.ProcessBlock(blk, blockchain.BFNone)
++		require.NoError(t, err)
++		require.True(t, isMain)
++		pool += jobstate.PoolIssuance(*params.JobModule, blockchain.CalcBlockSubsidy(height, &params))
++	}
++	st, err := g.chain.JobStateAtTip()
++	require.NoError(t, err)
++	require.Equal(t, pool, st.Accounts[jobstate.PoolAccount])
++	require.Equal(t, st.TotalIn-st.PaidOut, st.Holdings())
++}
+diff --git a/node/mining/mining.go b/node/mining/mining.go
+index 4e9f9ecc..d2dae1c6 100644
+--- a/node/mining/mining.go
++++ b/node/mining/mining.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/pearl-research-labs/pearl/node/btcutil"
+ 	"github.com/pearl-research-labs/pearl/node/chaincfg"
+ 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
+ 	"github.com/pearl-research-labs/pearl/node/txscript"
+ 	"github.com/pearl-research-labs/pearl/node/wire"
+ )
+@@ -625,6 +626,23 @@ mempoolLoop:
+ 		uint32(wire.VarIntSerializeSize(uint64(len(blockTxns))))
+ 	coinbaseTx.MsgTx().TxOut[0].Value += totalFees
+ 	txFees[0] = -totalFees
++
++	// Useful-Work Coin: deposit the pool share, pay due withdrawals and commit the job-state
++	// root (blockchain/jobs.go). Must come before the witness commitment, which covers the coinbase.
++	if g.chainParams.JobModule != nil {
++		tpl, err := g.chain.JobTemplateFor(blockTxns[1:], nil)
++		if err != nil {
++			return nil, err
++		}
++		cb := coinbaseTx.MsgTx()
++		cb.TxOut[0].Value -= tpl.PoolDeposit
++		cb.AddTxOut(wire.NewTxOut(tpl.PoolDeposit, blockchain.JobDepositScript(jobstate.PoolAccount)))
++		for _, w := range tpl.Withdrawals {
++			cb.AddTxOut(wire.NewTxOut(w.Amount, w.PkScript))
++		}
++		cb.AddTxOut(wire.NewTxOut(0, blockchain.JobStateRootScript(tpl.Root)))
++	}
++
+ 	// Add the witness commitment to the coinbase transaction.
+ 	witnessCommitment := AddWitnessCommitment(coinbaseTx, blockTxns)
+ 
+-- 
+2.30.2
+

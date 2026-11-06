@@ -1,0 +1,2191 @@
+From 4b5d7897427ecc4bfe2ca2c8b1747b4f9df69c6e Mon Sep 17 00:00:00 2001
+From: Sid <sid7513@gmail.com>
+Date: Fri, 6 Nov 2026 02:39:33 +0530
+Subject: [PATCH 1/2] jobstate: Useful-Work Coin job module (escrow, bonds,
+ verification lifecycle, settlement) with property tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuAcGXiQmWtSPUcEzo
+---
+ node/jobstate/apply.go         | 632 +++++++++++++++++++++++++++
+ node/jobstate/jobstate_test.go | 753 +++++++++++++++++++++++++++++++++
+ node/jobstate/merkle.go        |  97 +++++
+ node/jobstate/ops.go           | 238 +++++++++++
+ node/jobstate/state.go         | 218 ++++++++++
+ node/jobstate/types.go         | 191 +++++++++
+ 6 files changed, 2129 insertions(+)
+ create mode 100644 node/jobstate/apply.go
+ create mode 100644 node/jobstate/jobstate_test.go
+ create mode 100644 node/jobstate/merkle.go
+ create mode 100644 node/jobstate/ops.go
+ create mode 100644 node/jobstate/state.go
+ create mode 100644 node/jobstate/types.go
+
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+new file mode 100644
+index 00000000..6d8c6151
+--- /dev/null
++++ b/node/jobstate/apply.go
+@@ -0,0 +1,632 @@
++package jobstate
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"math/big"
++	"sort"
++)
++
++// Deposit credits value that left the UTXO set through a "UWCD" output.
++type Deposit struct {
++	Account AccountID
++	Amount  Amount
++}
++
++// Verdict is the outcome of a dispute, produced by consensus (build step 4: bisection to one
++// operation, recomputed by full nodes). Step 3 only defines how verdicts move money.
++type Verdict struct {
++	Job             Hash
++	ProviderAtFault bool
++}
++
++// BlockInput is everything the module needs from one block, in transaction order.
++type BlockInput struct {
++	Height   int32
++	PrevHash Hash // hash of the previous block: randomness for committee draws in this block
++	Deposits []Deposit
++	Ops      []*Op
++	Verdicts []Verdict
++}
++
++// BlockResult is what the block's coinbase must reflect.
++type BlockResult struct {
++	Root        Hash         // must be committed in the coinbase ("UWCS")
++	Withdrawals []Withdrawal // must each be paid by a coinbase output at this height
++	OpErrors    []error      // nil for applied ops; failed ops change nothing
++}
++
++// PoolIssuance is the minimum the coinbase must deposit to PoolAccount.
++func PoolIssuance(p Params, subsidy Amount) Amount { return subsidy * p.PoolShareBP / 10_000 }
++
++// ApplyBlock applies one block to st in place. It never fails because of an operation: a
++// failed op is reported in OpErrors and has no effect.
++func ApplyBlock(st *State, p Params, b BlockInput) *BlockResult {
++	res := &BlockResult{}
++	for _, d := range b.Deposits {
++		if d.Amount > 0 {
++			st.credit(d.Account, d.Amount)
++			st.TotalIn += d.Amount
++		}
++	}
++	for _, op := range b.Ops {
++		snap := st.Clone()
++		if err := st.applyOp(p, b.Height, op); err != nil {
++			*st = *snap // all-or-nothing per op
++			res.OpErrors = append(res.OpErrors, fmt.Errorf("%v: %w", op.Kind, err))
++		} else {
++			res.OpErrors = append(res.OpErrors, nil)
++		}
++	}
++	for _, v := range b.Verdicts {
++		st.applyVerdict(p, b.Height, v)
++	}
++	st.endBlock(p, b.Height, b.PrevHash, res)
++	res.Root = st.Root()
++	return res
++}
++
++// ---------------------------------------------------------------- balances
++
++func (s *State) credit(a AccountID, v Amount) {
++	if v == 0 {
++		return
++	}
++	s.Accounts[a] += v
++	if s.Accounts[a] == 0 {
++		delete(s.Accounts, a)
++	}
++}
++
++var errFunds = errors.New("insufficient balance")
++
++func (s *State) debit(a AccountID, v Amount) error {
++	if v < 0 || s.Accounts[a] < v {
++		return errFunds
++	}
++	s.credit(a, -v)
++	return nil
++}
++
++// slash takes up to v from a's active stake, then from its unbonding entries (oldest first).
++func (s *State) slash(a AccountID, v Amount) Amount {
++	took := min(v, s.Stakes[a])
++	s.Stakes[a] -= took
++	if s.Stakes[a] == 0 {
++		delete(s.Stakes, a)
++	}
++	for i := 0; i < len(s.Unbonding) && took < v; i++ {
++		if s.Unbonding[i].Account == a {
++			t := min(v-took, s.Unbonding[i].Amount)
++			s.Unbonding[i].Amount -= t
++			took += t
++		}
++	}
++	kept := s.Unbonding[:0]
++	for _, u := range s.Unbonding {
++		if u.Amount > 0 {
++			kept = append(kept, u)
++		}
++	}
++	s.Unbonding = kept
++	return took
++}
++
++func tagHash(tag string, parts ...[]byte) Hash {
++	h := sha256.New()
++	h.Write([]byte(tag))
++	for _, p := range parts {
++		h.Write(p)
++	}
++	var o Hash
++	copy(o[:], h.Sum(nil))
++	return o
++}
++
++func u32b(v uint32) []byte { var b [4]byte; binary.LittleEndian.PutUint32(b[:], v); return b[:] }
++
++// ---------------------------------------------------------------- ops
++
++func (s *State) applyOp(p Params, h int32, o *Op) error {
++	switch o.Kind {
++	case OpWithdraw:
++		if o.Amount <= 0 || len(o.PkScript) == 0 || len(o.PkScript) > maxPkScript {
++			return errors.New("bad withdrawal")
++		}
++		if err := s.debit(o.Actor, o.Amount); err != nil {
++			return err
++		}
++		s.Withdrawals = append(s.Withdrawals, Withdrawal{Seq: s.seq(), Account: o.Actor,
++			PkScript: append([]byte(nil), o.PkScript...), Amount: o.Amount, Due: h + p.WithdrawDelay})
++	case OpStake:
++		if o.Amount <= 0 {
++			return errors.New("bad amount")
++		}
++		if err := s.debit(o.Actor, o.Amount); err != nil {
++			return err
++		}
++		s.Stakes[o.Actor] += o.Amount
++	case OpUnstake:
++		if o.Amount <= 0 || o.Amount > s.Stakes[o.Actor] {
++			return errors.New("bad amount")
++		}
++		s.Stakes[o.Actor] -= o.Amount
++		if s.Stakes[o.Actor] == 0 {
++			delete(s.Stakes, o.Actor)
++		}
++		s.Unbonding = append(s.Unbonding, Unbonding{Seq: s.seq(), Account: o.Actor, Amount: o.Amount, Due: h + p.UnbondDelay})
++	case OpModelReg:
++		if o.U1 == 0 {
++			return errors.New("model needs at least one layer group")
++		}
++		id := tagHash("model", o.Ref[:])
++		if _, ok := s.Models[id]; ok {
++			return errors.New("duplicate model")
++		}
++		if err := s.debit(o.Actor, p.ModelRegBond); err != nil {
++			return err
++		}
++		s.Models[id] = &Model{ID: id, Registrant: o.Actor, WeightsRoot: o.H1, RuntimeHash: o.H2,
++			LayerGroups: o.U1, RotationBlock: o.U2, Bond: p.ModelRegBond}
++	case OpJobPost:
++		return s.jobPost(p, h, o)
++	case OpJobAccept:
++		j, err := s.job(o.Job, StatusPosted)
++		if err != nil {
++			return err
++		}
++		if h >= j.Deadline || o.Actor == j.Client {
++			return errors.New("too late or self-dealing on the same account")
++		}
++		if o.Amount < minBond(p, j.Fee) {
++			return errors.New("bond below minimum")
++		}
++		if err := s.debit(o.Actor, o.Amount); err != nil {
++			return err
++		}
++		j.Provider, j.Bond, j.Status = o.Actor, o.Amount, StatusAccepted
++	case OpTraceCommit:
++		j, err := s.job(o.Job, StatusAccepted)
++		if err != nil {
++			return err
++		}
++		if o.Actor != j.Provider || h >= j.Deadline {
++			return errors.New("not the provider, or past the deadline")
++		}
++		j.StageRoot, j.OutputRoot, j.CommitHeight, j.Status = o.H1, o.H2, h, StatusCommitted
++		j.PhaseEnd = h + p.CommitteeDelay
++	case OpVerifyCommit:
++		j, err := s.job(o.Job, StatusVerifyCommit)
++		if err != nil {
++			return err
++		}
++		v := j.seat(o.Actor)
++		if v == nil || v.Committed {
++			return errors.New("not a committee member, or already committed")
++		}
++		v.SaltHash, v.ResultHash, v.Committed = o.H1, o.H2, true
++	case OpVerifyReveal:
++		j, err := s.job(o.Job, StatusVerifyReveal)
++		if err != nil {
++			return err
++		}
++		v := j.seat(o.Actor)
++		if v == nil || !v.Committed || v.Revealed {
++			return errors.New("not a committed seat, or already revealed")
++		}
++		if sha256.Sum256(o.H1[:]) != v.SaltHash {
++			return errors.New("salt does not match commitment")
++		}
++		pos := Positions(o.H1, j.Stages, int(j.N))
++		if len(o.Roots) != len(pos) {
++			return errors.New("wrong number of roots")
++		}
++		if ResultHash(o.Roots, o.Actor, o.H1) != v.ResultHash {
++			return errors.New("roots do not match commitment")
++		}
++		v.Positions, v.Roots, v.Revealed = pos, append([]Hash(nil), o.Roots...), true
++	case OpTraceReveal:
++		j, err := s.job(o.Job, StatusProviderReveal)
++		if err != nil {
++			return err
++		}
++		if o.Actor != j.Provider || len(o.Reveals) == 0 {
++			return errors.New("not the provider")
++		}
++		want := j.requested()
++		have := map[uint32]bool{}
++		for _, r := range j.Revealed {
++			have[r.Stage] = true
++		}
++		for _, r := range o.Reveals {
++			if !want[r.Stage] || have[r.Stage] {
++				return errors.New("stage not requested or already revealed")
++			}
++			if !VerifyMerkleProof(j.StageRoot, StageLeaf(r.Stage, r.Salt, r.Root), int(r.Stage), int(j.Stages), r.Proof) {
++				return errors.New("stage proof does not open the committed stage root")
++			}
++			have[r.Stage] = true
++			j.Revealed = append(j.Revealed, StageReveal{Stage: r.Stage, Salt: r.Salt, Root: r.Root})
++		}
++		sort.Slice(j.Revealed, func(a, b int) bool { return j.Revealed[a].Stage < j.Revealed[b].Stage })
++	case OpChallenge:
++		j, err := s.job(o.Job, StatusChallenge)
++		if err != nil {
++			return err
++		}
++		if o.Actor == j.Provider || o.U1 >= j.Stages || o.Amount < p.ChallengeBondMin {
++			return errors.New("bad challenge")
++		}
++		if err := s.debit(o.Actor, o.Amount); err != nil {
++			return err
++		}
++		j.Disputes = append(j.Disputes, Challenge{Challenger: o.Actor, Stage: o.U1, ClaimedRoot: o.H1, Bond: o.Amount, Height: h})
++		j.Status, j.PhaseEnd = StatusDisputed, h+p.DisputeTimeout
++	default:
++		return errors.New("unknown op")
++	}
++	return nil
++}
++
++func minBond(p Params, fee Amount) Amount { return (fee*p.MinBondBP + 9_999) / 10_000 }
++
++// JobPay is the verifier pay and treasury cut fixed when a job is posted.
++func JobPay(p Params, fee Amount, k, n int) (verifier, treasury Amount) {
++	verifier = max(fee*p.VerifierShareBP/10_000, Amount(k*n)*p.VerifierFloorPerSample)
++	treasury = fee * p.TreasuryShareBP / 10_000
++	return
++}
++
++func (s *State) jobPost(p Params, h int32, o *Op) error {
++	m := s.Models[o.Model]
++	switch {
++	case m == nil:
++		return errors.New("unknown model")
++	case o.U1 == 0 || o.U1 > p.MaxStages || o.U1%m.LayerGroups != 0:
++		return errors.New("stages must be batches x layer groups")
++	case int(o.K) < p.MinK || int(o.K) > p.MaxK || int(o.N) < p.MinN || int(o.N) > p.MaxN:
++		return errors.New("k or n out of range")
++	case o.Deadline <= h || o.Deadline > h+p.MaxDeadlineBlocks:
++		return errors.New("bad deadline")
++	case o.Amount <= 0:
++		return errors.New("bad fee")
++	}
++	vp, tc := JobPay(p, o.Amount, int(o.K), int(o.N))
++	if o.Amount < vp+tc {
++		return errors.New("fee does not cover verifier pay and treasury share")
++	}
++	id := tagHash("job", o.Ref[:])
++	if _, ok := s.Jobs[id]; ok {
++		return errors.New("duplicate job")
++	}
++	if err := s.debit(o.Actor, o.Amount); err != nil {
++		return err
++	}
++	s.Jobs[id] = &Job{ID: id, Client: o.Actor, Model: o.Model, InputRoot: o.H1, Stages: o.U1, K: o.K, N: o.N,
++		Fee: o.Amount, VerifierPay: vp, TreasuryCut: tc, Deadline: o.Deadline, Status: StatusPosted, PostHeight: h}
++	return nil
++}
++
++func (s *State) seq() uint64 { s.NextSeq++; return s.NextSeq }
++
++func (s *State) job(id Hash, want JobStatus) (*Job, error) {
++	j := s.Jobs[id]
++	if j == nil {
++		return nil, errors.New("unknown job")
++	}
++	if j.Status != want {
++		return nil, fmt.Errorf("job is %v, not %v", j.Status, want)
++	}
++	return j, nil
++}
++
++func (j *Job) seat(a AccountID) *Verifier {
++	for i := range j.Committee {
++		if j.Committee[i].Account == a {
++			return &j.Committee[i]
++		}
++	}
++	return nil
++}
++
++func (j *Job) requested() map[uint32]bool {
++	want := map[uint32]bool{}
++	for _, v := range j.Committee {
++		if v.Revealed {
++			for _, p := range v.Positions {
++				want[p] = true
++			}
++		}
++	}
++	return want
++}
++
++// ResultHash binds a verifier's recomputed roots to its account and salt (commit-reveal).
++func ResultHash(roots []Hash, a AccountID, salt Hash) Hash {
++	parts := make([][]byte, 0, len(roots)+2)
++	for i := range roots {
++		parts = append(parts, roots[i][:])
++	}
++	parts = append(parts, a[:], salt[:])
++	return tagHash("result", parts...)
++}
++
++// Positions are the n distinct stages a verifier with this salt rechecks (all stages if n >= S).
++func Positions(salt Hash, stages uint32, n int) []uint32 {
++	if uint32(n) >= stages {
++		out := make([]uint32, stages)
++		for i := range out {
++			out[i] = uint32(i)
++		}
++		return out
++	}
++	seen := map[uint32]bool{}
++	var out []uint32
++	for i := uint32(0); len(out) < n && i < uint32(n)*64; i++ {
++		x := tagHash("pos", salt[:], u32b(i))
++		st := uint32(binary.LittleEndian.Uint64(x[:8]) % uint64(stages))
++		if !seen[st] {
++			seen[st] = true
++			out = append(out, st)
++		}
++	}
++	for st := uint32(0); len(out) < n; st++ { // astronomically unlikely fallback, still deterministic
++		if !seen[st] {
++			seen[st] = true
++			out = append(out, st)
++		}
++	}
++	sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
++	return out
++}
++
++// DrawCommittee picks up to k distinct stakers (stake >= MinVerifierStake), excluding the job's
++// client and provider, by successive stake-weighted sampling: seat i takes
++// H(seed || job || i) mod (remaining eligible stake) and walks the cumulative stake of the
++// remaining candidates in account order. Each pick is exactly proportional to stake.
++func DrawCommittee(s *State, p Params, j *Job, seed Hash) []AccountID {
++	type cand struct {
++		a     AccountID
++		stake Amount
++	}
++	var cs []cand
++	total := Amount(0)
++	for a, st := range s.Stakes {
++		if st < p.MinVerifierStake || a == j.Client || a == j.Provider {
++			continue
++		}
++		cs = append(cs, cand{a, st})
++		total += st
++	}
++	sort.Slice(cs, func(x, y int) bool { return bytes.Compare(cs[x].a[:], cs[y].a[:]) < 0 })
++	out := []AccountID{}
++	for i := 0; i < int(j.K) && len(cs) > 0; i++ {
++		x := tagHash("draw", seed[:], j.ID[:], u32b(uint32(i)))
++		r := new(big.Int).Mod(new(big.Int).SetBytes(x[:]), big.NewInt(total)).Int64()
++		k := 0
++		for acc := cs[0].stake; acc <= r; acc += cs[k].stake {
++			k++
++		}
++		out = append(out, cs[k].a)
++		total -= cs[k].stake
++		cs = append(cs[:k], cs[k+1:]...)
++	}
++	return out
++}
++
++// ---------------------------------------------------------------- verdicts and timers
++
++func (s *State) applyVerdict(p Params, h int32, v Verdict) {
++	j := s.Jobs[v.Job]
++	if j == nil || j.Status != StatusDisputed {
++		return
++	}
++	if v.ProviderAtFault {
++		var catchers []AccountID
++		for _, d := range j.Disputes {
++			s.credit(d.Challenger, d.Bond) // honest challengers get their bond back
++			catchers = append(catchers, d.Challenger)
++		}
++		for _, c := range j.Committee {
++			if c.Flagged {
++				catchers = append(catchers, c.Account)
++			}
++		}
++		s.failProvider(j, catchers)
++		return
++	}
++	for _, d := range j.Disputes { // failed challenges: bond half to provider, half to treasury
++		half := d.Bond / 2
++		s.credit(j.Provider, half)
++		s.credit(TreasuryAccount, d.Bond-half)
++	}
++	for i := range j.Committee {
++		if j.Committee[i].Flagged { // a verifier that wrongly flagged is penalized
++			s.credit(TreasuryAccount, s.slash(j.Committee[i].Account, p.VerifierNoShowPenalty))
++		}
++	}
++	j.Disputes = nil
++	s.settle(j)
++}
++
++// failProvider: fee back to the client; bond half to catchers (equal split), half (plus remainder) to treasury.
++func (s *State) failProvider(j *Job, catchers []AccountID) {
++	s.credit(j.Client, j.Fee)
++	toCatchers := Amount(0)
++	if len(catchers) > 0 {
++		each := (j.Bond / 2) / Amount(len(catchers))
++		for _, c := range catchers {
++			s.credit(c, each)
++		}
++		toCatchers = each * Amount(len(catchers))
++	}
++	s.credit(TreasuryAccount, j.Bond-toCatchers)
++	j.Disputes = nil
++	j.Status, j.PhaseEnd = StatusFailed, 0
++}
++
++// settle pays a job that passed verification and its challenge window.
++func (s *State) settle(j *Job) {
++	var paid []AccountID
++	for _, v := range j.Committee {
++		if v.Revealed && !v.Flagged {
++			paid = append(paid, v.Account)
++		}
++	}
++	vp := Amount(0)
++	if len(paid) > 0 {
++		each := j.VerifierPay / Amount(len(paid))
++		for _, a := range paid {
++			s.credit(a, each)
++		}
++		vp = each * Amount(len(paid))
++	}
++	s.credit(TreasuryAccount, j.TreasuryCut+(j.VerifierPay-vp))
++	s.credit(j.Provider, j.Fee-j.VerifierPay-j.TreasuryCut+j.Bond)
++	j.Status, j.PhaseEnd = StatusSettled, 0
++}
++
++func (s *State) endBlock(p Params, h int32, prevHash Hash, res *BlockResult) {
++	// stake finishing its unbonding period returns to the free balance
++	kept := s.Unbonding[:0]
++	for _, u := range s.Unbonding {
++		if u.Due <= h {
++			s.credit(u.Account, u.Amount)
++		} else {
++			kept = append(kept, u)
++		}
++	}
++	s.Unbonding = kept
++	// withdrawals due now must be paid by this block's coinbase
++	pending := s.Withdrawals[:0]
++	for _, w := range s.Withdrawals {
++		if w.Due <= h {
++			res.Withdrawals = append(res.Withdrawals, w)
++			s.PaidOut += w.Amount
++		} else {
++			pending = append(pending, w)
++		}
++	}
++	s.Withdrawals = pending
++	// job timers, in job-id order
++	ids := make([]Hash, 0, len(s.Jobs))
++	for id, j := range s.Jobs {
++		if !j.Status.Terminal() {
++			ids = append(ids, id)
++		}
++	}
++	sort.Slice(ids, func(a, b int) bool { return bytes.Compare(ids[a][:], ids[b][:]) < 0 })
++	for _, id := range ids {
++		s.advance(p, h, prevHash, s.Jobs[id])
++	}
++}
++
++func (s *State) advance(p Params, h int32, prevHash Hash, j *Job) {
++	switch j.Status {
++	case StatusPosted:
++		if h >= j.Deadline {
++			s.credit(j.Client, j.Fee)
++			j.Status = StatusExpired
++		}
++	case StatusAccepted:
++		if h >= j.Deadline { // accepted but never committed: provider at fault, client compensated
++			half := j.Bond / 2
++			s.credit(j.Client, j.Fee+half)
++			s.credit(TreasuryAccount, j.Bond-half)
++			j.Status = StatusFailed
++		}
++	case StatusCommitted:
++		if h >= j.PhaseEnd {
++			for _, a := range DrawCommittee(s, p, j, prevHash) {
++				j.Committee = append(j.Committee, Verifier{Account: a})
++			}
++			if len(j.Committee) == 0 {
++				j.Status, j.PhaseEnd = StatusChallenge, h+p.ChallengeWindow
++			} else {
++				j.Status, j.PhaseEnd = StatusVerifyCommit, h+p.VerifyCommitWindow
++			}
++		}
++	case StatusVerifyCommit:
++		all := true
++		for _, v := range j.Committee {
++			all = all && v.Committed
++		}
++		if all || h >= j.PhaseEnd {
++			for i := range j.Committee {
++				if !j.Committee[i].Committed {
++					s.credit(TreasuryAccount, s.slash(j.Committee[i].Account, p.VerifierNoShowPenalty))
++				}
++			}
++			j.Status, j.PhaseEnd = StatusVerifyReveal, h+p.VerifyRevealWindow
++		}
++	case StatusVerifyReveal:
++		all := true
++		for _, v := range j.Committee {
++			all = all && (v.Revealed || !v.Committed)
++		}
++		if all || h >= j.PhaseEnd {
++			for i := range j.Committee {
++				if j.Committee[i].Committed && !j.Committee[i].Revealed {
++					s.credit(TreasuryAccount, s.slash(j.Committee[i].Account, p.VerifierNoShowPenalty))
++				}
++			}
++			if len(j.requested()) == 0 {
++				j.Status, j.PhaseEnd = StatusChallenge, h+p.ChallengeWindow
++			} else {
++				j.Status, j.PhaseEnd = StatusProviderReveal, h+p.ProviderRevealWindow
++			}
++		}
++	case StatusProviderReveal:
++		want := j.requested()
++		got := map[uint32]Hash{}
++		for _, r := range j.Revealed {
++			got[r.Stage] = r.Root
++		}
++		complete := len(got) == len(want)
++		if !complete && h < j.PhaseEnd {
++			return
++		}
++		if !complete { // withheld a requested stage
++			var catchers []AccountID
++			for _, v := range j.Committee {
++				if v.Revealed {
++					catchers = append(catchers, v.Account)
++				}
++			}
++			s.failProvider(j, catchers)
++			return
++		}
++		flagged := false
++		for i := range j.Committee {
++			v := &j.Committee[i]
++			for k, pos := range v.Positions {
++				if v.Revealed && got[pos] != v.Roots[k] {
++					v.Flagged = true
++				}
++			}
++			flagged = flagged || v.Flagged
++		}
++		if flagged {
++			j.Status, j.PhaseEnd = StatusDisputed, h+p.DisputeTimeout
++		} else {
++			j.Status, j.PhaseEnd = StatusChallenge, h+p.ChallengeWindow
++		}
++	case StatusChallenge:
++		if h >= j.PhaseEnd {
++			s.settle(j)
++		}
++	case StatusDisputed:
++		if h >= j.PhaseEnd { // no verdict in time: no-fault abort, everything returned
++			s.credit(j.Client, j.Fee)
++			s.credit(j.Provider, j.Bond)
++			for _, d := range j.Disputes {
++				s.credit(d.Challenger, d.Bond)
++			}
++			j.Disputes = nil
++			j.Status, j.PhaseEnd = StatusAborted, 0
++		}
++	}
++}
+diff --git a/node/jobstate/jobstate_test.go b/node/jobstate/jobstate_test.go
+new file mode 100644
+index 00000000..dec687d4
+--- /dev/null
++++ b/node/jobstate/jobstate_test.go
+@@ -0,0 +1,753 @@
++package jobstate
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"math/rand/v2"
++	"reflect"
++	"testing"
++)
++
++// ---------------------------------------------------------------- harness
++
++func acct(i int) AccountID { return AccountForScript([]byte{0x51, byte(i), byte(i >> 8)}) }
++
++type sim struct {
++	t    *testing.T
++	p    Params
++	st   *State
++	h    int32
++	rng  *rand.Rand
++	refN uint64
++}
++
++func newSim(t *testing.T, seed uint64) *sim {
++	p := DefaultParams()
++	p.ChallengeWindow, p.DisputeTimeout, p.UnbondDelay = 20, 30, 15
++	return &sim{t: t, p: p, st: NewState(), rng: rand.New(rand.NewPCG(seed, seed^0x9e37))}
++}
++
++func (s *sim) ref() Hash {
++	s.refN++
++	return tagHash("ref", u32b(uint32(s.refN)), u32b(uint32(s.refN>>32)))
++}
++
++func (s *sim) randHash() (h Hash) {
++	for i := range h {
++		h[i] = byte(s.rng.Uint32())
++	}
++	return
++}
++
++// block applies one block and checks the invariants that must hold after every block.
++func (s *sim) block(deps []Deposit, ops []*Op, verdicts []Verdict) *BlockResult {
++	s.t.Helper()
++	s.h++
++	for _, o := range ops {
++		if o.Ref == (Hash{}) {
++			o.Ref = s.ref()
++		}
++	}
++	prev := s.randHash()
++	before := s.st.Clone()
++	in := BlockInput{Height: s.h, PrevHash: prev, Deposits: deps, Ops: ops, Verdicts: verdicts}
++	res := ApplyBlock(s.st, s.p, in)
++	// replay determinism: the same block on the pre-state gives the same root and payouts
++	again := ApplyBlock(before, s.p, in)
++	if again.Root != res.Root || !reflect.DeepEqual(again.Withdrawals, res.Withdrawals) {
++		s.t.Fatalf("block %d not deterministic", s.h)
++	}
++	s.check()
++	return res
++}
++
++func (s *sim) check() {
++	s.t.Helper()
++	st := s.st
++	if got, want := st.Holdings(), st.TotalIn-st.PaidOut; got != want {
++		s.t.Fatalf("height %d: conservation broken: holdings %d, expected %d", s.h, got, want)
++	}
++	for a, v := range st.Accounts {
++		if v <= 0 {
++			s.t.Fatalf("account %v has non-positive stored balance %d", a, v)
++		}
++	}
++	for a, v := range st.Stakes {
++		if v <= 0 {
++			s.t.Fatalf("stake %v non-positive %d", a, v)
++		}
++	}
++	for _, u := range st.Unbonding {
++		if u.Amount <= 0 {
++			s.t.Fatalf("empty unbonding entry")
++		}
++	}
++	for _, w := range st.Withdrawals {
++		if w.Amount <= 0 || w.Due <= s.h {
++			s.t.Fatalf("bad pending withdrawal %+v at %d", w, s.h)
++		}
++	}
++	for _, j := range st.Jobs {
++		if j.Held() < 0 {
++			s.t.Fatalf("job %v holds %d", j.ID, j.Held())
++		}
++	}
++	if st.Clone().Root() != st.Root() {
++		s.t.Fatal("root differs between clones")
++	}
++}
++
++func (s *sim) run(n int) {
++	for i := 0; i < n; i++ {
++		s.block(nil, nil, nil)
++	}
++}
++
++func (s *sim) bal(a AccountID) Amount { return s.st.Accounts[a] }
++
++func mustOK(t *testing.T, r *BlockResult) {
++	t.Helper()
++	for _, e := range r.OpErrors {
++		if e != nil {
++			t.Fatalf("op failed: %v", e)
++		}
++	}
++}
++
++// trace is a provider's honest work: one output root per stage, salted and committed.
++type trace struct {
++	roots, salts []Hash
++	leaves       []Hash
++}
++
++func (s *sim) newTrace(stages uint32) *trace {
++	tr := &trace{}
++	for i := uint32(0); i < stages; i++ {
++		r, sl := s.randHash(), s.randHash()
++		tr.roots, tr.salts = append(tr.roots, r), append(tr.salts, sl)
++		tr.leaves = append(tr.leaves, StageLeaf(i, sl, r))
++	}
++	return tr
++}
++
++func (tr *trace) commit() Hash { return MerkleRoot(tr.leaves) }
++
++func (tr *trace) reveal(stages []uint32) []StageReveal {
++	var out []StageReveal
++	for _, st := range stages {
++		out = append(out, StageReveal{Stage: st, Salt: tr.salts[st], Root: tr.roots[st], Proof: MerkleProof(tr.leaves, int(st))})
++	}
++	return out
++}
++
++// world: funded client, provider, several staked verifiers and a registered model.
++type world struct {
++	*sim
++	client, provider AccountID
++	verifiers        []AccountID
++	model            Hash
++}
++
++func newWorld(t *testing.T, seed uint64, nVerifiers int) *world {
++	s := newSim(t, seed)
++	w := &world{sim: s, client: acct(1), provider: acct(2)}
++	deps := []Deposit{{w.client, 1e9}, {w.provider, 1e9}}
++	var ops []*Op
++	for i := 0; i < nVerifiers; i++ {
++		v := acct(100 + i)
++		w.verifiers = append(w.verifiers, v)
++		deps = append(deps, Deposit{v, 1e8})
++		ops = append(ops, &Op{Kind: OpStake, Actor: v, Amount: s.p.MinVerifierStake * 2})
++	}
++	reg := &Op{Kind: OpModelReg, Actor: w.client, H1: s.randHash(), H2: s.randHash(), U1: 4, U2: 512}
++	ops = append(ops, reg)
++	mustOK(t, s.block(deps, ops, nil))
++	w.model = tagHash("model", reg.Ref[:])
++	return w
++}
++
++// post + accept + commit, then run until the committee is drawn. Returns the job.
++func (w *world) startJob(fee Amount, stages uint32, k, n uint8, tr *trace) *Job {
++	post := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, H1: w.randHash(), U1: stages, Amount: fee,
++		Deadline: w.h + 50, K: k, N: n}
++	mustOK(w.t, w.block(nil, []*Op{post}, nil))
++	id := tagHash("job", post.Ref[:])
++	mustOK(w.t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: w.provider, Job: id, Amount: minBond(w.p, fee)}}, nil))
++	mustOK(w.t, w.block(nil, []*Op{{Kind: OpTraceCommit, Actor: w.provider, Job: id, H1: tr.commit(), H2: w.randHash()}}, nil))
++	for w.st.Jobs[id].Status == StatusCommitted {
++		w.block(nil, nil, nil)
++	}
++	return w.st.Jobs[id]
++}
++
++// verifiers (except `skip`) commit to and then reveal the roots in tr at their sampled stages.
++func (w *world) verify(j *Job, tr *trace, skip map[AccountID]bool) {
++	salts := map[AccountID]Hash{}
++	var commits []*Op
++	for _, v := range j.Committee {
++		if skip[v.Account] {
++			continue
++		}
++		salt := w.randHash()
++		salts[v.Account] = salt
++		pos := Positions(salt, j.Stages, int(j.N))
++		roots := make([]Hash, len(pos))
++		for i, p := range pos {
++			roots[i] = tr.roots[p]
++		}
++		commits = append(commits, &Op{Kind: OpVerifyCommit, Actor: v.Account, Job: j.ID,
++			H1: sha256.Sum256(salt[:]), H2: ResultHash(roots, v.Account, salt)})
++	}
++	mustOK(w.t, w.block(nil, commits, nil))
++	for w.st.Jobs[j.ID].Status == StatusVerifyCommit {
++		w.block(nil, nil, nil)
++	}
++	var reveals []*Op
++	for _, v := range j.Committee {
++		salt, ok := salts[v.Account]
++		if !ok {
++			continue
++		}
++		pos := Positions(salt, j.Stages, int(j.N))
++		roots := make([]Hash, len(pos))
++		for i, p := range pos {
++			roots[i] = tr.roots[p]
++		}
++		reveals = append(reveals, &Op{Kind: OpVerifyReveal, Actor: v.Account, Job: j.ID, H1: salt, Roots: roots})
++	}
++	mustOK(w.t, w.block(nil, reveals, nil))
++}
++
++// ---------------------------------------------------------------- scenario tests
++
++func TestHonestJobSettlesExactly(t *testing.T) {
++	w := newWorld(t, 1, 5)
++	fee := Amount(10_000_000)
++	c0, p0, tr0 := w.bal(w.client), w.bal(w.provider), w.bal(TreasuryAccount)
++	vb := map[AccountID]Amount{}
++	for _, v := range w.verifiers {
++		vb[v] = w.bal(v)
++	}
++	tr := w.newTrace(40)
++	j := w.startJob(fee, 40, 3, 2, tr)
++	if len(j.Committee) != 3 {
++		t.Fatalf("committee size %d", len(j.Committee))
++	}
++	w.verify(j, tr, nil)
++	j = w.st.Jobs[j.ID]
++	if j.Status != StatusProviderReveal {
++		t.Fatalf("status %v", j.Status)
++	}
++	var want []uint32
++	for st := range j.requested() {
++		want = append(want, st)
++	}
++	mustOK(t, w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: w.provider, Job: j.ID, Reveals: tr.reveal(want)}}, nil))
++	w.block(nil, nil, nil)
++	if w.st.Jobs[j.ID].Status != StatusChallenge {
++		t.Fatalf("status %v", w.st.Jobs[j.ID].Status)
++	}
++	w.run(int(w.p.ChallengeWindow) + 1)
++	j = w.st.Jobs[j.ID]
++	if j.Status != StatusSettled {
++		t.Fatalf("status %v", j.Status)
++	}
++	vp, tc := JobPay(w.p, fee, 3, 2)
++	if d := w.bal(w.client) - c0; d != -fee {
++		t.Fatalf("client paid %d", -d)
++	}
++	if d := w.bal(w.provider) - p0; d != fee-vp-tc {
++		t.Fatalf("provider earned %d, want %d", d, fee-vp-tc)
++	}
++	each := vp / 3
++	for _, v := range j.Committee {
++		if d := w.bal(v.Account) - vb[v.Account]; d != each {
++			t.Fatalf("verifier earned %d, want %d", d, each)
++		}
++	}
++	if d := w.bal(TreasuryAccount) - tr0; d != tc+vp-3*each {
++		t.Fatalf("treasury got %d", d)
++	}
++}
++
++func TestWithholdingProviderIsSlashed(t *testing.T) {
++	w := newWorld(t, 2, 4)
++	fee := Amount(4_000_000)
++	c0, p0 := w.bal(w.client), w.bal(w.provider)
++	tr := w.newTrace(16)
++	j := w.startJob(fee, 16, 2, 3, tr)
++	w.verify(j, tr, nil)
++	w.run(int(w.p.ProviderRevealWindow) + 1) // provider never reveals
++	j = w.st.Jobs[j.ID]
++	if j.Status != StatusFailed {
++		t.Fatalf("status %v", j.Status)
++	}
++	if w.bal(w.client) != c0 {
++		t.Fatal("client not refunded")
++	}
++	if d := w.bal(w.provider) - p0; d != -minBond(w.p, fee) {
++		t.Fatalf("provider lost %d", -d)
++	}
++}
++
++func TestCheatingProviderCaughtByVerifier(t *testing.T) {
++	for _, atFault := range []bool{true, false} {
++		w := newWorld(t, 3, 4)
++		fee := Amount(6_000_000)
++		c0, p0 := w.bal(w.client), w.bal(w.provider)
++		honest := w.newTrace(24)
++		j := w.startJob(fee, 24, 2, 2, honest)
++		// the provider committed `honest`, but what it actually computed (and what an honest
++		// verifier recomputes) differs at every stage: model it as verifiers holding other roots
++		truth := w.newTrace(24)
++		w.verify(j, truth, nil)
++		j = w.st.Jobs[j.ID]
++		var want []uint32
++		for st := range j.requested() {
++			want = append(want, st)
++		}
++		mustOK(t, w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: w.provider, Job: j.ID, Reveals: honest.reveal(want)}}, nil))
++		w.block(nil, nil, nil)
++		if w.st.Jobs[j.ID].Status != StatusDisputed {
++			t.Fatalf("status %v", w.st.Jobs[j.ID].Status)
++		}
++		w.block(nil, nil, []Verdict{{Job: j.ID, ProviderAtFault: atFault}})
++		j = w.st.Jobs[j.ID]
++		bond := minBond(w.p, fee)
++		if atFault {
++			if j.Status != StatusFailed || w.bal(w.client) != c0 || w.bal(w.provider)-p0 != -bond {
++				t.Fatalf("fault: status %v client %d provider %d", j.Status, w.bal(w.client)-c0, w.bal(w.provider)-p0)
++			}
++		} else if j.Status != StatusSettled {
++			t.Fatalf("no-fault verdict should settle, got %v", j.Status)
++		}
++	}
++}
++
++func TestDisputeTimeoutAbortsWithoutLoss(t *testing.T) {
++	w := newWorld(t, 4, 3)
++	fee := Amount(5_000_000)
++	c0, p0 := w.bal(w.client), w.bal(w.provider)
++	tr := w.newTrace(8)
++	j := w.startJob(fee, 8, 2, 2, tr)
++	w.verify(j, tr, nil)
++	j = w.st.Jobs[j.ID]
++	var want []uint32
++	for st := range j.requested() {
++		want = append(want, st)
++	}
++	mustOK(t, w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: w.provider, Job: j.ID, Reveals: tr.reveal(want)}}, nil))
++	w.block(nil, nil, nil)
++	ch := acct(7)
++	mustOK(t, w.block([]Deposit{{ch, 1e7}}, []*Op{{Kind: OpChallenge, Actor: ch, Job: j.ID, U1: 3, H1: w.randHash(), Amount: w.p.ChallengeBondMin}}, nil))
++	w.run(int(w.p.DisputeTimeout) + 1)
++	if s := w.st.Jobs[j.ID].Status; s != StatusAborted {
++		t.Fatalf("status %v", s)
++	}
++	if w.bal(w.client) != c0 || w.bal(w.provider) != p0 || w.bal(ch) != 1e7 {
++		t.Fatal("abort must return every party's funds")
++	}
++}
++
++func TestNoShowVerifierPenalizedJobStillSettles(t *testing.T) {
++	w := newWorld(t, 5, 4)
++	tr := w.newTrace(12)
++	j := w.startJob(8_000_000, 12, 2, 2, tr)
++	lazy := j.Committee[0].Account
++	stake0 := w.st.Stakes[lazy]
++	w.verify(j, tr, map[AccountID]bool{lazy: true})
++	j = w.st.Jobs[j.ID]
++	if w.st.Stakes[lazy] != stake0-w.p.VerifierNoShowPenalty {
++		t.Fatalf("lazy verifier stake %d, want %d", w.st.Stakes[lazy], stake0-w.p.VerifierNoShowPenalty)
++	}
++	var want []uint32
++	for st := range j.requested() {
++		want = append(want, st)
++	}
++	mustOK(t, w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: w.provider, Job: j.ID, Reveals: tr.reveal(want)}}, nil))
++	w.run(int(w.p.ChallengeWindow) + 2)
++	if s := w.st.Jobs[j.ID].Status; s != StatusSettled {
++		t.Fatalf("status %v", s)
++	}
++}
++
++func TestExpiryAndAcceptWithoutCommit(t *testing.T) {
++	w := newWorld(t, 6, 2)
++	c0, p0 := w.bal(w.client), w.bal(w.provider)
++	post := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1_000_000, Deadline: w.h + 5, K: 2, N: 2}
++	mustOK(t, w.block(nil, []*Op{post}, nil))
++	w.run(6)
++	if s := w.st.Jobs[tagHash("job", post.Ref[:])].Status; s != StatusExpired || w.bal(w.client) != c0 {
++		t.Fatalf("expiry: %v", s)
++	}
++	post2 := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1_000_000, Deadline: w.h + 5, K: 2, N: 2}
++	mustOK(t, w.block(nil, []*Op{post2}, nil))
++	id := tagHash("job", post2.Ref[:])
++	bond := minBond(w.p, 1_000_000)
++	mustOK(t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: w.provider, Job: id, Amount: bond}}, nil))
++	w.run(6)
++	if s := w.st.Jobs[id].Status; s != StatusFailed {
++		t.Fatalf("accept-no-commit: %v", s)
++	}
++	if w.bal(w.client)-c0 != bond/2 || w.bal(w.provider)-p0 != -bond {
++		t.Fatalf("client +%d provider %d", w.bal(w.client)-c0, w.bal(w.provider)-p0)
++	}
++}
++
++func TestEscrowCannotBeSpentTwice(t *testing.T) {
++	w := newWorld(t, 7, 2)
++	all := w.bal(w.client)
++	ops := []*Op{
++		{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: all, Deadline: w.h + 9, K: 2, N: 2},
++		{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1, Deadline: w.h + 9, K: 2, N: 2},
++		{Kind: OpWithdraw, Actor: w.client, Amount: 1, PkScript: []byte{0x51}},
++		{Kind: OpStake, Actor: w.client, Amount: 1},
++	}
++	r := w.block(nil, ops, nil)
++	if r.OpErrors[0] != nil || r.OpErrors[1] == nil || r.OpErrors[2] == nil || r.OpErrors[3] == nil {
++		t.Fatalf("errors %v", r.OpErrors)
++	}
++	if w.bal(w.client) != 0 {
++		t.Fatal("balance should be fully escrowed")
++	}
++}
++
++func TestFailedOpsAreNoOps(t *testing.T) {
++	w := newWorld(t, 8, 3)
++	before := w.st.Root()
++	junk := []*Op{
++		{Kind: OpJobAccept, Actor: w.provider, Job: w.randHash(), Amount: 5},
++		{Kind: OpWithdraw, Actor: acct(999), Amount: 10, PkScript: []byte{1}},
++		{Kind: OpUnstake, Actor: w.verifiers[0], Amount: 1 << 60},
++		{Kind: OpJobPost, Actor: w.client, Model: w.randHash(), U1: 4, Amount: 10, Deadline: w.h + 3, K: 2, N: 2},
++		{Kind: OpChallenge, Actor: w.client, Job: w.randHash(), Amount: 1 << 40},
++		{Kind: OpModelReg, Actor: acct(999), U1: 1},
++	}
++	h := w.h + 1
++	cl := w.st.Clone()
++	r := ApplyBlock(cl, w.p, BlockInput{Height: h, Ops: junk})
++	for i, e := range r.OpErrors {
++		if e == nil {
++			t.Fatalf("junk op %d accepted", i)
++		}
++	}
++	empty := w.st.Clone()
++	r2 := ApplyBlock(empty, w.p, BlockInput{Height: h})
++	if r.Root != r2.Root {
++		t.Fatal("failed ops changed the state")
++	}
++	_ = before
++}
++
++func TestUnbondingStaysSlashable(t *testing.T) {
++	s := newSim(t, 9)
++	v := acct(5)
++	mustOK(t, s.block([]Deposit{{v, 1e7}}, []*Op{{Kind: OpStake, Actor: v, Amount: 3e6}}, nil))
++	mustOK(t, s.block(nil, []*Op{{Kind: OpUnstake, Actor: v, Amount: 3e6}}, nil))
++	if s.st.Stakes[v] != 0 || s.st.Accounts[v] != 7e6 {
++		t.Fatal("unstake should leave the draw immediately but not return funds")
++	}
++	if got := s.st.slash(v, 1e6); got != 1e6 {
++		t.Fatalf("slashed %d from unbonding", got)
++	}
++	s.st.credit(TreasuryAccount, 1e6)
++	s.run(int(s.p.UnbondDelay) + 1)
++	if s.st.Accounts[v] != 9e6 {
++		t.Fatalf("after unbonding balance %d", s.st.Accounts[v])
++	}
++}
++
++func TestWithdrawalsBecomeDueOnce(t *testing.T) {
++	s := newSim(t, 10)
++	a := acct(3)
++	mustOK(t, s.block([]Deposit{{a, 500}}, []*Op{{Kind: OpWithdraw, Actor: a, Amount: 200, PkScript: []byte{0x76, 0xa9}}}, nil))
++	due := s.h + s.p.WithdrawDelay
++	var seen int
++	for s.h < due+3 {
++		r := s.block(nil, nil, nil)
++		for _, w := range r.Withdrawals {
++			if s.h != due || w.Amount != 200 || !bytes.Equal(w.PkScript, []byte{0x76, 0xa9}) {
++				t.Fatalf("withdrawal %+v at height %d", w, s.h)
++			}
++			seen++
++		}
++	}
++	if seen != 1 || s.st.PaidOut != 200 || s.st.Accounts[a] != 300 {
++		t.Fatalf("seen %d paid %d balance %d", seen, s.st.PaidOut, s.st.Accounts[a])
++	}
++}
++
++// ---------------------------------------------------------------- committee, positions, merkle, encoding
++
++func TestCommitteeDrawProperties(t *testing.T) {
++	st := NewState()
++	p := DefaultParams()
++	for i := 0; i < 20; i++ {
++		st.Stakes[acct(i)] = p.MinVerifierStake * Amount(1+i%4)
++	}
++	st.Stakes[acct(50)] = p.MinVerifierStake - 1 // below minimum: never drawn
++	j := &Job{ID: Hash{1}, Client: acct(0), Provider: acct(1), K: 5}
++	c := DrawCommittee(st, p, j, Hash{9})
++	if len(c) != 5 {
++		t.Fatalf("size %d", len(c))
++	}
++	seen := map[AccountID]bool{}
++	for _, a := range c {
++		if a == j.Client || a == j.Provider || a == acct(50) || seen[a] {
++			t.Fatalf("bad member %v", a)
++		}
++		seen[a] = true
++	}
++	if !reflect.DeepEqual(c, DrawCommittee(st.Clone(), p, j, Hash{9})) {
++		t.Fatal("draw not deterministic")
++	}
++	// stake weighting with one seat: P(pick) proportional to stake
++	st2 := NewState()
++	st2.Stakes[acct(2)] = p.MinVerifierStake
++	st2.Stakes[acct(3)] = 3 * p.MinVerifierStake
++	j1 := &Job{ID: Hash{2}, K: 1}
++	wins := 0
++	const trials = 20000
++	for i := 0; i < trials; i++ {
++		if DrawCommittee(st2, p, j1, tagHash("seed", u32b(uint32(i))))[0] == acct(3) {
++			wins++
++		}
++	}
++	if f := float64(wins) / trials; f < 0.735 || f > 0.765 {
++		t.Fatalf("3x stake won %.3f of draws, want 0.75", f)
++	}
++}
++
++func TestPositions(t *testing.T) {
++	for _, S := range []uint32{1, 2, 3, 10, 1000} {
++		for n := 1; n <= 12; n++ {
++			pos := Positions(Hash{byte(S), byte(n)}, S, n)
++			want := n
++			if uint32(n) >= S {
++				want = int(S)
++			}
++			if len(pos) != want {
++				t.Fatalf("S=%d n=%d got %d", S, n, len(pos))
++			}
++			for i, p := range pos {
++				if p >= S || (i > 0 && pos[i-1] >= p) {
++					t.Fatalf("not sorted distinct in range: %v", pos)
++				}
++			}
++		}
++	}
++}
++
++func TestMerkleProofsAllSizes(t *testing.T) {
++	for n := 1; n <= 70; n++ {
++		var leaves []Hash
++		for i := 0; i < n; i++ {
++			leaves = append(leaves, leafHash([]byte{byte(i), byte(n)}))
++		}
++		root := MerkleRoot(leaves)
++		for i := 0; i < n; i++ {
++			pr := MerkleProof(leaves, i)
++			if !VerifyMerkleProof(root, leaves[i], i, n, pr) {
++				t.Fatalf("n=%d i=%d proof fails", n, i)
++			}
++			if n > 1 && VerifyMerkleProof(root, leaves[(i+1)%n], i, n, pr) {
++				t.Fatalf("n=%d i=%d wrong leaf accepted", n, i)
++			}
++			if n > 1 && VerifyMerkleProof(root, leaves[i], (i+1)%n, n, pr) {
++				t.Fatalf("n=%d i=%d proof accepted at another index", n, i)
++			}
++		}
++	}
++}
++
++func TestOpEncodingRoundTrip(t *testing.T) {
++	rng := rand.New(rand.NewPCG(11, 12))
++	rh := func() (h Hash) {
++		for i := range h {
++			h[i] = byte(rng.Uint32())
++		}
++		return
++	}
++	for i := 0; i < 2000; i++ {
++		o := &Op{Kind: OpKind(1 + rng.IntN(11)), Amount: rng.Int64(), Job: rh(), Model: rh(), H1: rh(), H2: rh(),
++			U1: rng.Uint32(), U2: rng.Uint32(), Deadline: int32(rng.Uint32()), K: uint8(rng.Uint32()), N: uint8(rng.Uint32())}
++		o.PkScript = make([]byte, rng.IntN(40))
++		for k := 0; k < rng.IntN(5); k++ {
++			o.Roots = append(o.Roots, rh())
++		}
++		for k := 0; k < rng.IntN(3); k++ {
++			o.Reveals = append(o.Reveals, StageReveal{Stage: rng.Uint32(), Salt: rh(), Root: rh(), Proof: []Hash{rh(), rh()}})
++		}
++		b := o.Encode()
++		d, err := DecodeOp(b)
++		if err != nil {
++			t.Fatalf("decode %v: %v", o.Kind, err)
++		}
++		if !bytes.Equal(d.Encode(), b) {
++			t.Fatalf("%v does not round-trip", o.Kind)
++		}
++		if _, err := DecodeOp(append(b, 0)); err == nil {
++			t.Fatal("trailing byte accepted")
++		}
++		if len(b) > 2 {
++			if _, err := DecodeOp(b[:len(b)-1]); err == nil {
++				t.Fatalf("%v: truncated payload accepted", o.Kind)
++			}
++		}
++	}
++}
++
++// ---------------------------------------------------------------- randomized property test
++
++// TestRandomizedProperties drives many random jobs (honest, cheating, withholding, lazy
++// verifiers, griefing challengers) plus random junk ops, deposits, stakes and withdrawals,
++// checking conservation, non-negativity and replay determinism after every block, and
++// liveness (every job terminal, nothing left in escrow) at the end.
++func TestRandomizedProperties(t *testing.T) {
++	seeds := 40
++	if testing.Short() {
++		seeds = 8
++	}
++	for seed := 0; seed < seeds; seed++ {
++		randomizedRun(t, uint64(seed+100))
++	}
++}
++
++func randomizedRun(t *testing.T, seed uint64) {
++	w := newWorld(t, seed, 6)
++	r := w.rng
++	type live struct {
++		id     Hash
++		tr     *trace
++		salts  map[AccountID]Hash
++		cheat  bool
++		lazy   AccountID
++		reveal bool
++	}
++	var jobs []*live
++	users := []AccountID{w.client, w.provider, acct(40), acct(41), acct(42)}
++	totalBlocks := 300
++	for b := 0; b < totalBlocks; b++ {
++		var ops []*Op
++		var deps []Deposit
++		var verdicts []Verdict
++		if r.IntN(4) == 0 {
++			deps = append(deps, Deposit{users[r.IntN(len(users))], Amount(r.IntN(5_000_000))})
++		}
++		// new jobs (posting stops well before the end so every job can finish)
++		if b < totalBlocks-150 && r.IntN(5) == 0 {
++			stages := uint32(4 * (1 + r.IntN(8)))
++			fee := Amount(1_000_000 + r.IntN(9_000_000))
++			post := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: stages, Amount: fee,
++				Deadline: w.h + 1 + int32(3+r.IntN(20)), K: uint8(2 + r.IntN(3)), N: uint8(2 + r.IntN(4)), Ref: w.ref()}
++			ops = append(ops, post)
++			jobs = append(jobs, &live{id: tagHash("job", post.Ref[:]), tr: w.newTrace(stages), salts: map[AccountID]Hash{},
++				cheat: r.IntN(4) == 0, reveal: r.IntN(6) != 0})
++		}
++		for _, lj := range jobs {
++			j := w.st.Jobs[lj.id]
++			if j == nil || j.Status.Terminal() {
++				continue
++			}
++			switch j.Status {
++			case StatusPosted:
++				if r.IntN(3) != 0 {
++					ops = append(ops, &Op{Kind: OpJobAccept, Actor: w.provider, Job: j.ID, Amount: minBond(w.p, j.Fee) + Amount(r.IntN(1000))})
++				}
++			case StatusAccepted:
++				if r.IntN(3) != 0 {
++					ops = append(ops, &Op{Kind: OpTraceCommit, Actor: w.provider, Job: j.ID, H1: lj.tr.commit(), H2: w.randHash()})
++				}
++			case StatusVerifyCommit:
++				for _, v := range j.Committee {
++					if v.Committed || lj.salts[v.Account] != (Hash{}) || r.IntN(8) == 0 {
++						continue
++					}
++					salt := w.randHash()
++					lj.salts[v.Account] = salt
++					pos := Positions(salt, j.Stages, int(j.N))
++					roots := make([]Hash, len(pos))
++					for i, p := range pos {
++						roots[i] = lj.tr.roots[p]
++						if lj.cheat {
++							roots[i] = tagHash("truth", lj.tr.roots[p][:])
++						}
++					}
++					ops = append(ops, &Op{Kind: OpVerifyCommit, Actor: v.Account, Job: j.ID, H1: sha256.Sum256(salt[:]), H2: ResultHash(roots, v.Account, salt)})
++				}
++			case StatusVerifyReveal:
++				for _, v := range j.Committee {
++					salt, ok := lj.salts[v.Account]
++					if !ok || v.Revealed || !v.Committed || r.IntN(8) == 0 {
++						continue
++					}
++					pos := Positions(salt, j.Stages, int(j.N))
++					roots := make([]Hash, len(pos))
++					for i, p := range pos {
++						roots[i] = lj.tr.roots[p]
++						if lj.cheat {
++							roots[i] = tagHash("truth", lj.tr.roots[p][:])
++						}
++					}
++					ops = append(ops, &Op{Kind: OpVerifyReveal, Actor: v.Account, Job: j.ID, H1: salt, Roots: roots})
++				}
++			case StatusProviderReveal:
++				if lj.reveal {
++					var want []uint32
++					for st := range j.requested() {
++						want = append(want, st)
++					}
++					if len(want) > 0 {
++						ops = append(ops, &Op{Kind: OpTraceReveal, Actor: w.provider, Job: j.ID, Reveals: lj.tr.reveal(want)})
++					}
++				}
++			case StatusChallenge:
++				if r.IntN(15) == 0 {
++					ch := users[2+r.IntN(3)]
++					ops = append(ops, &Op{Kind: OpChallenge, Actor: ch, Job: j.ID, U1: uint32(r.IntN(int(j.Stages))), H1: w.randHash(), Amount: w.p.ChallengeBondMin})
++				}
++			case StatusDisputed:
++				if r.IntN(4) == 0 {
++					verdicts = append(verdicts, Verdict{Job: j.ID, ProviderAtFault: lj.cheat || r.IntN(2) == 0})
++				}
++			}
++		}
++		// noise: random stakes, unstakes, withdrawals and malformed or unauthorized ops
++		for k := 0; k < r.IntN(3); k++ {
++			u := users[r.IntN(len(users))]
++			switch r.IntN(6) {
++			case 0:
++				ops = append(ops, &Op{Kind: OpStake, Actor: u, Amount: Amount(r.IntN(3_000_000))})
++			case 1:
++				ops = append(ops, &Op{Kind: OpUnstake, Actor: w.verifiers[r.IntN(len(w.verifiers))], Amount: Amount(r.IntN(300_000))})
++			case 2:
++				ops = append(ops, &Op{Kind: OpWithdraw, Actor: u, Amount: Amount(r.IntN(2_000_000)), PkScript: []byte{0x51, byte(k)}})
++			case 3:
++				if len(jobs) > 0 {
++					lj := jobs[r.IntN(len(jobs))]
++					ops = append(ops, &Op{Kind: OpKind(1 + r.IntN(11)), Actor: u, Job: lj.id, Amount: Amount(r.IntN(1 << 20)), H1: w.randHash()})
++				}
++			case 4:
++				ops = append(ops, &Op{Kind: OpTraceReveal, Actor: w.provider, Job: w.randHash(), Reveals: []StageReveal{{Stage: 1}}})
++			case 5:
++				ops = append(ops, &Op{Kind: OpChallenge, Actor: w.provider, Job: w.randHash(), Amount: -5})
++			}
++		}
++		w.block(deps, ops, verdicts)
++	}
++	// liveness: with no further input every job ends and nothing stays escrowed
++	w.run(int(w.p.DisputeTimeout + w.p.ChallengeWindow + 100))
++	statuses := map[JobStatus]int{}
++	for _, j := range w.st.Jobs {
++		if !j.Status.Terminal() {
++			t.Fatalf("seed %d: job %v stuck in %v", seed, j.ID, j.Status)
++		}
++		statuses[j.Status]++
++	}
++	if len(w.st.Jobs) == 0 {
++		t.Fatalf("seed %d: no jobs were created", seed)
++	}
++	if testing.Verbose() && seed == 100 {
++		t.Logf("seed %d: %d jobs, outcomes %v", seed, len(w.st.Jobs), statuses)
++	}
++}
+diff --git a/node/jobstate/merkle.go b/node/jobstate/merkle.go
+new file mode 100644
+index 00000000..ca9ea182
+--- /dev/null
++++ b/node/jobstate/merkle.go
+@@ -0,0 +1,97 @@
++package jobstate
++
++import (
++	"crypto/sha256"
++	"encoding/binary"
++)
++
++// RFC 6962 Merkle tree: leaves hashed with 0x00, interior nodes with 0x01, and the split at the
++// largest power of two below n (no duplicated leaves, so proofs are unambiguous for any size).
++
++func leafHash(data []byte) Hash {
++	h := sha256.New()
++	h.Write([]byte{0})
++	h.Write(data)
++	var o Hash
++	copy(o[:], h.Sum(nil))
++	return o
++}
++
++func nodeHash(l, r Hash) Hash {
++	h := sha256.New()
++	h.Write([]byte{1})
++	h.Write(l[:])
++	h.Write(r[:])
++	var o Hash
++	copy(o[:], h.Sum(nil))
++	return o
++}
++
++func splitPoint(n int) int {
++	k := 1
++	for k<<1 < n {
++		k <<= 1
++	}
++	return k
++}
++
++// MerkleRoot of already-hashed leaves; the empty tree hashes to sha256("").
++func MerkleRoot(leaves []Hash) Hash {
++	switch len(leaves) {
++	case 0:
++		return sha256.Sum256(nil)
++	case 1:
++		return leaves[0]
++	}
++	k := splitPoint(len(leaves))
++	return nodeHash(MerkleRoot(leaves[:k]), MerkleRoot(leaves[k:]))
++}
++
++// MerkleProof is the audit path for leaf index i (sibling hashes from the leaf upward).
++func MerkleProof(leaves []Hash, i int) []Hash {
++	if len(leaves) <= 1 {
++		return nil
++	}
++	k := splitPoint(len(leaves))
++	if i < k {
++		return append(MerkleProof(leaves[:k], i), MerkleRoot(leaves[k:]))
++	}
++	return append(MerkleProof(leaves[k:], i-k), MerkleRoot(leaves[:k]))
++}
++
++// VerifyMerkleProof checks that leaf sits at index i of a size-n tree with the given root.
++func VerifyMerkleProof(root, leaf Hash, i, n int, proof []Hash) bool {
++	if i < 0 || i >= n {
++		return false
++	}
++	h, ok := walk(leaf, i, n, proof)
++	return ok && h == root
++}
++
++func walk(leaf Hash, i, n int, proof []Hash) (Hash, bool) {
++	if n == 1 {
++		return leaf, len(proof) == 0
++	}
++	if len(proof) == 0 {
++		return Hash{}, false
++	}
++	k := splitPoint(n)
++	sib := proof[len(proof)-1]
++	rest := proof[:len(proof)-1]
++	if i < k {
++		h, ok := walk(leaf, i, k, rest)
++		return nodeHash(h, sib), ok
++	}
++	h, ok := walk(leaf, i-k, n-k, rest)
++	return nodeHash(sib, h), ok
++}
++
++// StageLeaf is the salted commitment leaf for one stage's output root.
++func StageLeaf(stage uint32, salt, root Hash) Hash {
++	var b [5 + 4 + 64]byte
++	copy(b[:5], "stage")
++	binary.LittleEndian.PutUint32(b[5:9], stage)
++	copy(b[9:41], salt[:])
++	copy(b[41:], root[:])
++	return leafHash(b[:])
++}
+diff --git a/node/jobstate/ops.go b/node/jobstate/ops.go
+new file mode 100644
+index 00000000..e13f6539
+--- /dev/null
++++ b/node/jobstate/ops.go
+@@ -0,0 +1,238 @@
++package jobstate
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"fmt"
++)
++
++// OpKind is a job-module operation type.
++type OpKind uint8
++
++const (
++	OpWithdraw OpKind = iota + 1
++	OpStake
++	OpUnstake
++	OpModelReg
++	OpJobPost
++	OpJobAccept
++	OpTraceCommit
++	OpVerifyCommit
++	OpVerifyReveal
++	OpTraceReveal
++	OpChallenge
++)
++
++var opNames = map[OpKind]string{
++	OpWithdraw: "WITHDRAW", OpStake: "STAKE", OpUnstake: "UNSTAKE", OpModelReg: "MODEL_REG",
++	OpJobPost: "JOB_POST", OpJobAccept: "JOB_ACCEPT", OpTraceCommit: "TRACE_COMMIT",
++	OpVerifyCommit: "VERIFY_COMMIT", OpVerifyReveal: "VERIFY_REVEAL", OpTraceReveal: "TRACE_REVEAL",
++	OpChallenge: "CHALLENGE",
++}
++
++func (k OpKind) String() string { return opNames[k] }
++
++// Op is one decoded operation. Actor and Ref are filled in by the node, not encoded:
++// Actor is the account of the transaction's first input, Ref = H(txid || output index)
++// (unique per op, used to derive job and model ids).
++//
++// Field use per kind:
++//
++//	WITHDRAW       Amount, PkScript
++//	STAKE/UNSTAKE  Amount
++//	MODEL_REG      H1 weights_root, H2 runtime_hash, U1 layer_groups, U2 rotation_block
++//	JOB_POST       Model, H1 input_root, U1 stages, Amount fee, Deadline, K, N
++//	JOB_ACCEPT     Job, Amount bond
++//	TRACE_COMMIT   Job, H1 stage_root, H2 output_root
++//	VERIFY_COMMIT  Job, H1 H(salt), H2 H(roots || account || salt)
++//	VERIFY_REVEAL  Job, H1 salt, Roots (one per sampled position, in position order)
++//	TRACE_REVEAL   Job, Reveals
++//	CHALLENGE      Job, U1 stage, H1 claimed_root, Amount bond
++type Op struct {
++	Kind     OpKind
++	Actor    AccountID
++	Ref      Hash
++	Amount   Amount
++	PkScript []byte
++	Job      Hash
++	Model    Hash
++	H1, H2   Hash
++	U1, U2   uint32
++	Deadline int32
++	K, N     uint8
++	Roots    []Hash
++	Reveals  []StageReveal
++}
++
++const (
++	opVersion       = 1
++	maxPkScript     = 10_000
++	maxRoots        = 4096
++	maxReveals      = 4096
++	maxProofDepth   = 40
++	MaxOpPayloadLen = 1 << 20
++)
++
++// Encode serializes an op (without Actor and Ref).
++func (o *Op) Encode() []byte {
++	var b bytes.Buffer
++	b.WriteByte(opVersion)
++	b.WriteByte(byte(o.Kind))
++	w := func(v any) { _ = binary.Write(&b, binary.LittleEndian, v) }
++	uv := func(v uint64) {
++		var t [binary.MaxVarintLen64]byte
++		b.Write(t[:binary.PutUvarint(t[:], v)])
++	}
++	switch o.Kind {
++	case OpWithdraw:
++		w(o.Amount)
++		uv(uint64(len(o.PkScript)))
++		b.Write(o.PkScript)
++	case OpStake, OpUnstake:
++		w(o.Amount)
++	case OpModelReg:
++		b.Write(o.H1[:])
++		b.Write(o.H2[:])
++		w(o.U1)
++		w(o.U2)
++	case OpJobPost:
++		b.Write(o.Model[:])
++		b.Write(o.H1[:])
++		w(o.U1)
++		w(o.Amount)
++		w(o.Deadline)
++		b.WriteByte(o.K)
++		b.WriteByte(o.N)
++	case OpJobAccept:
++		b.Write(o.Job[:])
++		w(o.Amount)
++	case OpTraceCommit, OpVerifyCommit:
++		b.Write(o.Job[:])
++		b.Write(o.H1[:])
++		b.Write(o.H2[:])
++	case OpVerifyReveal:
++		b.Write(o.Job[:])
++		b.Write(o.H1[:])
++		uv(uint64(len(o.Roots)))
++		for _, r := range o.Roots {
++			b.Write(r[:])
++		}
++	case OpTraceReveal:
++		b.Write(o.Job[:])
++		uv(uint64(len(o.Reveals)))
++		for _, r := range o.Reveals {
++			w(r.Stage)
++			b.Write(r.Salt[:])
++			b.Write(r.Root[:])
++			uv(uint64(len(r.Proof)))
++			for _, p := range r.Proof {
++				b.Write(p[:])
++			}
++		}
++	case OpChallenge:
++		b.Write(o.Job[:])
++		w(o.U1)
++		b.Write(o.H1[:])
++		w(o.Amount)
++	}
++	return b.Bytes()
++}
++
++var errDecode = errors.New("jobstate: malformed op")
++
++type reader struct {
++	b   []byte
++	err error
++}
++
++func (r *reader) take(n int) []byte {
++	if r.err != nil || n < 0 || len(r.b) < n {
++		r.err = errDecode
++		return make([]byte, max(n, 0))
++	}
++	v := r.b[:n]
++	r.b = r.b[n:]
++	return v
++}
++func (r *reader) hash() (h Hash) { copy(h[:], r.take(32)); return }
++func (r *reader) u8() uint8      { return r.take(1)[0] }
++func (r *reader) u32() uint32    { return binary.LittleEndian.Uint32(r.take(4)) }
++func (r *reader) i32() int32     { return int32(r.u32()) }
++func (r *reader) i64() int64     { return int64(binary.LittleEndian.Uint64(r.take(8))) }
++func (r *reader) uvar(limit uint64) int {
++	if r.err != nil {
++		return 0
++	}
++	v, n := binary.Uvarint(r.b)
++	if n <= 0 || v > limit {
++		r.err = errDecode
++		return 0
++	}
++	r.b = r.b[n:]
++	return int(v)
++}
++
++// DecodeOp parses an op payload strictly (no trailing bytes, bounded lengths).
++func DecodeOp(p []byte) (*Op, error) {
++	if len(p) > MaxOpPayloadLen {
++		return nil, errDecode
++	}
++	r := &reader{b: p}
++	if r.u8() != opVersion {
++		return nil, fmt.Errorf("jobstate: unknown op version")
++	}
++	o := &Op{Kind: OpKind(r.u8())}
++	switch o.Kind {
++	case OpWithdraw:
++		o.Amount = r.i64()
++		o.PkScript = append([]byte(nil), r.take(r.uvar(maxPkScript))...)
++	case OpStake, OpUnstake:
++		o.Amount = r.i64()
++	case OpModelReg:
++		o.H1, o.H2 = r.hash(), r.hash()
++		o.U1, o.U2 = r.u32(), r.u32()
++	case OpJobPost:
++		o.Model, o.H1 = r.hash(), r.hash()
++		o.U1 = r.u32()
++		o.Amount = r.i64()
++		o.Deadline = r.i32()
++		o.K, o.N = r.u8(), r.u8()
++	case OpJobAccept:
++		o.Job = r.hash()
++		o.Amount = r.i64()
++	case OpTraceCommit, OpVerifyCommit:
++		o.Job, o.H1, o.H2 = r.hash(), r.hash(), r.hash()
++	case OpVerifyReveal:
++		o.Job, o.H1 = r.hash(), r.hash()
++		n := r.uvar(maxRoots)
++		for i := 0; i < n && r.err == nil; i++ {
++			o.Roots = append(o.Roots, r.hash())
++		}
++	case OpTraceReveal:
++		o.Job = r.hash()
++		n := r.uvar(maxReveals)
++		for i := 0; i < n && r.err == nil; i++ {
++			sr := StageReveal{Stage: r.u32(), Salt: r.hash(), Root: r.hash()}
++			d := r.uvar(maxProofDepth)
++			for j := 0; j < d && r.err == nil; j++ {
++				sr.Proof = append(sr.Proof, r.hash())
++			}
++			o.Reveals = append(o.Reveals, sr)
++		}
++	case OpChallenge:
++		o.Job = r.hash()
++		o.U1 = r.u32()
++		o.H1 = r.hash()
++		o.Amount = r.i64()
++	default:
++		return nil, fmt.Errorf("jobstate: unknown op kind %d", o.Kind)
++	}
++	if r.err != nil {
++		return nil, r.err
++	}
++	if len(r.b) != 0 {
++		return nil, fmt.Errorf("jobstate: %d trailing bytes", len(r.b))
++	}
++	return o, nil
++}
+diff --git a/node/jobstate/state.go b/node/jobstate/state.go
+new file mode 100644
+index 00000000..f484d133
+--- /dev/null
++++ b/node/jobstate/state.go
+@@ -0,0 +1,218 @@
++package jobstate
++
++import (
++	"bytes"
++	"encoding/binary"
++	"sort"
++)
++
++// State is the whole job module. Zero balances and stakes are deleted so the
++// serialization (and so the root) is canonical.
++type State struct {
++	Accounts    map[AccountID]Amount // free balances
++	Stakes      map[AccountID]Amount // active verifier stake (eligible for draws)
++	Unbonding   []Unbonding          // leaving stake, still slashable, sorted by Seq
++	Models      map[Hash]*Model
++	Jobs        map[Hash]*Job
++	Withdrawals []Withdrawal // pending payouts, sorted by Seq
++	NextSeq     uint64
++	TotalIn     Amount // all deposits and pool issuance ever credited
++	PaidOut     Amount // all withdrawals ever paid in a coinbase
++}
++
++func NewState() *State {
++	return &State{Accounts: map[AccountID]Amount{}, Stakes: map[AccountID]Amount{},
++		Models: map[Hash]*Model{}, Jobs: map[Hash]*Job{}}
++}
++
++// Clone is a deep copy (used to evaluate a block without touching the chain tip's state).
++func (s *State) Clone() *State {
++	c := &State{Accounts: make(map[AccountID]Amount, len(s.Accounts)), Stakes: make(map[AccountID]Amount, len(s.Stakes)),
++		Models: make(map[Hash]*Model, len(s.Models)), Jobs: make(map[Hash]*Job, len(s.Jobs)),
++		NextSeq: s.NextSeq, TotalIn: s.TotalIn, PaidOut: s.PaidOut}
++	for k, v := range s.Accounts {
++		c.Accounts[k] = v
++	}
++	for k, v := range s.Stakes {
++		c.Stakes[k] = v
++	}
++	c.Unbonding = append([]Unbonding(nil), s.Unbonding...)
++	for k, v := range s.Models {
++		m := *v
++		c.Models[k] = &m
++	}
++	for k, v := range s.Jobs {
++		c.Jobs[k] = v.clone()
++	}
++	for _, w := range s.Withdrawals {
++		w.PkScript = append([]byte(nil), w.PkScript...)
++		c.Withdrawals = append(c.Withdrawals, w)
++	}
++	return c
++}
++
++func (j *Job) clone() *Job {
++	c := *j
++	c.Committee = make([]Verifier, len(j.Committee))
++	for i, v := range j.Committee {
++		v.Positions = append([]uint32(nil), v.Positions...)
++		v.Roots = append([]Hash(nil), v.Roots...)
++		c.Committee[i] = v
++	}
++	c.Revealed = make([]StageReveal, len(j.Revealed))
++	for i, r := range j.Revealed {
++		r.Proof = append([]Hash(nil), r.Proof...)
++		c.Revealed[i] = r
++	}
++	c.Disputes = append([]Challenge(nil), j.Disputes...)
++	return &c
++}
++
++// Holdings is everything the module currently holds; Conservation requires
++// Holdings() == TotalIn - PaidOut at every height.
++func (s *State) Holdings() Amount {
++	var t Amount
++	for _, v := range s.Accounts {
++		t += v
++	}
++	for _, v := range s.Stakes {
++		t += v
++	}
++	for _, u := range s.Unbonding {
++		t += u.Amount
++	}
++	for _, m := range s.Models {
++		t += m.Bond
++	}
++	for _, j := range s.Jobs {
++		t += j.Held()
++	}
++	for _, w := range s.Withdrawals {
++		t += w.Amount
++	}
++	return t
++}
++
++// Held is the amount escrowed for a job: fee and bond until it ends, plus open challenge bonds.
++func (j *Job) Held() Amount {
++	if j.Status.Terminal() {
++		return 0
++	}
++	t := j.Fee
++	if j.Status != StatusPosted {
++		t += j.Bond
++	}
++	for _, d := range j.Disputes {
++		t += d.Bond
++	}
++	return t
++}
++
++// ---------------------------------------------------------------- canonical encoding + root
++
++type enc struct{ bytes.Buffer }
++
++func (e *enc) w(vs ...any) {
++	for _, v := range vs {
++		switch x := v.(type) {
++		case Hash:
++			e.Write(x[:])
++		case AccountID:
++			e.Write(x[:])
++		case []byte:
++			e.u(uint64(len(x)))
++			e.Write(x)
++		case bool:
++			if x {
++				e.WriteByte(1)
++			} else {
++				e.WriteByte(0)
++			}
++		default:
++			_ = binary.Write(e, binary.LittleEndian, x)
++		}
++	}
++}
++
++func (e *enc) u(v uint64) {
++	var t [binary.MaxVarintLen64]byte
++	e.Write(t[:binary.PutUvarint(t[:], v)])
++}
++
++func encodeJob(j *Job) []byte {
++	var e enc
++	e.w(j.ID, j.Client, j.Provider, j.Model, j.InputRoot, j.Stages, j.K, j.N, j.Fee, j.VerifierPay,
++		j.TreasuryCut, j.Bond, j.Deadline, uint8(j.Status), j.PhaseEnd, j.PostHeight, j.CommitHeight,
++		j.StageRoot, j.OutputRoot)
++	e.u(uint64(len(j.Committee)))
++	for _, v := range j.Committee {
++		e.w(v.Account, v.SaltHash, v.ResultHash, v.Committed, v.Revealed, v.Flagged)
++		e.u(uint64(len(v.Positions)))
++		for i, p := range v.Positions {
++			e.w(p)
++			if i < len(v.Roots) {
++				e.w(v.Roots[i])
++			}
++		}
++	}
++	e.u(uint64(len(j.Revealed)))
++	for _, r := range j.Revealed {
++		e.w(r.Stage, r.Salt, r.Root) // proofs are checked on entry and not needed afterwards
++	}
++	e.u(uint64(len(j.Disputes)))
++	for _, d := range j.Disputes {
++		e.w(d.Challenger, d.Stage, d.ClaimedRoot, d.Bond, d.Height)
++	}
++	return e.Bytes()
++}
++
++type kv struct{ k, v []byte }
++
++// Root is the state commitment placed in each coinbase.
++func (s *State) Root() Hash {
++	var items []kv
++	add := func(prefix byte, key []byte, val []byte) {
++		items = append(items, kv{append([]byte{prefix}, key...), val})
++	}
++	for a, v := range s.Accounts {
++		var e enc
++		e.w(v)
++		add('a', a[:], e.Bytes())
++	}
++	for a, v := range s.Stakes {
++		var e enc
++		e.w(v)
++		add('s', a[:], e.Bytes())
++	}
++	for _, u := range s.Unbonding {
++		var k, e enc
++		k.w(u.Seq)
++		e.w(u.Account, u.Amount, u.Due)
++		add('u', k.Bytes(), e.Bytes())
++	}
++	for id, m := range s.Models {
++		var e enc
++		e.w(m.Registrant, m.WeightsRoot, m.RuntimeHash, m.LayerGroups, m.RotationBlock, m.Bond)
++		add('m', id[:], e.Bytes())
++	}
++	for id, j := range s.Jobs {
++		add('j', id[:], encodeJob(j))
++	}
++	for _, w := range s.Withdrawals {
++		var k, e enc
++		k.w(w.Seq)
++		e.w(w.Account, w.PkScript, w.Amount, w.Due)
++		add('w', k.Bytes(), e.Bytes())
++	}
++	var c enc
++	c.w(s.NextSeq, s.TotalIn, s.PaidOut)
++	add('c', nil, c.Bytes())
++	sort.Slice(items, func(i, j int) bool { return bytes.Compare(items[i].k, items[j].k) < 0 })
++	leaves := make([]Hash, len(items))
++	for i, it := range items {
++		var e enc
++		e.w(it.k, it.v)
++		leaves[i] = leafHash(e.Bytes())
++	}
++	return MerkleRoot(leaves)
++}
+diff --git a/node/jobstate/types.go b/node/jobstate/types.go
+new file mode 100644
+index 00000000..9fdaf808
+--- /dev/null
++++ b/node/jobstate/types.go
+@@ -0,0 +1,191 @@
++// Package jobstate is the Useful-Work Coin job module: an account-based state machine that
++// lives beside the UTXO set, escrows client fees, bonds providers and verifiers, and settles
++// verified batch-inference jobs. See spec/job-module.md in the Useful-Work Coin repository.
++//
++// The package is pure and deterministic: given a starting state and a block's deposits and
++// operations, ApplyBlock always produces the same new state, state root and withdrawals.
++package jobstate
++
++import (
++	"crypto/sha256"
++	"fmt"
++)
++
++// Amount is a quantity of the base unit (grains).
++type Amount = int64
++
++// Hash is a 32-byte sha256 digest.
++type Hash [32]byte
++
++func (h Hash) String() string { return fmt.Sprintf("%x", h[:6]) }
++
++// AccountID identifies a module account: sha256 of the pkScript that authorizes it, or a
++// reserved system account.
++type AccountID [32]byte
++
++func (a AccountID) String() string { return fmt.Sprintf("%x", a[:6]) }
++
++// System accounts. Nobody can sign for them, because no pkScript hashes to these values.
++var (
++	PoolAccount     = AccountID{'u', 'w', 'c', ':', 'p', 'o', 'o', 'l'}
++	TreasuryAccount = AccountID{'u', 'w', 'c', ':', 't', 'r', 'e', 'a', 's', 'u', 'r', 'y'}
++)
++
++// AccountForScript is the module account controlled by whoever can spend pkScript.
++func AccountForScript(pkScript []byte) AccountID { return AccountID(sha256.Sum256(pkScript)) }
++
++// Params are the consensus parameters of the job module.
++type Params struct {
++	PoolShareBP     int64 // share of block subsidy credited to PoolAccount, basis points
++	VerifierShareBP int64 // verifier pay as a share of the fee
++	TreasuryShareBP int64 // treasury share of the fee
++	MinBondBP       int64 // provider bond as a share of the fee
++
++	VerifierFloorPerSample Amount // minimum verifier pay per (verifier, sample)
++	MinVerifierStake       Amount
++	VerifierNoShowPenalty  Amount
++	ChallengeBondMin       Amount
++	ModelRegBond           Amount
++
++	MinK, MaxK, MinN, MaxN int
++	MaxStages              uint32
++	MaxDeadlineBlocks      int32
++
++	CommitteeDelay       int32 // the committee is drawn from the hash of block commit+delay
++	VerifyCommitWindow   int32
++	VerifyRevealWindow   int32
++	ProviderRevealWindow int32
++	ChallengeWindow      int32
++	DisputeTimeout       int32
++	WithdrawDelay        int32
++	UnbondDelay          int32
++}
++
++// DefaultParams follow the starting values of Design v3 (fee split 98/1/1, bond >= 50% of fee,
++// k = n = 2 minimum, pool share 10%) with block counts for a 1-minute block time.
++func DefaultParams() Params {
++	return Params{
++		PoolShareBP: 1000, VerifierShareBP: 100, TreasuryShareBP: 100, MinBondBP: 5000,
++		VerifierFloorPerSample: 1_000, MinVerifierStake: 1_000_000, VerifierNoShowPenalty: 50_000,
++		ChallengeBondMin: 100_000, ModelRegBond: 1_000_000,
++		MinK: 2, MaxK: 16, MinN: 2, MaxN: 64, MaxStages: 1 << 20, MaxDeadlineBlocks: 10_080,
++		CommitteeDelay: 2, VerifyCommitWindow: 10, VerifyRevealWindow: 10, ProviderRevealWindow: 10,
++		ChallengeWindow: 1440, DisputeTimeout: 2880, WithdrawDelay: 6, UnbondDelay: 2880,
++	}
++}
++
++// JobStatus is the lifecycle phase of a job.
++type JobStatus uint8
++
++const (
++	StatusPosted         JobStatus = iota + 1 // waiting for a provider
++	StatusAccepted                            // provider bonded, waiting for TRACE_COMMIT
++	StatusCommitted                           // trace committed, committee not yet drawn
++	StatusVerifyCommit                        // drawn verifiers commit
++	StatusVerifyReveal                        // verifiers reveal salts and roots
++	StatusProviderReveal                      // provider opens the sampled stages
++	StatusChallenge                           // open challenge window
++	StatusDisputed                            // waiting for a dispute verdict
++	// terminal states
++	StatusSettled // paid out normally
++	StatusExpired // never accepted; fee refunded
++	StatusFailed  // provider at fault; bond slashed, fee refunded
++	StatusAborted // dispute timed out; everything returned
++)
++
++func (s JobStatus) Terminal() bool { return s >= StatusSettled }
++
++var statusNames = map[JobStatus]string{
++	StatusPosted: "posted", StatusAccepted: "accepted", StatusCommitted: "committed",
++	StatusVerifyCommit: "verify-commit", StatusVerifyReveal: "verify-reveal",
++	StatusProviderReveal: "provider-reveal", StatusChallenge: "challenge", StatusDisputed: "disputed",
++	StatusSettled: "settled", StatusExpired: "expired", StatusFailed: "failed", StatusAborted: "aborted",
++}
++
++func (s JobStatus) String() string { return statusNames[s] }
++
++// Model is a registered model: weights, reference runtime and verification layout.
++type Model struct {
++	ID            Hash
++	Registrant    AccountID
++	WeightsRoot   Hash
++	RuntimeHash   Hash
++	LayerGroups   uint32
++	RotationBlock uint32
++	Bond          Amount
++}
++
++// Verifier is one committee seat on a job.
++type Verifier struct {
++	Account    AccountID
++	SaltHash   Hash
++	ResultHash Hash
++	Committed  bool
++	Revealed   bool
++	Positions  []uint32
++	Roots      []Hash
++	Flagged    bool // its roots disagreed with the provider's
++}
++
++// Challenge is an open dispute.
++type Challenge struct {
++	Challenger  AccountID // zero for verifier-flagged disputes
++	Stage       uint32
++	ClaimedRoot Hash
++	Bond        Amount
++	Height      int32
++}
++
++// StageReveal is one opened stage: its output root, salt and Merkle path in StageRoot.
++type StageReveal struct {
++	Stage uint32
++	Salt  Hash
++	Root  Hash
++	Proof []Hash
++}
++
++// Job is one escrowed batch-inference job.
++type Job struct {
++	ID        Hash
++	Client    AccountID
++	Provider  AccountID
++	Model     Hash
++	InputRoot Hash
++	Stages    uint32
++	K, N      uint8
++
++	Fee         Amount
++	VerifierPay Amount
++	TreasuryCut Amount
++	Bond        Amount
++
++	Deadline     int32
++	Status       JobStatus
++	PhaseEnd     int32 // last height of the current timed phase (0 when not timed)
++	PostHeight   int32
++	CommitHeight int32
++
++	StageRoot  Hash
++	OutputRoot Hash
++
++	Committee []Verifier
++	Revealed  []StageReveal // provider's opened stages, sorted by stage
++	Disputes  []Challenge
++}
++
++// Withdrawal is a pending payout from the module to a pkScript.
++type Withdrawal struct {
++	Seq      uint64
++	Account  AccountID
++	PkScript []byte
++	Amount   Amount
++	Due      int32
++}
++
++// Unbonding is stake leaving the verifier set.
++type Unbonding struct {
++	Seq     uint64
++	Account AccountID
++	Amount  Amount
++	Due     int32
++}
+-- 
+2.30.2
+
