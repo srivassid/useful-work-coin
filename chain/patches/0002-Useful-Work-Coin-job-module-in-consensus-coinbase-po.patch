@@ -1,7 +1,7 @@
 From 2060dad01993fd44da3cab9f37eac5cfde35c7b6 Mon Sep 17 00:00:00 2001
 From: Sid <sid7513@gmail.com>
 Date: Fri, 6 Nov 2026 06:49:34 +0530
-Subject: [PATCH 2/2] Useful-Work Coin job module in consensus: coinbase pool
+Subject: [PATCH 2/4] Useful-Work Coin job module in consensus: coinbase pool
  share, job-state commitment, withdrawals, templates, policy
 
 - chaincfg: Params.JobModule (nil for Pearl networks), UWCSimNetParams

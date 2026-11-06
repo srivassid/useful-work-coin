@@ -1,0 +1,1914 @@
+From 62953893c538d5292f6e3c0fa41cb496c4c20c8b Mon Sep 17 00:00:00 2001
+From: Sid <sid7513@gmail.com>
+Date: Fri, 6 Nov 2026 07:38:09 +0530
+Subject: [PATCH 4/4] jobstate: dispute games (bisection to one element,
+ one-step proofs) and serve-or-slash, with fault-injection suite
+
+- MODEL_REG carries the architecture; JOB_POST carries tokens per sequence
+- DISPUTE_MOVE / ONE_STEP: trace bisection, row-block bisection, referee recomputation; silent or
+  invalid movers lose; both-wrong penalizes both
+- DATA_REQUEST / DATA_SERVE: stage inputs proven against the previous stage, verification waits
+- tests: 14 fault scenarios + 60-trial property over all 26 op types
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuAcGXiQmWtSPUcEzo
+---
+ node/blockchain/jobs_test.go   |   5 +-
+ node/jobstate/apply.go         | 144 +++++---
+ node/jobstate/dispute.go       | 509 ++++++++++++++++++++++++++
+ node/jobstate/dispute_test.go  | 642 +++++++++++++++++++++++++++++++++
+ node/jobstate/jobstate_test.go |  54 ++-
+ node/jobstate/ops.go           | 154 +++++++-
+ node/jobstate/types.go         |  17 +-
+ 7 files changed, 1454 insertions(+), 71 deletions(-)
+ create mode 100644 node/jobstate/dispute.go
+ create mode 100644 node/jobstate/dispute_test.go
+
+diff --git a/node/blockchain/jobs_test.go b/node/blockchain/jobs_test.go
+index 339defb0..10c3a4c4 100644
+--- a/node/blockchain/jobs_test.go
++++ b/node/blockchain/jobs_test.go
+@@ -297,7 +297,8 @@ func TestJobModuleConsensus(t *testing.T) {
+ 	for _, v := range vs {
+ 		stakeTxs = append(stakeTxs, c.tx(v, opOut(t, &jobstate.Op{Kind: jobstate.OpStake, Amount: c.jp.MinVerifierStake * 2})))
+ 	}
+-	reg := &jobstate.Op{Kind: jobstate.OpModelReg, H1: jobstate.Hash{7}, H2: jobstate.Hash{8}, U1: 2, U2: 512}
++	reg := &jobstate.Op{Kind: jobstate.OpModelReg, H1: jobstate.Hash{7}, H2: jobstate.Hash{8}, U1: 2, U2: 0,
++		Cfg: jobstate.ModelCfg{D: 8, H: 2, Hkv: 1, Hd: 4, I: 8, L: 2, V: 16, Eps: 1e-6, MaxPos: 64}}
+ 	regTx := c.tx(client, opOut(t, reg))
+ 	c.mustMine(append(stakeTxs, regTx)...)
+ 	var model jobstate.Hash
+@@ -311,7 +312,7 @@ func TestJobModuleConsensus(t *testing.T) {
+ 		leaves[i] = jobstate.StageLeaf(uint32(i), salts[i], roots[i])
+ 	}
+ 	post := &jobstate.Op{Kind: jobstate.OpJobPost, Model: model, H1: jobstate.Hash{9}, U1: stages, Amount: fee,
+-		Deadline: c.tip.Height() + 30, K: 2, N: 2}
++		Deadline: c.tip.Height() + 30, K: 2, N: 2, U2: 4}
+ 	c.mustMine(c.tx(client, opOut(t, post)))
+ 	var job *jobstate.Job
+ 	for _, j := range c.state().Jobs {
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+index f657eaf4..9d384659 100644
+--- a/node/jobstate/apply.go
++++ b/node/jobstate/apply.go
+@@ -159,8 +159,8 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		}
+ 		s.Unbonding = append(s.Unbonding, Unbonding{Seq: s.seq(), Account: o.Actor, Amount: o.Amount, Due: h + p.UnbondDelay})
+ 	case OpModelReg:
+-		if o.U1 == 0 {
+-			return errors.New("model needs at least one layer group")
++		if o.U1 == 0 || !o.Cfg.valid() || o.Cfg.L%int(o.U1) != 0 || int(o.U2) != o.Cfg.Bs {
++			return errors.New("bad model architecture or layer groups")
+ 		}
+ 		id := tagHash("model", o.Ref[:])
+ 		if _, ok := s.Models[id]; ok {
+@@ -170,7 +170,7 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 			return err
+ 		}
+ 		s.Models[id] = &Model{ID: id, Registrant: o.Actor, WeightsRoot: o.H1, RuntimeHash: o.H2,
+-			LayerGroups: o.U1, RotationBlock: o.U2, Bond: p.ModelRegBond}
++			LayerGroups: o.U1, RotationBlock: o.U2, Bond: p.ModelRegBond, Cfg: o.Cfg}
+ 	case OpJobPost:
+ 		return s.jobPost(p, h, o)
+ 	case OpJobAccept:
+@@ -229,6 +229,14 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		}
+ 		v.Positions, v.Roots, v.Revealed = pos, append([]Hash(nil), o.Roots...), true
+ 	case OpTraceReveal:
++		if j := s.Jobs[o.Job]; j != nil && j.Status == StatusDisputed && o.Actor == j.Provider {
++			for _, r := range o.Reveals { // during a dispute the provider may open any stage
++				if err := s.reveal(j, r); err != nil {
++					return err
++				}
++			}
++			return nil
++		}
+ 		j, err := s.job(o.Job, StatusProviderReveal)
+ 		if err != nil {
+ 			return err
+@@ -242,8 +250,11 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 			have[r.Stage] = true
+ 		}
+ 		for _, r := range o.Reveals {
+-			if !want[r.Stage] || have[r.Stage] {
+-				return errors.New("stage not requested or already revealed")
++			if have[r.Stage] {
++				continue // already open (e.g. through DATA_SERVE); reopening is a no-op
++			}
++			if !want[r.Stage] {
++				return errors.New("stage not requested")
+ 			}
+ 			if !VerifyMerkleProof(j.StageRoot, StageLeaf(r.Stage, r.Salt, r.Root), int(r.Stage), int(j.Stages), r.Proof) {
+ 				return errors.New("stage proof does not open the committed stage root")
+@@ -253,18 +264,36 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		}
+ 		sort.Slice(j.Revealed, func(a, b int) bool { return j.Revealed[a].Stage < j.Revealed[b].Stage })
+ 	case OpChallenge:
+-		j, err := s.job(o.Job, StatusChallenge)
+-		if err != nil {
+-			return err
++		j := s.Jobs[o.Job]
++		if j == nil || !(j.Status == StatusChallenge || (j.Status == StatusDisputed && h < j.ChallengeEnd)) {
++			return errors.New("job is not open to challenges")
+ 		}
+-		if o.Actor == j.Provider || o.U1 >= j.Stages || o.Amount < p.ChallengeBondMin {
++		if o.Actor == j.Provider || o.Actor == (AccountID{}) || o.U1 >= j.Stages || o.Amount < p.ChallengeBondMin {
+ 			return errors.New("bad challenge")
+ 		}
+ 		if err := s.debit(o.Actor, o.Amount); err != nil {
+ 			return err
+ 		}
++		if j.Status == StatusChallenge {
++			j.ChallengeEnd = j.PhaseEnd
++		}
+ 		j.Disputes = append(j.Disputes, Challenge{Challenger: o.Actor, Stage: o.U1, ClaimedRoot: o.H1, Bond: o.Amount, Height: h})
+-		j.Status, j.PhaseEnd = StatusDisputed, h+p.DisputeTimeout
++		j.Status, j.PhaseEnd = StatusDisputed, 0
++	case OpDisputeMove, OpOneStep, OpDataRequest, OpDataServe:
++		j := s.Jobs[o.Job]
++		if j == nil || j.Status.Terminal() {
++			return errors.New("unknown or finished job")
++		}
++		switch o.Kind {
++		case OpDisputeMove:
++			return s.move(p, h, j, o)
++		case OpOneStep:
++			return s.oneStep(p, h, j, o)
++		case OpDataRequest:
++			return s.dataRequest(p, h, j, o)
++		default:
++			return s.dataServe(p, h, j, o)
++		}
+ 	default:
+ 		return errors.New("unknown op")
+ 	}
+@@ -300,6 +329,8 @@ func (s *State) jobPost(p Params, h int32, o *Op) error {
+ 		return errors.New("bad deadline")
+ 	case o.Amount <= 0:
+ 		return errors.New("bad fee")
++	case o.U2 == 0 || int(o.U2) > m.Cfg.MaxPos:
++		return errors.New("bad sequence length")
+ 	}
+ 	vp, tc := JobPay(p, o.Amount, int(o.K), int(o.N))
+ 	if o.Amount < vp+tc {
+@@ -313,7 +344,8 @@ func (s *State) jobPost(p Params, h int32, o *Op) error {
+ 		return err
+ 	}
+ 	s.Jobs[id] = &Job{ID: id, Client: o.Actor, Model: o.Model, InputRoot: o.H1, Stages: o.U1, K: o.K, N: o.N,
+-		Fee: o.Amount, VerifierPay: vp, TreasuryCut: tc, Deadline: o.Deadline, Status: StatusPosted, PostHeight: h}
++		Fee: o.Amount, VerifierPay: vp, TreasuryCut: tc, Deadline: o.Deadline, Status: StatusPosted, PostHeight: h,
++		SeqLen: o.U2}
+ 	return nil
+ }
+ 
+@@ -431,28 +463,23 @@ func (s *State) applyVerdict(p Params, h int32, v Verdict) {
+ 	if j == nil || j.Status != StatusDisputed {
+ 		return
+ 	}
++	j.Game = nil
+ 	if v.ProviderAtFault {
+ 		var catchers []AccountID
+ 		for _, d := range j.Disputes {
+ 			s.credit(d.Challenger, d.Bond) // honest challengers get their bond back
+ 			catchers = append(catchers, d.Challenger)
+ 		}
+-		for _, c := range j.Committee {
+-			if c.Flagged {
+-				catchers = append(catchers, c.Account)
+-			}
+-		}
+ 		s.failProvider(j, catchers)
+ 		return
+ 	}
+-	for _, d := range j.Disputes { // failed challenges: bond half to provider, half to treasury
+-		half := d.Bond / 2
+-		s.credit(j.Provider, half)
+-		s.credit(TreasuryAccount, d.Bond-half)
+-	}
+-	for i := range j.Committee {
+-		if j.Committee[i].Flagged { // a verifier that wrongly flagged is penalized
+-			s.credit(TreasuryAccount, s.slash(j.Committee[i].Account, p.VerifierNoShowPenalty))
++	for _, d := range j.Disputes {
++		if d.Verifier { // a verifier that wrongly flagged is penalized
++			s.credit(TreasuryAccount, s.slash(d.Challenger, p.VerifierNoShowPenalty))
++		} else { // failed challenges: bond half to provider, half to treasury
++			half := d.Bond / 2
++			s.credit(j.Provider, half)
++			s.credit(TreasuryAccount, d.Bond-half)
+ 		}
+ 	}
+ 	j.Disputes = nil
+@@ -471,7 +498,7 @@ func (s *State) failProvider(j *Job, catchers []AccountID) {
+ 		toCatchers = each * Amount(len(catchers))
+ 	}
+ 	s.credit(TreasuryAccount, j.Bond-toCatchers)
+-	j.Disputes = nil
++	j.Disputes, j.Game = nil, nil
+ 	j.Status, j.PhaseEnd = StatusFailed, 0
+ }
+ 
+@@ -556,6 +583,31 @@ func (s *State) advance(p Params, h int32, prevHash Hash, j *Job) {
+ 				j.Status, j.PhaseEnd = StatusVerifyCommit, h+p.VerifyCommitWindow
+ 			}
+ 		}
++	case StatusVerifyCommit, StatusVerifyReveal:
++		if hold, failed := s.dataHold(p, h, j); failed {
++			return
++		} else if hold {
++			win := p.VerifyCommitWindow
++			if j.Status == StatusVerifyReveal {
++				win = p.VerifyRevealWindow
++			}
++			j.PhaseEnd = max(j.PhaseEnd, h+win) // after the data arrives verifiers get a full window
++			return
++		}
++		s.advanceVerification(p, h, j)
++	case StatusProviderReveal:
++		s.advanceProviderReveal(p, h, j)
++	case StatusChallenge:
++		if h >= j.PhaseEnd {
++			s.settle(j)
++		}
++	case StatusDisputed:
++		s.advanceGame(p, h, j)
++	}
++}
++
++func (s *State) advanceVerification(p Params, h int32, j *Job) {
++	switch j.Status {
+ 	case StatusVerifyCommit:
+ 		all := true
+ 		for _, v := range j.Committee {
+@@ -586,13 +638,21 @@ func (s *State) advance(p Params, h int32, prevHash Hash, j *Job) {
+ 				j.Status, j.PhaseEnd = StatusProviderReveal, h+p.ProviderRevealWindow
+ 			}
+ 		}
+-	case StatusProviderReveal:
++	}
++}
++
++func (s *State) advanceProviderReveal(p Params, h int32, j *Job) {
++	{
+ 		want := j.requested()
+ 		got := map[uint32]Hash{}
+ 		for _, r := range j.Revealed {
+ 			got[r.Stage] = r.Root
+ 		}
+-		complete := len(got) == len(want)
++		complete := true // every requested stage opened (other stages may be open too, e.g. via DATA_SERVE)
++		for st := range want {
++			_, ok := got[st]
++			complete = complete && ok
++		}
+ 		if !complete && h < j.PhaseEnd {
+ 			return
+ 		}
+@@ -606,34 +666,22 @@ func (s *State) advance(p Params, h int32, prevHash Hash, j *Job) {
+ 			s.failProvider(j, catchers)
+ 			return
+ 		}
+-		flagged := false
+ 		for i := range j.Committee {
+ 			v := &j.Committee[i]
+ 			for k, pos := range v.Positions {
+-				if v.Revealed && got[pos] != v.Roots[k] {
+-					v.Flagged = true
++				if v.Revealed && !v.Flagged && got[pos] != v.Roots[k] {
++					v.Flagged = true // first disagreeing stage becomes this verifier's dispute
++					j.Disputes = append(j.Disputes, Challenge{Verifier: true, Challenger: v.Account, Stage: pos,
++						ClaimedRoot: v.Roots[k], Height: h})
+ 				}
+ 			}
+-			flagged = flagged || v.Flagged
+ 		}
+-		if flagged {
+-			j.Status, j.PhaseEnd = StatusDisputed, h+p.DisputeTimeout
++		j.ChallengeEnd = h + p.ChallengeWindow
++		if len(j.Disputes) > 0 {
++			j.Status, j.PhaseEnd = StatusDisputed, 0
++			s.startGame(p, h, j)
+ 		} else {
+-			j.Status, j.PhaseEnd = StatusChallenge, h+p.ChallengeWindow
+-		}
+-	case StatusChallenge:
+-		if h >= j.PhaseEnd {
+-			s.settle(j)
+-		}
+-	case StatusDisputed:
+-		if h >= j.PhaseEnd { // no verdict in time: no-fault abort, everything returned
+-			s.credit(j.Client, j.Fee)
+-			s.credit(j.Provider, j.Bond)
+-			for _, d := range j.Disputes {
+-				s.credit(d.Challenger, d.Bond)
+-			}
+-			j.Disputes = nil
+-			j.Status, j.PhaseEnd = StatusAborted, 0
++			j.Status, j.PhaseEnd = StatusChallenge, j.ChallengeEnd
+ 		}
+ 	}
+ }
+diff --git a/node/jobstate/dispute.go b/node/jobstate/dispute.go
+new file mode 100644
+index 00000000..0340e9f6
+--- /dev/null
++++ b/node/jobstate/dispute.go
+@@ -0,0 +1,509 @@
++package jobstate
++
++import (
++	"errors"
++	"fmt"
++)
++
++// Dispute games (design doc: "bisect inside the stage to one int8 operation; full nodes
++// recompute it on CPU"). A game is played between the provider and Disputes[0] over one stage:
++//
++//	GReveal   provider must open the disputed stage's root (if it was never sampled)
++//	GTree     bisect the stage trace tree: each round both post the two children of their
++//	          current node; play continues in the leftmost subtree where they differ
++//	GLeaf     both post the row root of the first differing leaf
++//	GBlocks   bisect that row's block tree the same way
++//	GBlock    both post the bytes of the first differing 1 KiB block
++//	GOneStep  the first differing 4-byte element is fixed; the provider posts the element's
++//	          inputs (rows with Merkle proofs) and every full node recomputes it
++//
++// A party that does not make a valid move before the round's deadline loses. Leaves before the
++// differing one hash identically in both trees, so inputs taken from them are agreed values.
++
++const (
++	GReveal uint8 = iota + 1
++	GTree
++	GLeaf
++	GBlocks
++	GBlock
++	GOneStep
++)
++
++// Game is the state of the dispute currently being played on a job.
++type Game struct {
++	Stage          uint32
++	Phase          uint8
++	ProvRoot       Hash
++	ChalRoot       Hash
++	N              int // leaves in the stage program
++	Lo, Size       int // current subtree (leaf range) of the trace or block tree
++	HP, HC         Hash
++	PMoved, CMoved bool
++	PL, PR, CL, CR Hash
++	PData, CData   []byte
++	Leaf           int
++	RowLen         int
++	Block          int
++	Elem           int
++	PWord, CWord   uint32
++	Deadline       int32
++}
++
++// DataReq is a committee member's on-chain request for a stage's input (serve-or-slash).
++type DataReq struct {
++	Stage     uint32
++	Requester AccountID
++	Due       int32
++	Served    []bool
++}
++
++// ---------------------------------------------------------------- stage geometry
++
++func (s *State) stageShape(j *Job, stage uint32) (Stage, int, int, error) {
++	m := s.Models[j.Model]
++	if m == nil || stage >= j.Stages {
++		return Stage{}, 0, 0, errors.New("bad stage")
++	}
++	G := int(m.LayerGroups)
++	b, g := int(stage)/G, int(stage)%G
++	lpg := m.Cfg.L / G
++	return Stage{Cfg: m.Cfg, T: int(j.SeqLen), L0: g * lpg, L1: (g + 1) * lpg}, b, g, nil
++}
++
++func revealedRoot(j *Job, stage uint32) (Hash, bool) {
++	for _, r := range j.Revealed {
++		if r.Stage == stage {
++			return r.Root, true
++		}
++	}
++	return Hash{}, false
++}
++
++// reveal opens a stage root against StageRoot (any stage, while the job is active).
++func (s *State) reveal(j *Job, r StageReveal) error {
++	if r.Stage >= j.Stages {
++		return errors.New("stage out of range")
++	}
++	if _, ok := revealedRoot(j, r.Stage); ok {
++		return nil
++	}
++	if !VerifyMerkleProof(j.StageRoot, StageLeaf(r.Stage, r.Salt, r.Root), int(r.Stage), int(j.Stages), r.Proof) {
++		return errors.New("stage proof does not open the committed stage root")
++	}
++	j.Revealed = append(j.Revealed, StageReveal{Stage: r.Stage, Salt: r.Salt, Root: r.Root})
++	for i := len(j.Revealed) - 1; i > 0 && j.Revealed[i].Stage < j.Revealed[i-1].Stage; i-- {
++		j.Revealed[i], j.Revealed[i-1] = j.Revealed[i-1], j.Revealed[i]
++	}
++	return nil
++}
++
++// ---------------------------------------------------------------- proven inputs
++
++// ProvenSource serves referee inputs that were each checked against a commitment.
++type ProvenSource struct {
++	MemSource
++}
++
++func (s *State) provenSource(j *Job, g *Game, rows []ProvenRow) (*ProvenSource, Stage, error) {
++	st, b, grp, err := s.stageShape(j, g.Stage)
++	if err != nil {
++		return nil, st, err
++	}
++	m := s.Models[j.Model]
++	c := m.Cfg
++	prog := Program(c, st.T, st.L0, st.L1)
++	idx := indexProgram(prog)
++	nw := c.V + c.L*(4+(c.H+2*c.Hkv)*c.Hd+c.D+2*c.I+c.D) + 2*c.MaxPos
++	ps := &ProvenSource{MemSource{Weights: map[WeightRow][]uint32{}, Leaves: map[LeafDesc][]uint32{}}}
++	var prevRoot Hash
++	var prevIdx programIndex
++	if grp > 0 {
++		r, ok := revealedRoot(j, g.Stage-1)
++		if !ok {
++			return nil, st, errors.New("previous stage not opened")
++		}
++		prevRoot = r
++		prevIdx = indexProgram(Program(c, st.T, st.L0-(st.L1-st.L0), st.L0))
++	}
++	inputs := map[int][]uint32{}
++	for _, in := range rows {
++		rr := RowRoot(in.Words)
++		switch in.Kind {
++		case RowLeaf:
++			i, ok := idx[in.Leaf]
++			if !ok || i >= g.Leaf || len(in.Words) != c.RowLen(in.Leaf, st.T) {
++				return nil, st, errors.New("input leaf not an earlier leaf of the stage")
++			}
++			if !VerifyMerkleProof(g.ProvRoot, TraceLeaf(i, rr), i, g.N, in.Proof) {
++				return nil, st, errors.New("input leaf proof fails")
++			}
++			ps.Leaves[in.Leaf] = in.Words
++		case RowWeight:
++			i, n, err := c.weightIndex(in.W)
++			if err != nil || n != len(in.Words) {
++				return nil, st, errors.New("bad weight row")
++			}
++			if !VerifyMerkleProof(m.WeightsRoot, WeightLeaf(i, rr), i, nw, in.Proof) {
++				return nil, st, errors.New("weight proof fails")
++			}
++			ps.Weights[in.W] = in.Words
++		case RowInput:
++			if grp == 0 || in.Index < 0 || in.Index >= st.T || len(in.Words) != c.D {
++				return nil, st, errors.New("bad stage input row")
++			}
++			i := prevIdx[LeafDesc{LR2, st.L0 - 1, in.Index, -1}]
++			if !VerifyMerkleProof(prevRoot, TraceLeaf(i, rr), i, len(prevIdx), in.Proof) {
++				return nil, st, errors.New("stage input proof fails")
++			}
++			inputs[in.Index] = in.Words
++		case RowTokens:
++			nb := int(j.Stages) / int(m.LayerGroups)
++			if grp != 0 || in.Index != b || len(in.Words) != st.T {
++				return nil, st, errors.New("bad token row")
++			}
++			if !VerifyMerkleProof(j.InputRoot, TokenLeaf(b, rr), b, nb, in.Proof) {
++				return nil, st, errors.New("token proof fails")
++			}
++			ps.Toks = in.Words
++		default:
++			return nil, st, errors.New("bad input kind")
++		}
++	}
++	if len(inputs) > 0 {
++		ps.Input = make([][]uint32, st.T)
++		for t, r := range inputs {
++			ps.Input[t] = r
++		}
++	}
++	return ps, st, nil
++}
++
++func (p *ProvenSource) StageInput(t int) ([]uint32, error) {
++	if t < 0 || t >= len(p.Input) || p.Input[t] == nil {
++		return nil, fmt.Errorf("missing stage input row %d", t)
++	}
++	return p.Input[t], nil
++}
++
++// ---------------------------------------------------------------- game lifecycle
++
++// startGame begins playing Disputes[0], if no game is running.
++func (s *State) startGame(p Params, h int32, j *Job) {
++	if j.Game != nil || len(j.Disputes) == 0 {
++		return
++	}
++	d := j.Disputes[0]
++	g := &Game{Stage: d.Stage, ChalRoot: d.ClaimedRoot, Deadline: h + p.GameWindow}
++	st, _, _, err := s.stageShape(j, d.Stage)
++	if err != nil {
++		g.Phase = GReveal // cannot happen for validated disputes; provider must answer anyway
++	}
++	g.N = len(Program(st.Cfg, st.T, st.L0, st.L1))
++	j.Game = g
++	if r, ok := revealedRoot(j, d.Stage); ok {
++		s.beginTree(p, h, j, r)
++	} else {
++		g.Phase = GReveal
++	}
++}
++
++func (s *State) beginTree(p Params, h int32, j *Job, provRoot Hash) {
++	g := j.Game
++	g.ProvRoot = provRoot
++	if provRoot == g.ChalRoot { // nothing to dispute: the disputant was wrong
++		s.endGame(p, h, j, false, true)
++		return
++	}
++	g.Phase, g.Lo, g.Size, g.HP, g.HC = GTree, 0, g.N, provRoot, g.ChalRoot
++	if g.Size == 1 {
++		g.Phase = GLeaf
++	}
++	s.newRound(p, h, g)
++}
++
++func (s *State) newRound(p Params, h int32, g *Game) {
++	g.PMoved, g.CMoved, g.PData, g.CData = false, false, nil, nil
++	g.Deadline = h + p.GameWindow
++}
++
++// move records one party's move (DISPUTE_MOVE).
++func (s *State) move(p Params, h int32, j *Job, o *Op) error {
++	g := j.Game
++	if g == nil || j.Status != StatusDisputed {
++		return errors.New("no game")
++	}
++	prov := o.Actor == j.Provider
++	if !prov && o.Actor != j.Disputes[0].Challenger {
++		return errors.New("not a party to the game")
++	}
++	if (prov && g.PMoved) || (!prov && g.CMoved) {
++		return errors.New("already moved this round")
++	}
++	own := g.HC
++	if prov {
++		own = g.HP
++	}
++	switch g.Phase {
++	case GTree, GBlocks:
++		if g.Size <= 1 || nodeHash(o.H1, o.H2) != own {
++			return errors.New("children do not hash to your node")
++		}
++		if prov {
++			g.PL, g.PR = o.H1, o.H2
++		} else {
++			g.CL, g.CR = o.H1, o.H2
++		}
++	case GLeaf:
++		if TraceLeaf(g.Lo, o.H1) != own {
++			return errors.New("row root does not hash to your leaf")
++		}
++		if prov {
++			g.PL = o.H1
++		} else {
++			g.CL = o.H1
++		}
++	case GBlock:
++		want := min(RowBlock, 4*g.RowLen-g.Block*RowBlock)
++		if len(o.Data) != want || leafHash(o.Data) != own {
++			return errors.New("block does not hash to your block leaf")
++		}
++		if prov {
++			g.PData = append([]byte(nil), o.Data...)
++		} else {
++			g.CData = append([]byte(nil), o.Data...)
++		}
++	default:
++		return errors.New("no move expected in this phase")
++	}
++	if prov {
++		g.PMoved = true
++	} else {
++		g.CMoved = true
++	}
++	return nil
++}
++
++// oneStep checks the provider's inputs and decides the game.
++func (s *State) oneStep(p Params, h int32, j *Job, o *Op) error {
++	g := j.Game
++	if g == nil || g.Phase != GOneStep || o.Actor != j.Provider {
++		return errors.New("no one-step proof expected")
++	}
++	for _, r := range o.Reveals {
++		if err := s.reveal(j, r); err != nil {
++			return err
++		}
++	}
++	src, st, err := s.provenSource(j, g, o.Inputs)
++	if err != nil {
++		return err
++	}
++	prog := Program(st.Cfg, st.T, st.L0, st.L1)
++	v, err := st.Recompute(prog[g.Leaf], g.Elem, src)
++	if err != nil {
++		return err
++	}
++	s.endGame(p, h, j, v != g.PWord, v != g.CWord)
++	return nil
++}
++
++// advanceGame runs at the end of each block while a job is disputed.
++func (s *State) advanceGame(p Params, h int32, j *Job) {
++	g := j.Game
++	if g == nil {
++		s.startGame(p, h, j)
++		return
++	}
++	switch g.Phase {
++	case GReveal:
++		if r, ok := revealedRoot(j, g.Stage); ok {
++			s.beginTree(p, h, j, r)
++		} else if h >= g.Deadline {
++			s.endGame(p, h, j, true, false)
++		}
++		return
++	case GOneStep:
++		if h >= g.Deadline {
++			s.endGame(p, h, j, true, false) // the provider could not justify its value
++		}
++		return
++	}
++	if !(g.PMoved && g.CMoved) {
++		if h >= g.Deadline {
++			s.endGame(p, h, j, !g.PMoved, g.PMoved) // a silent provider loses first
++		}
++		return
++	}
++	switch g.Phase {
++	case GTree, GBlocks:
++		k := splitPoint(g.Size)
++		if g.PL != g.CL {
++			g.Size, g.HP, g.HC = k, g.PL, g.CL
++		} else {
++			g.Lo, g.Size, g.HP, g.HC = g.Lo+k, g.Size-k, g.PR, g.CR
++		}
++		if g.Size == 1 {
++			if g.Phase == GTree {
++				g.Phase = GLeaf
++			} else {
++				g.Phase, g.Block = GBlock, g.Lo
++			}
++		}
++	case GLeaf:
++		st, _, _, _ := s.stageShape(j, g.Stage)
++		prog := Program(st.Cfg, st.T, st.L0, st.L1)
++		g.Leaf, g.RowLen = g.Lo, st.Cfg.RowLen(prog[g.Lo], st.T)
++		nb := (4*g.RowLen + RowBlock - 1) / RowBlock
++		g.Phase, g.Lo, g.Size, g.HP, g.HC = GBlocks, 0, nb, g.PL, g.CL
++		if nb == 1 { // the row root is the single block's leaf hash
++			g.Phase, g.Block = GBlock, 0
++		}
++	case GBlock:
++		w := 0
++		for w*4 < len(g.PData) && string(g.PData[4*w:4*w+4]) == string(g.CData[4*w:4*w+4]) {
++			w++
++		}
++		g.Elem = g.Block*(RowBlock/4) + w
++		g.PWord = le32(g.PData[4*w:])
++		g.CWord = le32(g.CData[4*w:])
++		g.Phase, g.Deadline = GOneStep, h+p.GameWindow
++		return
++	}
++	s.newRound(p, h, g)
++}
++
++func le32(b []byte) uint32 {
++	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
++}
++
++// endGame applies the outcome of the current game.
++func (s *State) endGame(p Params, h int32, j *Job, providerWrong, challengerWrong bool) {
++	d := j.Disputes[0]
++	j.Game = nil
++	penalize := func() {
++		if d.Verifier {
++			s.credit(TreasuryAccount, s.slash(d.Challenger, p.VerifierNoShowPenalty))
++			if v := j.seat(d.Challenger); v != nil {
++				v.Flagged = true
++			}
++		} else {
++			half := d.Bond / 2
++			s.credit(j.Provider, half)
++			s.credit(TreasuryAccount, d.Bond-half)
++		}
++	}
++	if providerWrong {
++		var catchers []AccountID
++		if challengerWrong {
++			penalize()
++		} else {
++			s.credit(d.Challenger, d.Bond)
++			catchers = append(catchers, d.Challenger)
++		}
++		for _, other := range j.Disputes[1:] { // queued disputants get their bonds back
++			s.credit(other.Challenger, other.Bond)
++		}
++		j.Disputes = nil
++		s.failProvider(j, catchers)
++		return
++	}
++	penalize()
++	j.Disputes = j.Disputes[1:]
++	if len(j.Disputes) > 0 {
++		s.startGame(p, h, j)
++		return
++	}
++	j.Disputes = nil
++	if h < j.ChallengeEnd {
++		j.Status, j.PhaseEnd = StatusChallenge, j.ChallengeEnd
++	} else {
++		s.settle(j)
++	}
++}
++
++// ---------------------------------------------------------------- serve-or-slash
++
++func (s *State) dataRequest(p Params, h int32, j *Job, o *Op) error {
++	if j.Status != StatusVerifyCommit && j.Status != StatusVerifyReveal {
++		return errors.New("data requests are taken during verification")
++	}
++	if j.seat(o.Actor) == nil {
++		return errors.New("only committee members may request stage inputs")
++	}
++	m := s.Models[j.Model]
++	if o.U1 >= j.Stages || o.U1%m.LayerGroups == 0 {
++		return errors.New("stage has no provider-held input (first layer groups read the job input)")
++	}
++	for _, r := range j.DataReqs {
++		if r.Requester == o.Actor {
++			return errors.New("one request per verifier")
++		}
++	}
++	j.DataReqs = append(j.DataReqs, DataReq{Stage: o.U1, Requester: o.Actor, Due: h + p.ServeWindow,
++		Served: make([]bool, j.SeqLen)})
++	return nil
++}
++
++func (s *State) dataServe(p Params, h int32, j *Job, o *Op) error {
++	if o.Actor != j.Provider {
++		return errors.New("not the provider")
++	}
++	var req *DataReq
++	for i := range j.DataReqs {
++		if j.DataReqs[i].Stage == o.U1 {
++			req = &j.DataReqs[i]
++		}
++	}
++	if req == nil {
++		return errors.New("no request for this stage")
++	}
++	for _, r := range o.Reveals {
++		if err := s.reveal(j, r); err != nil {
++			return err
++		}
++	}
++	prevRoot, ok := revealedRoot(j, o.U1-1)
++	if !ok {
++		return errors.New("previous stage not opened")
++	}
++	st, _, _, _ := s.stageShape(j, o.U1)
++	prev := indexProgram(Program(st.Cfg, st.T, st.L0-(st.L1-st.L0), st.L0))
++	for _, in := range o.Inputs {
++		if in.Kind != RowInput || in.Index < 0 || in.Index >= st.T || len(in.Words) != st.Cfg.D {
++			return errors.New("bad served row")
++		}
++		i := prev[LeafDesc{LR2, st.L0 - 1, in.Index, -1}]
++		if !VerifyMerkleProof(prevRoot, TraceLeaf(i, RowRoot(in.Words)), i, len(prev), in.Proof) {
++			return errors.New("served row does not open the previous stage")
++		}
++	}
++	for _, in := range o.Inputs { // all rows valid: mark them (whole op is all-or-nothing)
++		req.Served[in.Index] = true
++	}
++	return nil
++}
++
++func (r *DataReq) complete() bool {
++	for _, x := range r.Served {
++		if !x {
++			return false
++		}
++	}
++	return true
++}
++
++// dataHold reports whether verification must wait for stage inputs, and fails the provider
++// if a request went unserved past its due height.
++func (s *State) dataHold(p Params, h int32, j *Job) (hold, failed bool) {
++	for _, r := range j.DataReqs {
++		if r.complete() {
++			continue
++		}
++		if h >= r.Due {
++			s.failProvider(j, []AccountID{r.Requester})
++			return false, true
++		}
++		hold = true
++	}
++	return hold, false
++}
+diff --git a/node/jobstate/dispute_test.go b/node/jobstate/dispute_test.go
+new file mode 100644
+index 00000000..fb0b6049
+--- /dev/null
++++ b/node/jobstate/dispute_test.go
+@@ -0,0 +1,642 @@
++package jobstate
++
++import (
++	"crypto/sha256"
++	"fmt"
++	"math/rand/v2"
++	"testing"
++)
++
++// Fault-injection suite for build step 4: every injected fault must be caught and the right
++// party slashed. A tiny Qwen3 (all weights, real commitments) runs real stage programs; each
++// party plays the bisection game from its own trace; the provider builds one-step proofs from
++// whatever the referee actually reads.
++
++// ---------------------------------------------------------------- model + commitments
++
++type tinyModel struct {
++	cfg     ModelCfg
++	weights map[WeightRow][]uint32
++	wleaves []Hash
++	wroot   Hash
++	tokens  [][]uint32 // per batch
++}
++
++func loadTiny(t *testing.T) *tinyModel {
++	fx, cfg, w := loadFixture(t, "testdata/tiny.json.gz")
++	leaves := make([]Hash, len(w))
++	for k, row := range w {
++		i, _, _ := cfg.weightIndex(k)
++		leaves[i] = WeightLeaf(i, RowRoot(row))
++	}
++	tm := &tinyModel{cfg: cfg, weights: w, wleaves: leaves, wroot: MerkleRoot(leaves)}
++	t0 := fx.Stages[0].Tokens
++	t1 := make([]uint32, len(t0))
++	for i := range t0 {
++		t1[i] = t0[len(t0)-1-i] // second batch: the first one reversed
++	}
++	tm.tokens = [][]uint32{t0, t1}
++	return tm
++}
++
++func (tm *tinyModel) inputTree() ([]Hash, Hash) {
++	var lv []Hash
++	for b, toks := range tm.tokens {
++		lv = append(lv, TokenLeaf(b, RowRoot(toks)))
++	}
++	return lv, MerkleRoot(lv)
++}
++
++// trace computes one stage. corrupt (optional) edits a leaf right after it is computed, so later
++// leaves are recomputed consistently from the edited value (a "consistent liar").
++func (tm *tinyModel) trace(t *testing.T, w map[WeightRow][]uint32, toks []uint32, input [][]uint32, l0, l1 int,
++	corrupt func(i int, row []uint32)) [][]uint32 {
++	st := Stage{Cfg: tm.cfg, T: len(toks), L0: l0, L1: l1}
++	src := &MemSource{Weights: w, Toks: toks, Input: input, Leaves: map[LeafDesc][]uint32{}}
++	prog := Program(tm.cfg, st.T, l0, l1)
++	rows := make([][]uint32, len(prog))
++	for i, d := range prog {
++		r, err := st.RecomputeRow(d, src)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if corrupt != nil {
++			corrupt(i, r)
++		}
++		src.Leaves[d] = r
++		rows[i] = r
++	}
++	return rows
++}
++
++// ---------------------------------------------------------------- parties
++
++type party struct {
++	acct    AccountID
++	weights map[WeightRow][]uint32
++	tokens  [][]uint32
++	rows    map[uint32][][]uint32 // by stage
++	leaves  map[uint32][]Hash
++	silent  bool // never moves in games
++	badMove bool // posts garbage children
++}
++
++func (tm *tinyModel) newParty(t *testing.T, a AccountID, w map[WeightRow][]uint32, tokens [][]uint32,
++	fault func(stage uint32) func(int, []uint32), inputFault func(stage uint32, rows [][]uint32)) *party {
++	p := &party{acct: a, weights: w, tokens: tokens, rows: map[uint32][][]uint32{}, leaves: map[uint32][]Hash{}}
++	G := 2
++	lpg := tm.cfg.L / G
++	for b := range tokens {
++		var prevOut [][]uint32
++		for g := 0; g < G; g++ {
++			s := uint32(b*G + g)
++			var cor func(int, []uint32)
++			if fault != nil {
++				cor = fault(s)
++			}
++			var input [][]uint32
++			if g > 0 {
++				input = prevOut
++				if inputFault != nil {
++					input = cloneRows(prevOut)
++					inputFault(s, input)
++				}
++			}
++			rows := tm.trace(t, w, tokens[b], input, g*lpg, (g+1)*lpg, cor)
++			p.rows[s] = rows
++			_, p.leaves[s] = TraceRoot(rows)
++			prog := Program(tm.cfg, len(tokens[b]), g*lpg, (g+1)*lpg)
++			prevOut = nil
++			for i, d := range prog {
++				if d.Op == LR2 && d.Layer == (g+1)*lpg-1 {
++					prevOut = append(prevOut, rows[i])
++				}
++			}
++		}
++	}
++	return p
++}
++
++func cloneRows(r [][]uint32) [][]uint32 {
++	o := make([][]uint32, len(r))
++	for i := range r {
++		o[i] = append([]uint32(nil), r[i]...)
++	}
++	return o
++}
++
++func (p *party) root(s uint32) Hash { return MerkleRoot(p.leaves[s]) }
++
++func rangeRoot(l []Hash) Hash { return MerkleRoot(l) }
++
++// move returns this party's DISPUTE_MOVE for the game's current round.
++func (p *party) move(tm *tinyModel, j *Job, g *Game) *Op {
++	if p.silent {
++		return nil
++	}
++	rows := p.rows[g.Stage]
++	leaves := p.leaves[g.Stage]
++	o := &Op{Kind: OpDisputeMove, Actor: p.acct, Job: j.ID}
++	switch g.Phase {
++	case GTree:
++		k := splitPoint(g.Size)
++		o.H1, o.H2 = rangeRoot(leaves[g.Lo:g.Lo+k]), rangeRoot(leaves[g.Lo+k:g.Lo+g.Size])
++	case GLeaf:
++		o.H1 = RowRoot(rows[g.Lo])
++	case GBlocks:
++		bl := blockLeaves(rowWords(rows[g.Leaf]))
++		k := splitPoint(g.Size)
++		o.H1, o.H2 = rangeRoot(bl[g.Lo:g.Lo+k]), rangeRoot(bl[g.Lo+k:g.Lo+g.Size])
++	case GBlock:
++		o.Data = rowBlocks(rowWords(rows[g.Leaf]))[g.Block]
++	default:
++		return nil
++	}
++	if p.badMove {
++		o.H1, o.H2 = Hash{1}, Hash{2}
++	}
++	return o
++}
++
++// recorder notes which rows the referee reads.
++type recorder struct {
++	inner   *MemSource
++	leaves  []LeafDesc
++	weights []WeightRow
++	inputs  []int
++	tokens  bool
++}
++
++func (r *recorder) Leaf(d LeafDesc) ([]uint32, error) {
++	r.leaves = append(r.leaves, d)
++	return r.inner.Leaf(d)
++}
++func (r *recorder) Weight(w WeightRow) ([]uint32, error) {
++	r.weights = append(r.weights, w)
++	return r.inner.Weight(w)
++}
++func (r *recorder) StageInput(t int) ([]uint32, error) {
++	r.inputs = append(r.inputs, t)
++	return r.inner.StageInput(t)
++}
++func (r *recorder) Tokens() ([]uint32, error) { r.tokens = true; return r.inner.Tokens() }
++
++// oneStep builds the provider's ONE_STEP from its own data (which fails if that data is false).
++func (p *party) oneStep(tm *tinyModel, w *world, j *Job, g *Game, salts []Hash, stageLeaves []Hash) *Op {
++	if p.silent {
++		return nil
++	}
++	G := 2
++	b, grp := int(g.Stage)/G, int(g.Stage)%G
++	lpg := tm.cfg.L / G
++	T := len(p.tokens[b])
++	st := Stage{Cfg: tm.cfg, T: T, L0: grp * lpg, L1: (grp + 1) * lpg}
++	prog := Program(tm.cfg, T, st.L0, st.L1)
++	mem := &MemSource{Weights: p.weights, Toks: p.tokens[b], Leaves: map[LeafDesc][]uint32{}}
++	for i, d := range prog {
++		mem.Leaves[d] = p.rows[g.Stage][i]
++	}
++	var prevIdx programIndex
++	if grp > 0 {
++		pp := Program(tm.cfg, T, st.L0-lpg, st.L0)
++		prevIdx = indexProgram(pp)
++		for t := 0; t < T; t++ {
++			mem.Input = append(mem.Input, p.rows[g.Stage-1][prevIdx[LeafDesc{LR2, st.L0 - 1, t, -1}]])
++		}
++	}
++	rec := &recorder{inner: mem}
++	if _, err := st.Recompute(prog[g.Leaf], g.Elem, rec); err != nil {
++		return nil
++	}
++	idx := indexProgram(prog)
++	o := &Op{Kind: OpOneStep, Actor: p.acct, Job: j.ID}
++	for _, d := range rec.leaves {
++		i := idx[d]
++		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowLeaf, Leaf: d, Words: p.rows[g.Stage][i], Proof: MerkleProof(p.leaves[g.Stage], i)})
++	}
++	for _, wr := range rec.weights {
++		i, _, _ := tm.cfg.weightIndex(wr)
++		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowWeight, W: wr, Words: p.weights[wr], Proof: MerkleProof(tm.wleaves, i)})
++	}
++	for _, t := range rec.inputs {
++		i := prevIdx[LeafDesc{LR2, st.L0 - 1, t, -1}]
++		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowInput, Index: t, Words: mem.Input[t], Proof: MerkleProof(p.leaves[g.Stage-1], i)})
++	}
++	if rec.tokens {
++		lv, _ := tm.inputTree()
++		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowTokens, Index: b, Words: p.tokens[b], Proof: MerkleProof(lv, b)})
++	}
++	if grp > 0 {
++		o.Reveals = []StageReveal{{Stage: g.Stage - 1, Salt: salts[g.Stage-1], Root: p.root(g.Stage - 1),
++			Proof: MerkleProof(stageLeaves, int(g.Stage-1))}}
++	}
++	return o
++}
++
++// ---------------------------------------------------------------- scenario driver
++
++type scenario struct {
++	providerFault   func(stage uint32) func(int, []uint32)
++	providerInput   func(stage uint32, rows [][]uint32)
++	providerWeights map[WeightRow][]uint32
++	providerTokens  [][]uint32
++	providerSilent  bool
++	providerBadMove bool
++	verifierFault   func(stage uint32) func(int, []uint32) // applied to the first committee seat
++	challenge       *struct {
++		stage  uint32
++		fault  func(stage uint32) func(int, []uint32)
++		silent bool
++	}
++	dataRequest bool
++	serve       string // "ok", "none", "bad"
++}
++
++type outcome struct {
++	status        JobStatus
++	provider      Amount // balance change
++	client        Amount
++	verifierStake Amount // change of the first seat's stake
++	verifierBal   Amount
++	challenger    Amount
++	bond          Amount
++	games         int
++	oneStepOK     int // ONE_STEP ops accepted (verdict by recomputation)
++	oneStepBad    int // ONE_STEP ops rejected (forged or inconsistent inputs)
++}
++
++func runScenario(t *testing.T, tm *tinyModel, sc scenario, seed uint64) outcome {
++	t.Helper()
++	w := newSim(t, seed)
++	wd := &world{sim: w, client: acct(1), provider: acct(2)}
++	var deps []Deposit
++	var ops []*Op
++	deps = append(deps, Deposit{wd.client, 1e9}, Deposit{wd.provider, 1e9})
++	for i := 0; i < 3; i++ {
++		v := acct(100 + i)
++		wd.verifiers = append(wd.verifiers, v)
++		deps = append(deps, Deposit{v, 1e8})
++		ops = append(ops, &Op{Kind: OpStake, Actor: v, Amount: w.p.MinVerifierStake * 2})
++	}
++	reg := &Op{Kind: OpModelReg, Actor: wd.client, H1: tm.wroot, H2: Hash{7}, U1: 2, U2: uint32(tm.cfg.Bs), Cfg: tm.cfg}
++	ops = append(ops, reg)
++	mustOK(t, w.block(deps, ops, nil))
++	model := tagHash("model", reg.Ref[:])
++	_, inRoot := tm.inputTree()
++	const fee = 20_000_000
++	c0, p0 := w.st.Accounts[wd.client], w.st.Accounts[wd.provider] // before the fee and bond are escrowed
++	post := &Op{Kind: OpJobPost, Actor: wd.client, Model: model, H1: inRoot, U1: 4, Amount: fee, Deadline: w.h + 40,
++		K: 2, N: 4, U2: uint32(len(tm.tokens[0]))}
++	mustOK(t, w.block(nil, []*Op{post}, nil))
++	jid := tagHash("job", post.Ref[:])
++
++	pw, ptok := tm.weights, tm.tokens
++	if sc.providerWeights != nil {
++		pw = sc.providerWeights
++	}
++	if sc.providerTokens != nil {
++		ptok = sc.providerTokens
++	}
++	prov := tm.newParty(t, wd.provider, pw, ptok, sc.providerFault, sc.providerInput)
++	prov.silent, prov.badMove = sc.providerSilent, sc.providerBadMove
++	salts := make([]Hash, 4)
++	sl := make([]Hash, 4)
++	for s := range salts {
++		salts[s] = sha256.Sum256([]byte{byte(s), 0x5a})
++		sl[s] = StageLeaf(uint32(s), salts[s], prov.root(uint32(s)))
++	}
++	bond := minBond(w.p, fee)
++	mustOK(t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: wd.provider, Job: jid, Amount: bond}}, nil))
++	mustOK(t, w.block(nil, []*Op{{Kind: OpTraceCommit, Actor: wd.provider, Job: jid, H1: MerkleRoot(sl), H2: Hash{3}}}, nil))
++	for w.st.Jobs[jid].Status == StatusCommitted {
++		w.block(nil, nil, nil)
++	}
++	j := w.st.Jobs[jid]
++	seats := map[AccountID]*party{}
++	for i, s := range j.Committee {
++		var f func(uint32) func(int, []uint32)
++		if i == 0 {
++			f = sc.verifierFault
++		}
++		seats[s.Account] = tm.newParty(t, s.Account, tm.weights, tm.tokens, f, nil)
++	}
++	first := j.Committee[0].Account
++	vs0, vb0 := w.st.Stakes[first], w.st.Accounts[first]
++	// optional serve-or-slash round before committing
++	if sc.dataRequest {
++		mustOK(t, w.block(nil, []*Op{{Kind: OpDataRequest, Actor: first, Job: jid, U1: 1}}, nil))
++		switch sc.serve {
++		case "ok", "bad":
++			var rows []ProvenRow
++			pp := Program(tm.cfg, len(tm.tokens[0]), 0, 1)
++			idx := indexProgram(pp)
++			for tt := 0; tt < len(tm.tokens[0]); tt++ {
++				i := idx[LeafDesc{LR2, 0, tt, -1}]
++				words := append([]uint32(nil), prov.rows[0][i]...)
++				if sc.serve == "bad" && tt == 3 {
++					words[5] ^= 1
++				}
++				rows = append(rows, ProvenRow{Kind: RowInput, Index: tt, Words: words, Proof: MerkleProof(prov.leaves[0], i)})
++			}
++			w.block(nil, []*Op{{Kind: OpDataServe, Actor: wd.provider, Job: jid, U1: 1, Inputs: rows,
++				Reveals: []StageReveal{{Stage: 0, Salt: salts[0], Root: prov.root(0), Proof: MerkleProof(sl, 0)}}}}, nil)
++		}
++	}
++	// verifiers commit to and reveal their roots for all stages (n >= S samples everything)
++	vsalt := map[AccountID]Hash{}
++	var commits []*Op
++	for _, s := range j.Committee {
++		salt := sha256.Sum256(s.Account[:])
++		vsalt[s.Account] = salt
++		var roots []Hash
++		for _, pos := range Positions(salt, 4, 4) {
++			roots = append(roots, seats[s.Account].root(pos))
++		}
++		commits = append(commits, &Op{Kind: OpVerifyCommit, Actor: s.Account, Job: jid, H1: sha256.Sum256(salt[:]),
++			H2: ResultHash(roots, s.Account, salt)})
++	}
++	w.block(nil, commits, nil)
++	for i := 0; i < 40 && w.st.Jobs[jid].Status == StatusVerifyCommit; i++ {
++		w.block(nil, nil, nil)
++	}
++	var reveals []*Op
++	for _, s := range j.Committee {
++		var roots []Hash
++		for _, pos := range Positions(vsalt[s.Account], 4, 4) {
++			roots = append(roots, seats[s.Account].root(pos))
++		}
++		reveals = append(reveals, &Op{Kind: OpVerifyReveal, Actor: s.Account, Job: jid, H1: vsalt[s.Account], Roots: roots})
++	}
++	if w.st.Jobs[jid].Status == StatusVerifyReveal {
++		w.block(nil, reveals, nil)
++	}
++	if w.st.Jobs[jid].Status == StatusProviderReveal {
++		var rv []StageReveal
++		for s := uint32(0); s < 4; s++ {
++			rv = append(rv, StageReveal{Stage: s, Salt: salts[s], Root: prov.root(s), Proof: MerkleProof(sl, int(s))})
++		}
++		w.block(nil, []*Op{{Kind: OpTraceReveal, Actor: wd.provider, Job: jid, Reveals: rv}}, nil)
++		w.block(nil, nil, nil)
++	}
++	// an outside bonded challenger, if any
++	var chal *party
++	ch := acct(77)
++	ch0 := Amount(0)
++	if sc.challenge != nil && w.st.Jobs[jid].Status == StatusChallenge {
++		chal = tm.newParty(t, ch, tm.weights, tm.tokens, sc.challenge.fault, nil)
++		chal.silent = sc.challenge.silent
++		w.block([]Deposit{{ch, 1e8}}, nil, nil)
++		ch0 = w.st.Accounts[ch]
++		mustOK(t, w.block(nil, []*Op{{Kind: OpChallenge, Actor: ch, Job: jid, U1: sc.challenge.stage,
++			H1: chal.root(sc.challenge.stage), Amount: w.p.ChallengeBondMin}}, nil))
++		ch0 -= 0
++	}
++	// play games until the job ends
++	games, okSteps, badSteps := 0, 0, 0
++	for i := 0; i < 2000 && !w.st.Jobs[jid].Status.Terminal(); i++ {
++		j = w.st.Jobs[jid]
++		var ops []*Op
++		if g := j.Game; g != nil && j.Status == StatusDisputed {
++			if g.Phase == GTree && g.Lo == 0 && g.Size == g.N && !g.PMoved && !g.CMoved {
++				games++
++			}
++			disputant := seats[j.Disputes[0].Challenger]
++			if j.Disputes[0].Challenger == ch {
++				disputant = chal
++			}
++			switch g.Phase {
++			case GOneStep:
++				if o := prov.oneStep(tm, wd, j, g, salts, sl); o != nil {
++					ops = append(ops, o)
++				}
++			case GReveal:
++				ops = append(ops, &Op{Kind: OpTraceReveal, Actor: wd.provider, Job: jid, Reveals: []StageReveal{
++					{Stage: g.Stage, Salt: salts[g.Stage], Root: prov.root(g.Stage), Proof: MerkleProof(sl, int(g.Stage))}}})
++			default:
++				if !g.PMoved {
++					if o := prov.move(tm, j, g); o != nil {
++						ops = append(ops, o)
++					}
++				}
++				if !g.CMoved {
++					if o := disputant.move(tm, j, g); o != nil {
++						ops = append(ops, o)
++					}
++				}
++			}
++		}
++		res := w.block(nil, ops, nil)
++		for k, o := range ops {
++			if o.Kind == OpOneStep {
++				if res.OpErrors[k] == nil {
++					okSteps++
++				} else {
++					badSteps++
++				}
++			}
++		}
++	}
++	j = w.st.Jobs[jid]
++	if !j.Status.Terminal() {
++		t.Fatalf("job stuck in %v (game %+v)", j.Status, j.Game)
++	}
++	out := outcome{status: j.Status, provider: w.st.Accounts[wd.provider] - p0, client: w.st.Accounts[wd.client] - c0,
++		verifierStake: w.st.Stakes[first] - vs0, verifierBal: w.st.Accounts[first] - vb0, bond: bond, games: games,
++		oneStepOK: okSteps, oneStepBad: badSteps}
++	if chal != nil {
++		out.challenger = w.st.Accounts[ch] - ch0
++	}
++	return out
++}
++
++// ---------------------------------------------------------------- the faults
++
++// corruptAt flips element e of leaf i (in stage s) and lets later leaves follow consistently.
++func corruptAt(s uint32, i, e int) func(uint32) func(int, []uint32) {
++	return func(st uint32) func(int, []uint32) {
++		if st != s {
++			return nil
++		}
++		return func(k int, row []uint32) {
++			if k == i {
++				row[e%len(row)] ^= 0x00400001
++			}
++		}
++	}
++}
++
++func expectProviderSlashed(t *testing.T, o outcome, name string) {
++	t.Helper()
++	if o.status != StatusFailed || o.provider != -o.bond || o.client != 0 {
++		t.Fatalf("%s: status %v provider %d client %d (bond %d)", name, o.status, o.provider, o.client, o.bond)
++	}
++}
++
++func TestFaultsAreCaughtAndTheRightPartyIsSlashed(t *testing.T) {
++	tm := loadTiny(t)
++	progLen := len(Program(tm.cfg, len(tm.tokens[0]), 0, 1))
++
++	t.Run("honest job settles", func(t *testing.T) {
++		o := runScenario(t, tm, scenario{}, 1)
++		if o.status != StatusSettled || o.provider <= 0 || o.games != 0 {
++			t.Fatalf("%+v", o)
++		}
++	})
++	t.Run("provider fakes a whole stage", func(t *testing.T) {
++		fake := func(s uint32) func(int, []uint32) {
++			if s != 2 {
++				return nil
++			}
++			return func(_ int, row []uint32) {
++				for i := range row {
++					row[i] = 0x3f800000
++				}
++			}
++		}
++		o := runScenario(t, tm, scenario{providerFault: fake}, 2)
++		expectProviderSlashed(t, o, "fake stage")
++		if o.verifierBal <= 0 {
++			t.Fatalf("catching verifier not rewarded: %+v", o)
++		}
++	})
++	t.Run("provider substitutes a weight row (model substitution)", func(t *testing.T) {
++		sub := map[WeightRow][]uint32{}
++		for k, v := range tm.weights {
++			sub[k] = v
++		}
++		row := append([]uint32(nil), tm.weights[WeightRow{"gu", 1, 7}]...)
++		row[3] = uint32(int32(row[3]) + 9)
++		sub[WeightRow{"gu", 1, 7}] = row
++		o := runScenario(t, tm, scenario{providerWeights: sub}, 3)
++		expectProviderSlashed(t, o, "weights")
++		if o.oneStepOK != 0 || o.oneStepBad == 0 {
++			t.Fatalf("substituted weights must fail the weights-root proof: %+v", o)
++		}
++	})
++	t.Run("provider computes on the wrong tokens", func(t *testing.T) {
++		toks := [][]uint32{append([]uint32(nil), tm.tokens[0]...), tm.tokens[1]}
++		toks[0][4] = (toks[0][4] + 1) % uint32(tm.cfg.V)
++		o := runScenario(t, tm, scenario{providerTokens: toks}, 4)
++		expectProviderSlashed(t, o, "tokens")
++		if o.oneStepOK != 0 || o.oneStepBad == 0 {
++			t.Fatalf("wrong tokens must fail the input-root proof: %+v", o)
++		}
++	})
++	t.Run("provider computes a stage on a wrong input", func(t *testing.T) {
++		in := func(s uint32, rows [][]uint32) {
++			if s == 1 {
++				rows[5][9] ^= 1 << 20
++			}
++		}
++		expectProviderSlashed(t, runScenario(t, tm, scenario{providerInput: in}, 5), "stage input")
++	})
++	t.Run("provider silent in the game", func(t *testing.T) {
++		expectProviderSlashed(t, runScenario(t, tm, scenario{providerFault: corruptAt(0, 40, 3), providerSilent: true}, 6), "silent")
++	})
++	t.Run("provider posts invalid moves", func(t *testing.T) {
++		expectProviderSlashed(t, runScenario(t, tm, scenario{providerFault: corruptAt(3, 100, 1), providerBadMove: true}, 7), "bad moves")
++	})
++	t.Run("lying verifier against an honest provider", func(t *testing.T) {
++		o := runScenario(t, tm, scenario{verifierFault: corruptAt(1, 77, 2)}, 8)
++		if o.status != StatusSettled || o.verifierStake != -DefaultParams().VerifierNoShowPenalty || o.games != 1 {
++			t.Fatalf("%+v", o)
++		}
++	})
++	t.Run("provider and verifier wrong differently at the same element", func(t *testing.T) {
++		pf := corruptAt(0, 60, 5)
++		vf := func(s uint32) func(int, []uint32) {
++			if s != 0 {
++				return nil
++			}
++			return func(k int, row []uint32) {
++				if k == 60 {
++					row[5%len(row)] ^= 0x00800002
++				}
++			}
++		}
++		o := runScenario(t, tm, scenario{providerFault: pf, verifierFault: vf}, 9)
++		if o.status != StatusFailed || o.provider != -o.bond || o.verifierStake != -DefaultParams().VerifierNoShowPenalty {
++			t.Fatalf("both wrong: %+v", o)
++		}
++	})
++	t.Run("lying bonded challenger loses its bond", func(t *testing.T) {
++		o := runScenario(t, tm, scenario{challenge: &struct {
++			stage  uint32
++			fault  func(uint32) func(int, []uint32)
++			silent bool
++		}{stage: 3, fault: corruptAt(3, 150, 4)}}, 10)
++		if o.status != StatusSettled || o.challenger != -DefaultParams().ChallengeBondMin {
++			t.Fatalf("%+v", o)
++		}
++	})
++	t.Run("silent challenger loses its bond", func(t *testing.T) {
++		o := runScenario(t, tm, scenario{challenge: &struct {
++			stage  uint32
++			fault  func(uint32) func(int, []uint32)
++			silent bool
++		}{stage: 2, fault: corruptAt(2, 9, 0), silent: true}}, 11)
++		if o.status != StatusSettled || o.challenger != -DefaultParams().ChallengeBondMin {
++			t.Fatalf("%+v", o)
++		}
++	})
++	t.Run("data served: no slash", func(t *testing.T) {
++		o := runScenario(t, tm, scenario{dataRequest: true, serve: "ok"}, 12)
++		if o.status != StatusSettled {
++			t.Fatalf("%+v", o)
++		}
++	})
++	t.Run("data not served: provider slashed", func(t *testing.T) {
++		expectProviderSlashed(t, runScenario(t, tm, scenario{dataRequest: true, serve: "none"}, 13), "no serve")
++	})
++	t.Run("corrupted data served: rejected, provider slashed", func(t *testing.T) {
++		expectProviderSlashed(t, runScenario(t, tm, scenario{dataRequest: true, serve: "bad"}, 14), "bad serve")
++	})
++
++	// property: a consistent lie at a random element of a random leaf, covering every op type,
++	// is always caught; the same for a lying verifier against an honest provider
++	rng := rand.New(rand.NewPCG(5, 6))
++	prog0 := Program(tm.cfg, len(tm.tokens[0]), 0, 1)
++	prog1 := Program(tm.cfg, len(tm.tokens[0]), 1, 2)
++	seen := map[uint8]bool{}
++	for trial := 0; trial < 60; trial++ {
++		stage := uint32(rng.IntN(4))
++		prog := prog0
++		if stage%2 == 1 {
++			prog = prog1
++		}
++		i := rng.IntN(len(prog))
++		if trial < 52 { // first, one leaf of each op type in turn
++			want := uint8(trial % 26)
++			for k, d := range prog {
++				if d.Op == want {
++					i = k + rng.IntN(4)%(len(prog)-k)
++					if prog[i].Op != want {
++						i = k
++					}
++					break
++				}
++			}
++		}
++		e := rng.IntN(tm.cfg.RowLen(prog[i], len(tm.tokens[0])))
++		seen[prog[i].Op] = true
++		name := fmt.Sprintf("trial %d stage %d leaf %d (%d) elem %d", trial, stage, i, prog[i].Op, e)
++		if trial%2 == 0 {
++			o := runScenario(t, tm, scenario{providerFault: corruptAt(stage, i, e)}, uint64(100+trial))
++			expectProviderSlashed(t, o, name)
++			if o.oneStepOK != 1 {
++				t.Fatalf("%s: verdict must come from one accepted recomputation: %+v", name, o)
++			}
++		} else {
++			o := runScenario(t, tm, scenario{verifierFault: corruptAt(stage, i, e)}, uint64(100+trial))
++			if o.status != StatusSettled || o.verifierStake != -DefaultParams().VerifierNoShowPenalty || o.oneStepOK != 1 {
++				t.Fatalf("%s: lying verifier not penalized by recomputation: %+v", name, o)
++			}
++		}
++	}
++	for op := uint8(0); op <= LR2; op++ {
++		if !seen[op] && !(op == LEmbed) {
++			t.Fatalf("op %d never corrupted", op)
++		}
++	}
++	_ = progLen
++}
+diff --git a/node/jobstate/jobstate_test.go b/node/jobstate/jobstate_test.go
+index 6d939b24..996313cd 100644
+--- a/node/jobstate/jobstate_test.go
++++ b/node/jobstate/jobstate_test.go
+@@ -10,6 +10,9 @@ import (
+ 
+ // ---------------------------------------------------------------- harness
+ 
++// smallCfg: an architecture with 4 layers, so 4 layer groups of one layer each.
++var smallCfg = ModelCfg{D: 8, H: 2, Hkv: 1, Hd: 4, I: 8, L: 4, V: 16, Eps: 1e-6, Bs: 0, MaxPos: 64}
++
+ func acct(i int) AccountID { return AccountForScript([]byte{0x51, byte(i), byte(i >> 8)}) }
+ 
+ // payTo is a valid P2TR payout script.
+@@ -166,7 +169,7 @@ func newWorld(t *testing.T, seed uint64, nVerifiers int) *world {
+ 		deps = append(deps, Deposit{v, 1e8})
+ 		ops = append(ops, &Op{Kind: OpStake, Actor: v, Amount: s.p.MinVerifierStake * 2})
+ 	}
+-	reg := &Op{Kind: OpModelReg, Actor: w.client, H1: s.randHash(), H2: s.randHash(), U1: 4, U2: 512}
++	reg := &Op{Kind: OpModelReg, Actor: w.client, H1: s.randHash(), H2: s.randHash(), U1: 4, U2: 0, Cfg: smallCfg}
+ 	ops = append(ops, reg)
+ 	mustOK(t, s.block(deps, ops, nil))
+ 	w.model = tagHash("model", reg.Ref[:])
+@@ -176,7 +179,7 @@ func newWorld(t *testing.T, seed uint64, nVerifiers int) *world {
+ // post + accept + commit, then run until the committee is drawn. Returns the job.
+ func (w *world) startJob(fee Amount, stages uint32, k, n uint8, tr *trace) *Job {
+ 	post := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, H1: w.randHash(), U1: stages, Amount: fee,
+-		Deadline: w.h + 50, K: k, N: n}
++		Deadline: w.h + 50, K: k, N: n, U2: 4}
+ 	mustOK(w.t, w.block(nil, []*Op{post}, nil))
+ 	id := tagHash("job", post.Ref[:])
+ 	mustOK(w.t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: w.provider, Job: id, Amount: minBond(w.p, fee)}}, nil))
+@@ -331,7 +334,7 @@ func TestCheatingProviderCaughtByVerifier(t *testing.T) {
+ 	}
+ }
+ 
+-func TestDisputeTimeoutAbortsWithoutLoss(t *testing.T) {
++func TestSilentProviderLosesDispute(t *testing.T) {
+ 	w := newWorld(t, 4, 3)
+ 	fee := Amount(5_000_000)
+ 	c0, p0 := w.bal(w.client), w.bal(w.provider)
+@@ -347,12 +350,13 @@ func TestDisputeTimeoutAbortsWithoutLoss(t *testing.T) {
+ 	w.block(nil, nil, nil)
+ 	ch := acct(7)
+ 	mustOK(t, w.block([]Deposit{{ch, 1e7}}, []*Op{{Kind: OpChallenge, Actor: ch, Job: j.ID, U1: 3, H1: w.randHash(), Amount: w.p.ChallengeBondMin}}, nil))
+-	w.run(int(w.p.DisputeTimeout) + 1)
+-	if s := w.st.Jobs[j.ID].Status; s != StatusAborted {
++	w.run(int(w.p.GameWindow) + 2) // the provider never answers the game
++	if s := w.st.Jobs[j.ID].Status; s != StatusFailed {
+ 		t.Fatalf("status %v", s)
+ 	}
+-	if w.bal(w.client) != c0 || w.bal(w.provider) != p0 || w.bal(ch) != 1e7 {
+-		t.Fatal("abort must return every party's funds")
++	bond := minBond(w.p, fee)
++	if w.bal(w.client) != c0 || w.bal(w.provider)-p0 != -bond || w.bal(ch) != 1e7+bond/2 {
++		t.Fatalf("client %d provider %d challenger %d", w.bal(w.client)-c0, w.bal(w.provider)-p0, w.bal(ch)-1e7)
+ 	}
+ }
+ 
+@@ -381,13 +385,13 @@ func TestNoShowVerifierPenalizedJobStillSettles(t *testing.T) {
+ func TestExpiryAndAcceptWithoutCommit(t *testing.T) {
+ 	w := newWorld(t, 6, 2)
+ 	c0, p0 := w.bal(w.client), w.bal(w.provider)
+-	post := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1_000_000, Deadline: w.h + 5, K: 2, N: 2}
++	post := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1_000_000, Deadline: w.h + 5, K: 2, N: 2, U2: 4}
+ 	mustOK(t, w.block(nil, []*Op{post}, nil))
+ 	w.run(6)
+ 	if s := w.st.Jobs[tagHash("job", post.Ref[:])].Status; s != StatusExpired || w.bal(w.client) != c0 {
+ 		t.Fatalf("expiry: %v", s)
+ 	}
+-	post2 := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1_000_000, Deadline: w.h + 5, K: 2, N: 2}
++	post2 := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1_000_000, Deadline: w.h + 5, K: 2, N: 2, U2: 4}
+ 	mustOK(t, w.block(nil, []*Op{post2}, nil))
+ 	id := tagHash("job", post2.Ref[:])
+ 	bond := minBond(w.p, 1_000_000)
+@@ -405,8 +409,8 @@ func TestEscrowCannotBeSpentTwice(t *testing.T) {
+ 	w := newWorld(t, 7, 2)
+ 	all := w.bal(w.client)
+ 	ops := []*Op{
+-		{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: all, Deadline: w.h + 9, K: 2, N: 2},
+-		{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1, Deadline: w.h + 9, K: 2, N: 2},
++		{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: all, Deadline: w.h + 9, K: 2, N: 2, U2: 4},
++		{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: 4, Amount: 1, Deadline: w.h + 9, K: 2, N: 2, U2: 4},
+ 		{Kind: OpWithdraw, Actor: w.client, Amount: 1, PkScript: payTo(1)},
+ 		{Kind: OpStake, Actor: w.client, Amount: 1},
+ 	}
+@@ -427,7 +431,7 @@ func TestFailedOpsAreNoOps(t *testing.T) {
+ 		{Kind: OpWithdraw, Actor: acct(999), Amount: 10, PkScript: payTo(9)},
+ 		{Kind: OpWithdraw, Actor: w.client, Amount: 10, PkScript: []byte{0x76, 0xa9, 0x14}}, // unpayable on Pearl
+ 		{Kind: OpUnstake, Actor: w.verifiers[0], Amount: 1 << 60},
+-		{Kind: OpJobPost, Actor: w.client, Model: w.randHash(), U1: 4, Amount: 10, Deadline: w.h + 3, K: 2, N: 2},
++		{Kind: OpJobPost, Actor: w.client, Model: w.randHash(), U1: 4, Amount: 10, Deadline: w.h + 3, K: 2, N: 2, U2: 4},
+ 		{Kind: OpChallenge, Actor: w.client, Job: w.randHash(), Amount: 1 << 40},
+ 		{Kind: OpModelReg, Actor: acct(999), U1: 1},
+ 	}
+@@ -577,8 +581,25 @@ func TestOpEncodingRoundTrip(t *testing.T) {
+ 		return
+ 	}
+ 	for i := 0; i < 2000; i++ {
+-		o := &Op{Kind: OpKind(1 + rng.IntN(11)), Amount: rng.Int64(), Job: rh(), Model: rh(), H1: rh(), H2: rh(),
+-			U1: rng.Uint32(), U2: rng.Uint32(), Deadline: int32(rng.Uint32()), K: uint8(rng.Uint32()), N: uint8(rng.Uint32())}
++		o := &Op{Kind: OpKind(1 + rng.IntN(15)), Amount: rng.Int64(), Job: rh(), Model: rh(), H1: rh(), H2: rh(),
++			U1: rng.Uint32(), U2: rng.Uint32(), Deadline: int32(rng.Uint32()), K: uint8(rng.Uint32()), N: uint8(rng.Uint32()),
++			Cfg:  ModelCfg{D: rng.IntN(1 << 20), H: rng.IntN(99), Hkv: 3, Hd: 64, I: 7, L: 2, V: 9, Eps: 1e-5, Bs: 128, MaxPos: 5},
++			Data: make([]byte, rng.IntN(RowBlock))}
++		for k := 0; k < rng.IntN(4); k++ {
++			in := ProvenRow{Kind: uint8(1 + rng.IntN(4)), Index: rng.IntN(1000), Words: []uint32{rng.Uint32(), 7}, Proof: []Hash{rh()}}
++			in.Leaf = LeafDesc{Op: uint8(rng.IntN(26)), Layer: rng.IntN(5), T: rng.IntN(50) - 1, H: rng.IntN(8) - 1}
++			in.W = WeightRow{Name: weightNames[rng.IntN(len(weightNames))], Layer: rng.IntN(5), Row: rng.IntN(99)}
++			if in.Kind != RowLeaf {
++				in.Leaf = LeafDesc{}
++			}
++			if in.Kind != RowWeight {
++				in.W = WeightRow{}
++			}
++			if in.Kind == RowLeaf || in.Kind == RowWeight {
++				in.Index = 0
++			}
++			o.Inputs = append(o.Inputs, in)
++		}
+ 		o.PkScript = make([]byte, rng.IntN(40))
+ 		for k := 0; k < rng.IntN(5); k++ {
+ 			o.Roots = append(o.Roots, rh())
+@@ -647,7 +668,7 @@ func randomizedRun(t *testing.T, seed uint64) {
+ 			stages := uint32(4 * (1 + r.IntN(8)))
+ 			fee := Amount(1_000_000 + r.IntN(9_000_000))
+ 			post := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, U1: stages, Amount: fee,
+-				Deadline: w.h + 1 + int32(3+r.IntN(20)), K: uint8(2 + r.IntN(3)), N: uint8(2 + r.IntN(4)), Ref: w.ref()}
++				Deadline: w.h + 1 + int32(3+r.IntN(20)), K: uint8(2 + r.IntN(3)), N: uint8(2 + r.IntN(4)), U2: 4, Ref: w.ref()}
+ 			ops = append(ops, post)
+ 			jobs = append(jobs, &live{id: tagHash("job", post.Ref[:]), tr: w.newTrace(stages), salts: map[AccountID]Hash{},
+ 				cheat: r.IntN(4) == 0, reveal: r.IntN(6) != 0})
+@@ -733,7 +754,8 @@ func randomizedRun(t *testing.T, seed uint64) {
+ 			case 3:
+ 				if len(jobs) > 0 {
+ 					lj := jobs[r.IntN(len(jobs))]
+-					ops = append(ops, &Op{Kind: OpKind(1 + r.IntN(11)), Actor: u, Job: lj.id, Amount: Amount(r.IntN(1 << 20)), H1: w.randHash()})
++					ops = append(ops, &Op{Kind: OpKind(1 + r.IntN(15)), Actor: u, Job: lj.id, Amount: Amount(r.IntN(1 << 20)), H1: w.randHash(),
++						U1: uint32(r.IntN(8)), Data: make([]byte, r.IntN(64))})
+ 				}
+ 			case 4:
+ 				ops = append(ops, &Op{Kind: OpTraceReveal, Actor: w.provider, Job: w.randHash(), Reveals: []StageReveal{{Stage: 1}}})
+diff --git a/node/jobstate/ops.go b/node/jobstate/ops.go
+index e13f6539..8541a5bc 100644
+--- a/node/jobstate/ops.go
++++ b/node/jobstate/ops.go
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
++	"math"
+ )
+ 
+ // OpKind is a job-module operation type.
+@@ -22,13 +23,18 @@ const (
+ 	OpVerifyReveal
+ 	OpTraceReveal
+ 	OpChallenge
++	OpDisputeMove
++	OpOneStep
++	OpDataRequest
++	OpDataServe
+ )
+ 
+ var opNames = map[OpKind]string{
+ 	OpWithdraw: "WITHDRAW", OpStake: "STAKE", OpUnstake: "UNSTAKE", OpModelReg: "MODEL_REG",
+ 	OpJobPost: "JOB_POST", OpJobAccept: "JOB_ACCEPT", OpTraceCommit: "TRACE_COMMIT",
+ 	OpVerifyCommit: "VERIFY_COMMIT", OpVerifyReveal: "VERIFY_REVEAL", OpTraceReveal: "TRACE_REVEAL",
+-	OpChallenge: "CHALLENGE",
++	OpChallenge: "CHALLENGE", OpDisputeMove: "DISPUTE_MOVE", OpOneStep: "ONE_STEP",
++	OpDataRequest: "DATA_REQUEST", OpDataServe: "DATA_SERVE",
+ }
+ 
+ func (k OpKind) String() string { return opNames[k] }
+@@ -49,6 +55,11 @@ func (k OpKind) String() string { return opNames[k] }
+ //	VERIFY_REVEAL  Job, H1 salt, Roots (one per sampled position, in position order)
+ //	TRACE_REVEAL   Job, Reveals
+ //	CHALLENGE      Job, U1 stage, H1 claimed_root, Amount bond
++//	MODEL_REG also carries Cfg (architecture); JOB_POST also carries U2 = tokens per sequence
++//	DISPUTE_MOVE   Job, H1 H2 (children in a bisection round, or H1 = row root at a leaf), Data (block bytes)
++//	ONE_STEP       Job, Reveals (optional: previous stage opened), Inputs (proven input rows)
++//	DATA_REQUEST   Job, U1 stage
++//	DATA_SERVE     Job, U1 stage, Reveals (previous stage opened), Inputs (proven stage-input rows)
+ type Op struct {
+ 	Kind     OpKind
+ 	Actor    AccountID
+@@ -63,6 +74,37 @@ type Op struct {
+ 	K, N     uint8
+ 	Roots    []Hash
+ 	Reveals  []StageReveal
++	Cfg      ModelCfg
++	Data     []byte
++	Inputs   []ProvenRow
++}
++
++// ProvenRow is an input row for the referee or a served stage input, with its Merkle proof.
++type ProvenRow struct {
++	Kind  uint8 // RowLeaf, RowWeight, RowInput, RowTokens
++	Leaf  LeafDesc
++	W     WeightRow
++	Index int // token position t (RowInput) or batch (RowTokens)
++	Words []uint32
++	Proof []Hash
++}
++
++const (
++	RowLeaf uint8 = iota + 1
++	RowWeight
++	RowInput
++	RowTokens
++)
++
++var weightNames = []string{"embed", "in_norm", "post_norm", "q_norm", "k_norm", "qkv", "o", "gu", "down", "rope.cos", "rope.sin"}
++
++func weightCode(n string) uint8 {
++	for i, x := range weightNames {
++		if x == n {
++			return uint8(i)
++		}
++	}
++	return 255
+ }
+ 
+ const (
+@@ -70,7 +112,9 @@ const (
+ 	maxPkScript     = 10_000
+ 	maxRoots        = 4096
+ 	maxReveals      = 4096
+-	maxProofDepth   = 40
++	maxProofDepth   = 64
++	maxInputs       = 512
++	maxRowWords     = 1 << 18
+ 	MaxOpPayloadLen = 1 << 20
+ )
+ 
+@@ -96,6 +140,11 @@ func (o *Op) Encode() []byte {
+ 		b.Write(o.H2[:])
+ 		w(o.U1)
+ 		w(o.U2)
++		c := o.Cfg
++		for _, v := range []int{c.D, c.H, c.Hkv, c.Hd, c.I, c.L, c.V, c.Bs, c.MaxPos} {
++			w(uint32(v))
++		}
++		w(math.Float32bits(c.Eps))
+ 	case OpJobPost:
+ 		b.Write(o.Model[:])
+ 		b.Write(o.H1[:])
+@@ -104,6 +153,7 @@ func (o *Op) Encode() []byte {
+ 		w(o.Deadline)
+ 		b.WriteByte(o.K)
+ 		b.WriteByte(o.N)
++		w(o.U2)
+ 	case OpJobAccept:
+ 		b.Write(o.Job[:])
+ 		w(o.Amount)
+@@ -135,6 +185,53 @@ func (o *Op) Encode() []byte {
+ 		w(o.U1)
+ 		b.Write(o.H1[:])
+ 		w(o.Amount)
++	case OpDisputeMove:
++		b.Write(o.Job[:])
++		b.Write(o.H1[:])
++		b.Write(o.H2[:])
++		uv(uint64(len(o.Data)))
++		b.Write(o.Data)
++	case OpOneStep, OpDataServe, OpDataRequest:
++		b.Write(o.Job[:])
++		w(o.U1)
++		if o.Kind == OpDataRequest {
++			break
++		}
++		uv(uint64(len(o.Reveals)))
++		for _, r := range o.Reveals {
++			w(r.Stage)
++			b.Write(r.Salt[:])
++			b.Write(r.Root[:])
++			uv(uint64(len(r.Proof)))
++			for _, p := range r.Proof {
++				b.Write(p[:])
++			}
++		}
++		uv(uint64(len(o.Inputs)))
++		for _, in := range o.Inputs {
++			b.WriteByte(in.Kind)
++			switch in.Kind {
++			case RowLeaf:
++				b.WriteByte(in.Leaf.Op)
++				w(uint32(in.Leaf.Layer))
++				w(int32(in.Leaf.T))
++				w(int32(in.Leaf.H))
++			case RowWeight:
++				b.WriteByte(weightCode(in.W.Name))
++				w(uint32(in.W.Layer))
++				w(uint32(in.W.Row))
++			default:
++				w(uint32(in.Index))
++			}
++			uv(uint64(len(in.Words)))
++			for _, x := range in.Words {
++				w(x)
++			}
++			uv(uint64(len(in.Proof)))
++			for _, p := range in.Proof {
++				b.Write(p[:])
++			}
++		}
+ 	}
+ 	return b.Bytes()
+ }
+@@ -192,12 +289,19 @@ func DecodeOp(p []byte) (*Op, error) {
+ 	case OpModelReg:
+ 		o.H1, o.H2 = r.hash(), r.hash()
+ 		o.U1, o.U2 = r.u32(), r.u32()
++		vals := make([]int, 9)
++		for i := range vals {
++			vals[i] = int(r.u32())
++		}
++		o.Cfg = ModelCfg{D: vals[0], H: vals[1], Hkv: vals[2], Hd: vals[3], I: vals[4], L: vals[5], V: vals[6],
++			Bs: vals[7], MaxPos: vals[8], Eps: math.Float32frombits(r.u32())}
+ 	case OpJobPost:
+ 		o.Model, o.H1 = r.hash(), r.hash()
+ 		o.U1 = r.u32()
+ 		o.Amount = r.i64()
+ 		o.Deadline = r.i32()
+ 		o.K, o.N = r.u8(), r.u8()
++		o.U2 = r.u32()
+ 	case OpJobAccept:
+ 		o.Job = r.hash()
+ 		o.Amount = r.i64()
+@@ -225,6 +329,52 @@ func DecodeOp(p []byte) (*Op, error) {
+ 		o.U1 = r.u32()
+ 		o.H1 = r.hash()
+ 		o.Amount = r.i64()
++	case OpDisputeMove:
++		o.Job, o.H1, o.H2 = r.hash(), r.hash(), r.hash()
++		o.Data = append([]byte(nil), r.take(r.uvar(RowBlock))...)
++	case OpOneStep, OpDataServe, OpDataRequest:
++		o.Job = r.hash()
++		o.U1 = r.u32()
++		if o.Kind == OpDataRequest {
++			break
++		}
++		n := r.uvar(maxReveals)
++		for i := 0; i < n && r.err == nil; i++ {
++			sr := StageReveal{Stage: r.u32(), Salt: r.hash(), Root: r.hash()}
++			d := r.uvar(maxProofDepth)
++			for j := 0; j < d && r.err == nil; j++ {
++				sr.Proof = append(sr.Proof, r.hash())
++			}
++			o.Reveals = append(o.Reveals, sr)
++		}
++		ni := r.uvar(maxInputs)
++		for i := 0; i < ni && r.err == nil; i++ {
++			in := ProvenRow{Kind: r.u8()}
++			switch in.Kind {
++			case RowLeaf:
++				in.Leaf = LeafDesc{Op: r.u8(), Layer: int(r.u32()), T: int(r.i32()), H: int(r.i32())}
++			case RowWeight:
++				code := int(r.u8())
++				if code >= len(weightNames) {
++					r.err = errDecode
++					break
++				}
++				in.W = WeightRow{Name: weightNames[code], Layer: int(r.u32()), Row: int(r.u32())}
++			case RowInput, RowTokens:
++				in.Index = int(r.u32())
++			default:
++				r.err = errDecode
++			}
++			nw := r.uvar(maxRowWords)
++			for j := 0; j < nw && r.err == nil; j++ {
++				in.Words = append(in.Words, r.u32())
++			}
++			d := r.uvar(maxProofDepth)
++			for j := 0; j < d && r.err == nil; j++ {
++				in.Proof = append(in.Proof, r.hash())
++			}
++			o.Inputs = append(o.Inputs, in)
++		}
+ 	default:
+ 		return nil, fmt.Errorf("jobstate: unknown op kind %d", o.Kind)
+ 	}
+diff --git a/node/jobstate/types.go b/node/jobstate/types.go
+index 9fdaf808..02eee6dd 100644
+--- a/node/jobstate/types.go
++++ b/node/jobstate/types.go
+@@ -56,7 +56,9 @@ type Params struct {
+ 	VerifyRevealWindow   int32
+ 	ProviderRevealWindow int32
+ 	ChallengeWindow      int32
+-	DisputeTimeout       int32
++	DisputeTimeout       int32 // used only when a verdict is injected externally (tests); games use GameWindow
++	GameWindow           int32 // blocks for each move of a dispute game
++	ServeWindow          int32 // blocks for the provider to serve requested stage inputs
+ 	WithdrawDelay        int32
+ 	UnbondDelay          int32
+ }
+@@ -71,6 +73,7 @@ func DefaultParams() Params {
+ 		MinK: 2, MaxK: 16, MinN: 2, MaxN: 64, MaxStages: 1 << 20, MaxDeadlineBlocks: 10_080,
+ 		CommitteeDelay: 2, VerifyCommitWindow: 10, VerifyRevealWindow: 10, ProviderRevealWindow: 10,
+ 		ChallengeWindow: 1440, DisputeTimeout: 2880, WithdrawDelay: 6, UnbondDelay: 2880,
++		GameWindow: 10, ServeWindow: 10,
+ 	}
+ }
+ 
+@@ -113,6 +116,7 @@ type Model struct {
+ 	LayerGroups   uint32
+ 	RotationBlock uint32
+ 	Bond          Amount
++	Cfg           ModelCfg // architecture: fixes every stage program and the dispute referee
+ }
+ 
+ // Verifier is one committee seat on a job.
+@@ -127,8 +131,10 @@ type Verifier struct {
+ 	Flagged    bool // its roots disagreed with the provider's
+ }
+ 
+-// Challenge is an open dispute.
++// Challenge is an open dispute: a bonded challenger, or a committee verifier whose recomputed
++// root disagreed with the provider's (Verifier = true, no bond; staked instead).
+ type Challenge struct {
++	Verifier    bool
+ 	Challenger  AccountID // zero for verifier-flagged disputes
+ 	Stage       uint32
+ 	ClaimedRoot Hash
+@@ -170,7 +176,12 @@ type Job struct {
+ 
+ 	Committee []Verifier
+ 	Revealed  []StageReveal // provider's opened stages, sorted by stage
+-	Disputes  []Challenge
++	Disputes  []Challenge   // queue; Disputes[0] is played in Game
++
++	SeqLen       uint32 // tokens per sequence (one sequence per batch)
++	ChallengeEnd int32  // end of the challenge window (restored after a dispute the provider wins)
++	Game         *Game
++	DataReqs     []DataReq
+ }
+ 
+ // Withdrawal is a pending payout from the module to a pkScript.
+-- 
+2.30.2
+

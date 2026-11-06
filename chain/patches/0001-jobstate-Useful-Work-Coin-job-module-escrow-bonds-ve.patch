@@ -1,7 +1,7 @@
 From 4b5d7897427ecc4bfe2ca2c8b1747b4f9df69c6e Mon Sep 17 00:00:00 2001
 From: Sid <sid7513@gmail.com>
 Date: Fri, 6 Nov 2026 02:39:33 +0530
-Subject: [PATCH 1/2] jobstate: Useful-Work Coin job module (escrow, bonds,
+Subject: [PATCH 1/4] jobstate: Useful-Work Coin job module (escrow, bonds,
  verification lifecycle, settlement) with property tests
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

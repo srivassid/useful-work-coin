@@ -17,5 +17,7 @@ exactly as on unmodified Pearl.
 |---|---|
 | 0001 | `node/jobstate`: the job module (pure Go) and its property tests |
 | 0002 | consensus integration: `chaincfg.Params.JobModule`, coinbase rules, state persistence, mining templates, mempool policy |
+| 0003 | stage programs and the bit-exact referee (with Python fixtures in `jobstate/testdata`) |
+| 0004 | dispute games, one-step proofs, serve-or-slash, fault-injection suite |
 
-Design: `spec/job-module.md`. Results: `spec/step3-results.md`.
+Design: `spec/job-module.md`, `spec/stage-program.md`. Results: `spec/step3-results.md`, `spec/step4-results.md`.
