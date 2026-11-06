@@ -35,14 +35,14 @@ needs no job-module rules, and a block is never invalid because of a job operati
 | 8 | `TRACE_REVEAL(job, [stage, salt_i, root_i, proof])` | provider | in the following `ProviderRevealWindow`; each proof must open stage_root |
 | 9 | comparison (automatic, end of reveal window) | – | a requested stage left unrevealed → provider slashed. A verifier root ≠ provider root → dispute. Otherwise the challenge window opens |
 | 10 | `CHALLENGE(job, stage, claimed_root, bond)` | anyone | during `ChallengeWindow` W; bond ≥ `ChallengeBondMin`; opens a dispute |
-| 11 | dispute verdict | consensus (step 4: bisection to one op) | provider at fault → slashed; else the challenger (or flagging verifier) pays |
+| 11 | dispute game (`DISPUTE_MOVE`, `ONE_STEP`) | provider and disputant; every full node referees | provider at fault → slashed; else the challenger (or flagging verifier) pays |
 | 12 | settlement (automatic, end of W) | – | provider gets F − V − T plus B back; revealing verifiers share V; T and unpaid V go to the treasury |
 
 Timeouts:
 - Not accepted by the deadline: F refunded.
 - Accepted but not committed by the deadline: B goes ½ to the client, ½ to the treasury, and F is refunded.
 - A verifier that doesn't commit or reveal: `VerifierNoShowPenalty` taken from its stake, to the treasury.
-- Dispute unresolved after `DisputeTimeout`: no-fault abort (F refunded, B and challenge bonds returned).
+- Dispute: played as a bisection game (spec/stage-program.md). A party that misses a `GameWindow` loses, and the game ends in one recomputed element.
 
 Slash split: the provider's B goes ½ to whoever caught it (the flagging verifiers or the challenger), ½ to the treasury, and the client gets F back. A failed challenge's bond goes ½ to the provider, ½ to the treasury.
 
