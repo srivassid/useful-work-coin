@@ -16,6 +16,7 @@ import json
 import os
 import random
 import secrets
+import sys
 import threading
 import time
 import traceback
@@ -116,12 +117,15 @@ class Agent:
         g = j.get("game")
         if not g or g["phase"] == GREVEAL:
             return
-        if (g["pmoved"] if as_provider else g["cmoved"]):
+        # pmoved/cmoved are left over from the last block round when the game enters the
+        # one-step phase; only the provider acts there
+        if g["phase"] != GONESTEP and (g["pmoved"] if as_provider else g["cmoved"]):
             return
         js = self.st["jobs"].setdefault(j["id"], {})
         tag = f"{g['stage']}:{g['phase']}:{g['lo']}:{g['size']}:{g['leaf']}:{g['block']}"
-        if js.get("last_move") == tag:
-            return
+        h = self.chain.height()
+        if js.get("last_move") == tag and h - js.get("last_move_h", h) < 3:
+            return  # sent recently; resend if it has not reached a block after 3 blocks (e.g. a node restart dropped it)
         b = self.batches(j)
         if b is None:
             return
@@ -131,7 +135,7 @@ class Agent:
             return
         op = move(j["id"], g, self.game_trace(j, b, g["stage"], as_provider))
         if op and self.send([op], f"game {j['id'][:8]} stage {g['stage']} phase {g['phase']} lo {g['lo']} size {g['size']}"):
-            js["last_move"] = tag
+            js["last_move"], js["last_move_h"] = tag, h
             self.save()
 
     def game_trace(self, j: dict, b, stage: int, as_provider: bool):
@@ -152,7 +156,7 @@ class Agent:
         try:
             r = self.chain.run("onestep", self.key, os.path.join(d, "req.json"))
             log(f"one-step {j['id'][:8]} stage {g['stage']} leaf {g['leaf']} elem {g['elem']}: tx {r['txid'][:12]}")
-            js["last_move"] = tag
+            js["last_move"], js["last_move_h"] = tag, self.chain.height()
             self.save()
         except ChainError as e:
             log(f"one-step {j['id'][:8]}: {e}")
@@ -224,6 +228,7 @@ class Provider(Agent):
     def claim(self, s: dict):
         cats = [(cid, c) for cid, c in s["categories"].items() if not c["retired"] and c["workroot"] in self.lists]
         random.shuffle(cats)
+        cats.sort(key=lambda x: not (self.a.prefer and x[0].startswith(self.a.prefer)))
         for cid, c in cats:
             doc = self.lists[c["workroot"]]
             taken = set()
@@ -261,11 +266,13 @@ class Provider(Agent):
                 return
             self.busy = self.worker.submit(self.compute_job, jid, b)
             return
+        if j["status"] == "accepted" and js.get("committed") and self.chain.height() - js.get("committed_h", 0) >= 3:
+            js["committed"] = False  # the commit never reached a block: send it again
         if j["status"] == "accepted" and "roots" in js and not js.get("committed"):
             sc = self.commit_of(js)
             if self.send([{"kind": "TRACE_COMMIT", "job": jid, "h1": sc.root.hex(), "h2": js["outputroot"]}],
                          f"commit {jid[:8]}"):
-                js["committed"] = True
+                js["committed"], js["committed_h"] = True, self.chain.height()
                 self.save()
             return
         if "roots" not in js:
@@ -286,10 +293,11 @@ class Provider(Agent):
             self.play(j, as_provider=True)
         want -= open_
         key = f"{j['status']}:{sorted(want)}"
-        if want and js.get("last_reveal") != key:
+        h = self.chain.height()
+        if want and (js.get("last_reveal") != key or h - js.get("last_reveal_h", h) >= 3):
             if self.send([{"kind": "TRACE_REVEAL", "job": jid, "reveals": [sc.reveal(x) for x in sorted(want)]}],
                          f"reveal {jid[:8]} stages {sorted(want)}"):
-                js["last_reveal"] = key
+                js["last_reveal"], js["last_reveal_h"] = key, h
                 self.save()
 
     def compute_job(self, jid: str, b: list[list[int]]):
@@ -338,6 +346,20 @@ class Verifier(Agent):
                 if seat is None:
                     continue
                 js = self.st["jobs"].setdefault(jid, {})
+                h = self.chain.height()
+                # resend a commit or reveal the chain has not recorded after 3 blocks
+                if status == "verify-commit" and js.get("committed") and not seat["committed"] and h - js.get("sent_h", h) >= 3:
+                    js["resend"] = True
+                if status == "verify-reveal" and js.get("revealed") and not seat["revealed"] and h - js.get("sent_h", h) >= 3:
+                    js["revealed"] = False
+                if status == "verify-commit" and js.get("resend") and "salt" in js:
+                    salt = bytes.fromhex(js["salt"])
+                    rh = result_hash([bytes.fromhex(r) for r in js["roots"]], bytes.fromhex(self.account), salt)
+                    if self.send([{"kind": "VERIFY_COMMIT", "job": jid, "h1": hashlib.sha256(salt).hexdigest(),
+                                   "h2": rh.hex()}], f"verify-commit {jid[:8]} (resend)"):
+                        js["resend"], js["sent_h"] = False, h
+                        self.save()
+                    continue
                 if status == "verify-commit" and not seat["committed"] and not js.get("committed"):
                     b = self.batches(j)
                     if b is None:
@@ -351,13 +373,13 @@ class Verifier(Agent):
                     rh = result_hash(roots, bytes.fromhex(self.account), salt)
                     if self.send([{"kind": "VERIFY_COMMIT", "job": jid, "h1": hashlib.sha256(salt).hexdigest(),
                                    "h2": rh.hex()}], f"verify-commit {jid[:8]} stages {pos}"):
-                        js["committed"] = True
+                        js["committed"], js["sent_h"] = True, self.chain.height()
                     self.save()
                 elif status == "verify-reveal" and seat["committed"] and not seat["revealed"] and js.get("committed") \
                         and not js.get("revealed"):
                     if self.send([{"kind": "VERIFY_REVEAL", "job": jid, "h1": js["salt"], "roots": js["roots"]}],
                                  f"verify-reveal {jid[:8]}"):
-                        js["revealed"] = True
+                        js["revealed"], js["sent_h"] = True, self.chain.height()
                         self.save()
 
 
@@ -538,7 +560,18 @@ class Decoy(Provider):
             elif j["status"] in ("provider-reveal", "disputed"):
                 self.reveals_only(j, js)
         active = [js for js in self.st["jobs"].values() if not js.get("final")]
-        if len(active) < 1 and h - self.st.get("last_post", -10**9) >= self.a.every and self.a.post > len(self.st["jobs"]):
+        # every decoy has ended: the keyholders reveal the record so catchers get their jackpots
+        if not active and len(self.st["jobs"]) >= self.a.post and not self.st.get("revealed"):
+            import subprocess
+            p = subprocess.run([sys.executable, "-m", "agent.fe", "reveal", "--devnet", self.a.devnet],
+                               capture_output=True, text=True, cwd=os.path.join(os.path.dirname(__file__), ".."))
+            log(f"forced-error reveal: {p.stdout.strip() or p.stderr.strip()[-300:]}")
+            if p.returncode == 0:
+                self.st["revealed"] = h
+                self.save()
+            return
+        if len(active) < self.a.max_jobs and h - self.st.get("last_post", -10**9) >= self.a.every and \
+                self.a.post > len(self.st["jobs"]):
             self.post_decoy(h)
 
     def reveals_only(self, j: dict, js: dict):
@@ -611,6 +644,7 @@ def main() -> None:
     # provider
     ap.add_argument("--max-jobs", type=int, default=1)
     ap.add_argument("--pool", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--prefer", default="", help="provider: claim from categories with this id prefix first")
     # verifier
     ap.add_argument("--stake", type=int, default=100_000_000)
     # watcher

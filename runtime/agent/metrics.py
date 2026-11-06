@@ -125,6 +125,17 @@ def main() -> None:
         "pool_reserve": s["pool"], "treasury": s["treasury"],
         "categories": {cid[:8]: {k: c[k] for k in ("budget", "price", "done", "inflight", "units")} for cid, c in s["categories"].items()},
     }
+    # per-job table for the page: kind, outcome, and the cause of each failure as the agents saw it
+    causes = {}
+    for f in glob.glob(os.path.join(a.devnet, "agent", "*-*.json")):
+        pass
+    table = []
+    for jid, e in sorted(jobs.items(), key=lambda x: x[1]["posted"]):
+        kind = "decoy" if jid in decoys else ("pool" if e.get("pool") else "client")
+        table.append({"job": jid[:8], "kind": kind, "status": e["status"], "stages": e["stages"], "posted": e["posted"],
+                      "fee": e["fee"], "provider": e["provider"][:8]})
+    out["job_table"] = table
+    out["blocks_window"] = [lo, h]
     print(json.dumps(out, indent=1, default=str))
     if a.json:
         json.dump(out, open(a.json, "w"), indent=1, default=str)

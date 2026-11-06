@@ -11,8 +11,8 @@ clients is a later, separate decision.
 |---|---|---|
 | 1 | Real blocks: devnet params, `pearld` with proof verification, Ampere miner → Pearl gateway (zk proof) → node | **done** |
 | 2 | Job tooling: `uwcctl` deposits and job ops (Taproot-signed), council actions | **done** |
-| 3 | Provider, verifier and watcher daemons on the GPUs (deterministic runtime), client CLI with off-chain output delivery | – |
-| 4 | Testnet metrics page: useful share, λ per job type, verification overhead, false-slash rate, client price | – |
+| 3 | Provider, verifier and watcher daemons on the GPUs (deterministic runtime), client CLI with off-chain output delivery | **running**; see below |
+| 4 | Testnet metrics page: useful share, λ per job type, verification overhead, false-slash rate, client price | **done** (snapshot): `runtime/agent/metrics.py`, page https://claude.ai/artifact/764HEMAoNDH5DTwZdmyFgM |
 | 5 | Public testnet: exposure, outside clients | needs a decision |
 
 ## Milestone 1: real blocks (2026-11-06)
@@ -72,24 +72,105 @@ Lessons:
     stages, and it gets 60% of pool income. The proposal sat at one approval until the second
     member approved; then the category opened and started collecting about 6 coins per block.
 
-## Where to resume (2026-11-06, session ended mid-milestone 3)
+## Milestone 3: the full job flow on the devnet (2026-11-06)
 
-Running on the devnet: both nodes, both gateways, 4 noise miners (all GPUs), height ~43.
-Patch 0010 adds `uwcctl ops <key> <json>` (any job op as JSON, hex fields) and shortens the
-devnet challenge window to 60 blocks (unbonding 120); nodes were redeployed with it.
+**Agent** (`runtime/agent/`, Python). It runs the reference runtime on the GPUs and sends
+chain operations through `uwcctl`:
 
-Milestone 3 plan (not started in code beyond `runtime/agent/{model_info,inputs,worklist}.py`):
-1. `agent/chain.py`: wrapper over `uwcctl` (queries, `ops`). Python ports of StageLeaf,
-   Positions, ResultHash (tag "pos", "result").
-2. `agent/data.py`: LAN-only HTTP data service on 192.168.29.71:18680 for job inputs
-   (`/inputs/<input_root>.json`) and outputs; output_root = Merkle root over row roots of each
-   batch's mean-pooled final hidden state.
-3. `agent/provider.py`: claim pool units / accept client jobs, run stages with detrt on a GPU
-   (stage = batch*G + group), commit salted stage roots, reveal requested stages, reveal in
-   GReveal. Take GPU1 on box 71 off noise mining for it.
-4. `agent/verifier.py`: stake, then for drawn seats pick a salt, recompute sampled stages from
-   tokens, VERIFY_COMMIT then VERIFY_REVEAL. Verifier keys still to generate and fund.
-5. `agent/client.py`: post jobs (WikiText chunks past the pool's 200 units), fetch and check outputs.
-6. Then watchers (CHALLENGE checks), canaries, FE decoys, and the dispute-game client
-   (port of `party.move` / one-step building from `jobstate/dispute_test.go`).
-Milestone 4: metrics page. Milestone 5 (public) needs the user's decision.
+| Role | Where | What it does |
+|---|---|---|
+| provider (miner71) | box 71, GPU 1 | claims pool units, accepts client jobs, computes every stage, commits salted roots and the output root, uploads outputs, reveals, plays games, builds one-step proofs |
+| verifier0, verifier1 | box 71 GPU 2; 5090 | stake, then per seat: private salt, recompute the sampled stages, commit, reveal; play games they open |
+| watcher0 | 5090 | checks half of the jobs in their challenge window at one random stage |
+| watcher1 (fault injection) | 5090 | the same, but every check claims a root with one element flipped |
+| client0 | box 71 | posts embedding jobs over WikiText-2 and checks delivered outputs against `output_root` |
+| decoy0 + decoyclient | box 71, GPU 2 | forced errors: posts and accepts its own jobs with one wrong stage root, never defends |
+| curator | 5090 | reveals canary units of the canary category |
+
+Data service: `agent/data.py` on 192.168.29.71:18680, LAN only, for job inputs and outputs.
+The Python protocol helpers match Go (`TestAgentVectors`).
+
+**What ran on the real chain (real cuPOW blocks):**
+- **Pool and verification:**
+  - Pool units claimed by Merkle proof against the work list and computed: 7 stages of 128
+    tokens in about 44 s on a 3080.
+  - Committees drawn from stake. The 5090 verifier recomputed sampled stages and matched the
+    3080 provider bit for bit; cross-GPU determinism holds on live jobs.
+  - Requested stages revealed. The first pool unit settled and was paid at its epoch end.
+- **Client jobs:** outputs delivered off-chain; the client verified every one against its committed `output_root`.
+- **Watchers:** a check of an opened stage matched, so nothing was posted. Other checks went on chain.
+- **Games:** the lying watcher opened real bisection games over Qwen3-1.7B stage traces of about
+  76,000 leaves, played move by move by both agents.
+- **Forced errors:** the council's 2-of-3 commitment is on chain with a 0.6-coin reserve, and decoy jobs were posted and accepted.
+- **Canaries:** category `29b34b31…` (100 units, canaries at units 7, 15, 55, 71 and 95 among 20 leaves) opened by council0 and council2.
+- **Weights store:** `agent/weights_store.py` (2.6 GB) matches the registered weights root;
+  `uwcctl onestep` builds one-step proofs from it (`TestBuildOneStepDefeatsALyingChallenger`).
+
+**Problems the devnet found, and fixes:**
+
+1. **Pool categories could freeze (consensus; fixed in patch 0011).** After a dry spell, the
+   first delivered unit collected the whole accumulated budget (about 8,329 coins). Bonds were
+   sized against the last payout, so the next claim needed a 4,165-coin bond, and nobody could
+   claim. Bonds are now sized against min(last payout, the category's reference cost); the
+   withheld payout already deters cheating. Regression test `TestPoolBondAfterABigPayout`.
+2. **False slashes from agent liveness (operations).** All four honest-provider slashes so far
+   are operational:
+   - One provider missed a 10-block reply window while computing a 5-minute job
+     single-threaded. Fixed: jobs compute on a worker thread; replies come first.
+   - Three games were lost after both nodes were restarted at once. `pearld` doesn't persist
+     its mempool, so the provider's pending moves vanished, and the agent had marked them as
+     sent. Fixed: agents resend a move, reveal or commit the chain hasn't recorded after 3 blocks.
+
+   Rule for operators: restart nodes one at a time.
+
+   Protocol lesson: the silence rule ("a silent provider loses first") turns any lost
+   transaction into a slash. Reply windows in blocks shrink in wall time when hashrate rises
+   (38.5 s blocks at the moment). The testnet needs windows of 30+ blocks and agents that
+   rebroadcast.
+3. **Verification overhead is 1.9× the provider's compute, not the design's 0.4%.** Units have
+   only 7 stages (k·n/S = 4/7 even ideally), and verifiers recompute every earlier layer group
+   from the tokens instead of getting the stage input served (`DATA_REQUEST`). Testnet jobs need
+   S in the hundreds, and verifiers should fetch stage inputs.
+
+**More results (block 287):**
+- 11 jobs settled (84 stages), including a client job.
+- **A full dispute game on the live chain.** The lying watcher challenged client job `4d7d80b4`
+  at stage 9. The game ran about 17 bisection rounds over 76,320 leaves to leaf 28,146, then the
+  row's blocks, then element 10. The provider's one-step proof (`uwcctl onestep`, one proven
+  input row, weights from the store) was recomputed by every full node. The honest provider won,
+  the liar lost its bond, and the job settled. The proof was built by hand on the 5090 because
+  the running agent had a bug: in the one-step phase the chain leaves "provider moved" set from
+  the previous round. Fixed in the agent.
+- Four pool units paid; one category is drained and refilling; the canary category is being claimed.
+- Four decoys posted. One settled unnoticed (a missed decoy); three are in their windows. The
+  decoy runner reveals the forced-error record itself once all its decoys have ended, so jackpots
+  are paid without anyone stepping in.
+
+**Testnet metrics (snapshot, block 284; `agent/metrics.py`, page above):**
+
+| Metric | Value | Reading |
+|---|---|---|
+| False slashes | 4 of 4 failures | all operational (missed window, moves lost in a restart of both nodes); fixed in the agent |
+| Verification overhead | 2.4× provider compute (19 jobs) | 7-stage units and recompute-from-tokens; needs large S and served stage inputs |
+| Client price vs renting | 0.26× (1 job) | the test client's fee was below the provider's mining opportunity cost: a mispriced job, not a saving |
+| Useful share | 3.8 × 10⁻⁷ | tiny jobs; providers don't mine during jobs yet |
+| Network | 340 TMAC/s, 44.8 s blocks | 3080s at 61–66 TMAC/s each when not shared with agents |
+
+## Where to resume (2026-11-06, end of session)
+
+The devnet keeps running on its own: nodes, gateways, miners (box 71 GPUs 0 and 2, the 5090),
+and the agents. `devnet/up.sh` and `down.sh` start and stop a box; `agent.sh <role> <key>` runs a
+role. Restart nodes one at a time. Still due, all automatic:
+- canary units 7, 15, 55, 71 and 95 are claimed and revealed by the curator;
+- the remaining decoys end and the forced-error record is revealed (jackpots for whoever caught them);
+- the remaining client jobs settle.
+
+Rerun `python -m agent.metrics --json` on box 71 and refresh the page's datasets to update it.
+
+Next:
+1. Providers mine while serving: run jobs with mining on, with the block key from the gateway,
+   and submit winning tiles. This makes λ per job type a live metric.
+2. Verifiers fetch stage inputs (`DATA_REQUEST` and serve) instead of recomputing prefixes, and
+   jobs have hundreds of stages, so verification overhead approaches the design's k·n/S.
+3. Testnet parameters: reply windows of 30+ blocks; mempool persistence or rebroadcast in `pearld`.
+4. Milestone 5 (public) needs the user's decision on exposure, hosting and outside clients.
