@@ -219,6 +219,35 @@ The catch rate, 1 in 5, fits the odds for one wrong stage in 7 with two verifier
 stages each and a watcher checking half the jobs at one stage: about 0.49 + 0.51 × 0.5/7 ≈ 0.53
 per decoy. With five decoys the sample is far too small to test that.
 
+## Testnet fixes (2026-11-06, after the devnet was stopped)
+
+| Fix | State |
+|---|---|
+| Rule changes with activation heights | **done** (patch 0013): `Params.Upgrades` and `Params.At(height)`; code-level changes versioned by `Params.Rules` (bond basis = Rules 1). Tests: `TestUpgradesActivateAtHeight`, `TestRulesVersionGatesBondBasis` |
+| Fresh testnet with final rules | **done** (patch 0013): `--uwctestnet`, new genesis and magic, 30-block reply windows, 240-block challenge window, a new 2-of-3 council (keys in `~/.uwc/testnet/keys` on the laptop; should move to the user) |
+| Pending transactions survive restarts | **done** (patch 0013): `pearld` writes `mempool.dat` on shutdown and re-admits it on startup. Round-trip test; a live check is still to do |
+| Verifiers fetch stage inputs | **done** (agent): the provider keeps each later stage's input with Merkle proofs and opens the previous stage on request. Verifiers check it against the on-chain commitment and recompute one stage: 3.1 s instead of 15.8 s, same root; tampered rows are rejected |
+| Live metrics | **done** (agent): the data service serves `/` and `/metrics.json`, refreshed by `devnet/metrics.sh` |
+| Fast provider runtime | **partly done**: `detrt/fast.py` batches a job's sequences, copies each op's output once and hashes rows in parallel. Every row and root is identical to `run_stage` (`tests/test_fast.py`). The provider is 2.9× faster (6-sequence job: 134 s → 46 s) |
+
+**Profile of the reference runtime** (one 4-layer stage, 128 tokens, 3080 Ti, 3.24 s): 61% copying
+76,448 rows one at a time to the CPU, 28% emulated fp ops, 11% hashing, about 0% int8 GEMMs.
+
+**Finding: full-trace commitments cap λ.** Each stage root commits to every op's output: about
+76,000 rows and roughly 250 KB of trace per token-layer. Even hashed on a GPU at about 20 GB/s, that
+is roughly 25× the time of the int8 GEMMs it describes, so λ stays near or below 0.04 however fast
+the runtime is.
+
+Proposed protocol change, not yet made:
+- Providers commit only each stage's **output** rows. A full trace is computed and committed only
+  when a stage is disputed, bound to the committed input and output.
+- The bisection argument still holds: with input and output fixed, a wrong output forces a wrong
+  op somewhere in the trace.
+- Verifiers compare output roots, which is also cheaper.
+
+This changes `TRACE_COMMIT`, the verifier result hashes and the start of a dispute game
+(consensus), and the agents.
+
 ## Where to resume (2026-11-06, end of session)
 
 The devnet keeps running on its own: nodes, gateways, miners (box 71 GPUs 0 and 2, the 5090),

@@ -317,8 +317,7 @@ class Provider(Agent):
         mined0 = self.rt.miner.hashed if self.rt.miner else 0
         torch_sync()
         roots, embs, inputs = [], [], []
-        for toks in b:
-            r, e, ins = self.rt.batch_with_inputs(toks)
+        for r, e, ins in self.rt.job_with_inputs(b):
             roots += r
             embs.append(e)
             inputs.append(ins)

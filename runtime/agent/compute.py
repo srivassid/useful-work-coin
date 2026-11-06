@@ -96,6 +96,35 @@ class Runtime:
             del st
         return roots, pooled(x.numpy()), inputs
 
+    def job_with_inputs(self, batches: list[list[int]], chunk: int = 8):
+        """batch_with_inputs for a whole job, using the batched runtime (detrt.fast: same rows and
+        roots, about 3x faster per sequence-stage). Returns per-batch (roots, embedding, inputs)."""
+        from detrt.fast import run_stages
+        from detrt.stage import R2
+        from .proto import multi_proofs
+        if self.miner is not None:
+            self.miner.refresh()
+        out = []
+        for c0 in range(0, len(batches), chunk):
+            seqs = [torch.tensor(t, dtype=torch.long) for t in batches[c0:c0 + chunk]]
+            res = [([], {}) for _ in seqs]
+            xs = None
+            for g in range(self.G):
+                trs = run_stages(self.m, seqs if g == 0 else None, xs, g * self.lpg, (g + 1) * self.lpg)
+                for (roots, inputs), st in zip(res, trs):
+                    roots.append(st.root)
+                    if g + 1 < self.G:
+                        last = (g + 1) * self.lpg - 1
+                        idx = [i for _, i in sorted((lf.t, i) for i, lf in enumerate(st.leaves)
+                                                    if lf.op == R2 and lf.layer == last)]
+                        pr = multi_proofs(st.leaf_hashes, idx)
+                        inputs[g + 1] = {"rows": st.output.copy(), "idx": idx,
+                                         "proofs": [[h.hex() for h in pr[i]] for i in idx], "prev_leaves": len(st.leaves)}
+                xs = [torch.from_numpy(st.output) for st in trs]
+                del trs
+            out += [(roots, pooled(x.numpy()), inputs) for (roots, inputs), x in zip(res, xs)]
+        return out
+
     def stage_root_from_input(self, rows: np.ndarray, g: int) -> bytes:
         """One stage (layer group g >= 1) from its served input rows."""
         return run_stage(self.m, None, torch.from_numpy(rows), g * self.lpg, (g + 1) * self.lpg).root
