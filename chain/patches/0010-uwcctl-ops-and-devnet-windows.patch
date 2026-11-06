@@ -1,0 +1,249 @@
+From 69fcb3589b5f1d2d831ea08ae017284b2b7fe554 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 09:45:53 +0530
+Subject: [PATCH] uwcctl ops (generic JSON job operations); devnet challenge
+ window 60 blocks, unbonding 120
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/chaincfg/uwc_devnet.go |   3 +
+ node/cmd/uwcctl/main.go     |  19 ++++
+ node/cmd/uwcctl/opsjson.go  | 167 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 189 insertions(+)
+ create mode 100644 node/cmd/uwcctl/opsjson.go
+
+diff --git a/node/chaincfg/uwc_devnet.go b/node/chaincfg/uwc_devnet.go
+index c0586c73..703faa6f 100644
+--- a/node/chaincfg/uwc_devnet.go
++++ b/node/chaincfg/uwc_devnet.go
+@@ -37,6 +37,9 @@ func uwcDevNetJobParams() *jobstate.Params {
+ 		p.Council = append(p.Council, a)
+ 	}
+ 	p.CouncilThreshold = 2
++	// devnet timing: an hour of challenge window instead of a day, so jobs settle while we watch
++	p.ChallengeWindow = 60
++	p.UnbondDelay = 120
+ 	return &p
+ }
+ 
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index 8e8ce582..e16b1c64 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -9,6 +9,7 @@ import (
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"os"
+ 	"strconv"
+ 
+@@ -35,6 +36,7 @@ money
+   withdraw <key> <amount>             back to the key's own P2TR script (paid by a later coinbase)
+ 
+ jobs
++  ops <key> <ops.json|->               any job operations (JSON object or array, hex fields), one transaction
+   modelreg <key> <model.json>         register a model (weights_root, runtime_hash, layer_groups, block, cfg)
+   jobpost <key> <model> <input_root> <stages> <fee> <deadline_blocks> <k> <n> <seq_len>
+ 
+@@ -210,6 +212,23 @@ func main() {
+ 		need(args, 2)
+ 		k := key(args[0])
+ 		submit(k, nil, &jobstate.Op{Kind: jobstate.OpWithdraw, Amount: amount(args[1]), PkScript: k.Script})
++	case "ops":
++		need(args, 2)
++		var raw []byte
++		var err error
++		if args[1] == "-" {
++			raw, err = io.ReadAll(os.Stdin)
++		} else {
++			raw, err = os.ReadFile(args[1])
++		}
++		if err != nil {
++			die(err)
++		}
++		ops, err := parseOps(raw)
++		if err != nil {
++			die(err)
++		}
++		submit(key(args[0]), nil, ops...)
+ 	case "modelreg":
+ 		need(args, 2)
+ 		var m struct {
+diff --git a/node/cmd/uwcctl/opsjson.go b/node/cmd/uwcctl/opsjson.go
+new file mode 100644
+index 00000000..4e1a20a2
+--- /dev/null
++++ b/node/cmd/uwcctl/opsjson.go
+@@ -0,0 +1,167 @@
++package main
++
++import (
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++)
++
++// opJSON is the generic JSON form of a job operation (hashes and byte strings in hex), used by
++// `uwcctl ops` so that scripts and the devnet agent can send any operation.
++type opJSON struct {
++	Kind     string       `json:"kind"`
++	Amount   int64        `json:"amount"`
++	Job      string       `json:"job"`
++	Model    string       `json:"model"`
++	H1       string       `json:"h1"`
++	H2       string       `json:"h2"`
++	U1       uint32       `json:"u1"`
++	U2       uint32       `json:"u2"`
++	Deadline int32        `json:"deadline"`
++	K        uint8        `json:"k"`
++	N        uint8        `json:"n"`
++	Roots    []string     `json:"roots"`
++	Reveals  []revealJSON `json:"reveals"`
++	Proof    []string     `json:"proof"`
++	Data     string       `json:"data"`
++	PkScript string       `json:"pkscript"`
++	Inputs   []provenJSON `json:"inputs"`
++}
++
++type revealJSON struct {
++	Stage uint32   `json:"stage"`
++	Salt  string   `json:"salt"`
++	Root  string   `json:"root"`
++	Proof []string `json:"proof"`
++}
++
++type provenJSON struct {
++	Kind  uint8    `json:"kind"` // 1 leaf, 2 weight, 3 stage input row, 4 tokens
++	Op    uint8    `json:"op"`
++	Layer int      `json:"layer"`
++	T     int      `json:"t"`
++	H     int      `json:"h"`
++	Name  string   `json:"name"` // weight row name
++	Row   int      `json:"row"`
++	Index int      `json:"index"`
++	Words []uint32 `json:"words"`
++	Proof []string `json:"proof"`
++}
++
++func opKindByName(name string) (jobstate.OpKind, error) {
++	for k := jobstate.OpKind(1); k < 64; k++ {
++		if k.String() == name {
++			return k, nil
++		}
++	}
++	return 0, fmt.Errorf("unknown op kind %q", name)
++}
++
++func hexOpt(s string) (jobstate.Hash, error) {
++	var h jobstate.Hash
++	if s == "" {
++		return h, nil
++	}
++	b, err := hex.DecodeString(s)
++	if err != nil || len(b) != 32 {
++		return h, fmt.Errorf("expected 32 hex bytes: %q", s)
++	}
++	copy(h[:], b)
++	return h, nil
++}
++
++func hashes(ss []string) ([]jobstate.Hash, error) {
++	var out []jobstate.Hash
++	for _, s := range ss {
++		h, err := hexOpt(s)
++		if err != nil {
++			return nil, err
++		}
++		out = append(out, h)
++	}
++	return out, nil
++}
++
++func (j *opJSON) op() (*jobstate.Op, error) {
++	kind, err := opKindByName(j.Kind)
++	if err != nil {
++		return nil, err
++	}
++	o := &jobstate.Op{Kind: kind, Amount: j.Amount, U1: j.U1, U2: j.U2, Deadline: j.Deadline, K: j.K, N: j.N}
++	for _, f := range []struct {
++		s   string
++		dst *jobstate.Hash
++	}{{j.Job, &o.Job}, {j.Model, &o.Model}, {j.H1, &o.H1}, {j.H2, &o.H2}} {
++		if *f.dst, err = hexOpt(f.s); err != nil {
++			return nil, err
++		}
++	}
++	if o.Roots, err = hashes(j.Roots); err != nil {
++		return nil, err
++	}
++	if o.Proof, err = hashes(j.Proof); err != nil {
++		return nil, err
++	}
++	for _, r := range j.Reveals {
++		sr := jobstate.StageReveal{Stage: r.Stage}
++		if sr.Salt, err = hexOpt(r.Salt); err != nil {
++			return nil, err
++		}
++		if sr.Root, err = hexOpt(r.Root); err != nil {
++			return nil, err
++		}
++		if sr.Proof, err = hashes(r.Proof); err != nil {
++			return nil, err
++		}
++		o.Reveals = append(o.Reveals, sr)
++	}
++	for _, in := range j.Inputs {
++		pr := jobstate.ProvenRow{Kind: in.Kind, Index: in.Index, Words: in.Words}
++		switch in.Kind {
++		case jobstate.RowLeaf:
++			pr.Leaf = jobstate.LeafDesc{Op: in.Op, Layer: in.Layer, T: in.T, H: in.H}
++		case jobstate.RowWeight:
++			pr.W = jobstate.WeightRow{Name: in.Name, Layer: in.Layer, Row: in.Row}
++		}
++		if pr.Proof, err = hashes(in.Proof); err != nil {
++			return nil, err
++		}
++		o.Inputs = append(o.Inputs, pr)
++	}
++	if j.Data != "" {
++		if o.Data, err = hex.DecodeString(j.Data); err != nil {
++			return nil, err
++		}
++	}
++	if j.PkScript != "" {
++		if o.PkScript, err = hex.DecodeString(j.PkScript); err != nil {
++			return nil, err
++		}
++	}
++	if _, err := jobstate.DecodeOp(o.Encode()); err != nil {
++		return nil, fmt.Errorf("%s does not encode: %w", j.Kind, err)
++	}
++	return o, nil
++}
++
++func parseOps(raw []byte) ([]*jobstate.Op, error) {
++	var js []opJSON
++	if err := json.Unmarshal(raw, &js); err != nil {
++		var one opJSON
++		if err2 := json.Unmarshal(raw, &one); err2 != nil {
++			return nil, err
++		}
++		js = []opJSON{one}
++	}
++	var ops []*jobstate.Op
++	for i := range js {
++		o, err := js[i].op()
++		if err != nil {
++			return nil, err
++		}
++		ops = append(ops, o)
++	}
++	return ops, nil
++}
+-- 
+2.30.2
+

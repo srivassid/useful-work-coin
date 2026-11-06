@@ -71,3 +71,25 @@ Lessons:
     (`runtime/agent/worklist.py`) is 200 units, each 128 tokens of WikiText-2 test text with 7
     stages, and it gets 60% of pool income. The proposal sat at one approval until the second
     member approved; then the category opened and started collecting about 6 coins per block.
+
+## Where to resume (2026-11-06, session ended mid-milestone 3)
+
+Running on the devnet: both nodes, both gateways, 4 noise miners (all GPUs), height ~43.
+Patch 0010 adds `uwcctl ops <key> <json>` (any job op as JSON, hex fields) and shortens the
+devnet challenge window to 60 blocks (unbonding 120); nodes were redeployed with it.
+
+Milestone 3 plan (not started in code beyond `runtime/agent/{model_info,inputs,worklist}.py`):
+1. `agent/chain.py`: wrapper over `uwcctl` (queries, `ops`). Python ports of StageLeaf,
+   Positions, ResultHash (tag "pos", "result").
+2. `agent/data.py`: LAN-only HTTP data service on 192.168.29.71:18680 for job inputs
+   (`/inputs/<input_root>.json`) and outputs; output_root = Merkle root over row roots of each
+   batch's mean-pooled final hidden state.
+3. `agent/provider.py`: claim pool units / accept client jobs, run stages with detrt on a GPU
+   (stage = batch*G + group), commit salted stage roots, reveal requested stages, reveal in
+   GReveal. Take GPU1 on box 71 off noise mining for it.
+4. `agent/verifier.py`: stake, then for drawn seats pick a salt, recompute sampled stages from
+   tokens, VERIFY_COMMIT then VERIFY_REVEAL. Verifier keys still to generate and fund.
+5. `agent/client.py`: post jobs (WikiText chunks past the pool's 200 units), fetch and check outputs.
+6. Then watchers (CHALLENGE checks), canaries, FE decoys, and the dispute-game client
+   (port of `party.move` / one-step building from `jobstate/dispute_test.go`).
+Milestone 4: metrics page. Milestone 5 (public) needs the user's decision.
