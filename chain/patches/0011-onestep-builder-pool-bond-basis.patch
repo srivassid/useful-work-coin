@@ -1,0 +1,688 @@
+From e85df02d54cb57f0781887822489ef67cfe520d5 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 13:02:25 +0530
+Subject: [PATCH] One-step proofs for providers (BuildOneStep, uwcctl onestep),
+ pool bond basis capped at the reference unit cost, devnet agent vectors
+ (build step 7)
+
+- jobstate.BuildOneStep and FileWeights: a provider's ONE_STEP from its stage rows, the previous
+  stage's rows, the job's tokens and a weights store; tested against a lying challenger on the
+  tiny Qwen3 for both stage kinds.
+- Pool claims are bonded against min(last payout, InitPrice). On the devnet the first delivery
+  collected a large accumulated budget, and bonding new claims against that payout priced every
+  provider out (the category would freeze). The payout already deters cheating by itself.
+- getcategory/getjobstate report bondbasis and initprice; TestAgentVectors checks the agent's
+  Python helpers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/cmd/uwcctl/main.go                   |   4 +
+ node/cmd/uwcctl/onestep.go                | 126 ++++++++++++
+ node/jobstate/onestep.go                  | 228 ++++++++++++++++++++++
+ node/jobstate/pool.go                     |   9 +-
+ node/jobstate/pool_test.go                | 166 +++++++++++++++-
+ node/jobstate/testdata/agent_vectors.json |  30 +++
+ node/rpcjobs.go                           |   3 +-
+ 7 files changed, 563 insertions(+), 3 deletions(-)
+ create mode 100644 node/cmd/uwcctl/onestep.go
+ create mode 100644 node/jobstate/onestep.go
+ create mode 100644 node/jobstate/testdata/agent_vectors.json
+
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index e16b1c64..5f5075ba 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -37,6 +37,7 @@ money
+ 
+ jobs
+   ops <key> <ops.json|->               any job operations (JSON object or array, hex fields), one transaction
++  onestep <key> <request.json>        a provider's one-step proof for a game in its last round
+   modelreg <key> <model.json>         register a model (weights_root, runtime_hash, layer_groups, block, cfg)
+   jobpost <key> <model> <input_root> <stages> <fee> <deadline_blocks> <k> <n> <seq_len>
+ 
+@@ -229,6 +230,9 @@ func main() {
+ 			die(err)
+ 		}
+ 		submit(key(args[0]), nil, ops...)
++	case "onestep":
++		need(args, 2)
++		oneStep(args[0], args[1])
+ 	case "modelreg":
+ 		need(args, 2)
+ 		var m struct {
+diff --git a/node/cmd/uwcctl/onestep.go b/node/cmd/uwcctl/onestep.go
+new file mode 100644
+index 00000000..fa0ea953
+--- /dev/null
++++ b/node/cmd/uwcctl/onestep.go
+@@ -0,0 +1,126 @@
++package main
++
++import (
++	"encoding/binary"
++	"encoding/json"
++	"fmt"
++	"os"
++
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++)
++
++// oneStepReq is written by the devnet agent when a game it plays as provider reaches its last round.
++type oneStepReq struct {
++	Job      string     `json:"job"`
++	Model    string     `json:"model"`   // model json (agent.model_info): cfg, layer_groups
++	Weights  string     `json:"weights"` // weights store directory (agent.weights_store)
++	Rows     string     `json:"rows"`    // this stage's trace rows
++	PrevRows string     `json:"prev_rows"`
++	Batches  [][]uint32 `json:"batches"` // the job's token batches
++	Salts    []string   `json:"salts"`   // the provider's stage salts and roots
++	Roots    []string   `json:"roots"`
++}
++
++func readRows(path string) ([][]uint32, error) {
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	if len(b) < 4 {
++		return nil, fmt.Errorf("%s: short", path)
++	}
++	n := binary.LittleEndian.Uint32(b)
++	p := 4
++	rows := make([][]uint32, 0, n)
++	for i := uint32(0); i < n; i++ {
++		if p+4 > len(b) {
++			return nil, fmt.Errorf("%s: truncated", path)
++		}
++		w := int(binary.LittleEndian.Uint32(b[p:]))
++		p += 4
++		if p+4*w > len(b) {
++			return nil, fmt.Errorf("%s: truncated row %d", path, i)
++		}
++		r := make([]uint32, w)
++		for k := range r {
++			r[k] = binary.LittleEndian.Uint32(b[p+4*k:])
++		}
++		p += 4 * w
++		rows = append(rows, r)
++	}
++	return rows, nil
++}
++
++func oneStep(keyPath, reqPath string) {
++	raw, err := os.ReadFile(reqPath)
++	if err != nil {
++		die(err)
++	}
++	var req oneStepReq
++	if err := json.Unmarshal(raw, &req); err != nil {
++		die(err)
++	}
++	var mi struct {
++		LayerGroups int               `json:"layer_groups"`
++		Cfg         jobstate.ModelCfg `json:"cfg"`
++	}
++	raw, err = os.ReadFile(req.Model)
++	if err != nil {
++		die(err)
++	}
++	if err := json.Unmarshal(raw, &mi); err != nil {
++		die(err)
++	}
++	c := client()
++	var job struct {
++		Game *struct {
++			Stage uint32 `json:"stage"`
++			Phase uint8  `json:"phase"`
++			Leaf  int    `json:"leaf"`
++			Elem  int    `json:"elem"`
++		} `json:"game"`
++	}
++	if err := c.Query("getjob", &job, req.Job); err != nil {
++		die(err)
++	}
++	if job.Game == nil || job.Game.Phase != jobstate.GOneStep {
++		die(fmt.Errorf("job %s is not waiting for a one-step proof", req.Job))
++	}
++	g := job.Game
++	w, err := jobstate.OpenFileWeights(req.Weights, mi.Cfg)
++	if err != nil {
++		die(err)
++	}
++	rows, err := readRows(req.Rows)
++	if err != nil {
++		die(err)
++	}
++	in := jobstate.OneStepInput{Cfg: mi.Cfg, LayerGroups: mi.LayerGroups, Stage: g.Stage, Leaf: g.Leaf, Elem: g.Elem,
++		Rows: rows, Weights: w}
++	b := int(g.Stage) / mi.LayerGroups
++	if b >= len(req.Batches) {
++		die(fmt.Errorf("stage %d: no batch %d", g.Stage, b))
++	}
++	in.Tokens = req.Batches[b]
++	for i, toks := range req.Batches {
++		in.InputLeaves = append(in.InputLeaves, jobstate.TokenLeaf(i, jobstate.RowRoot(toks)))
++	}
++	for i := range req.Salts {
++		in.StageLeaves = append(in.StageLeaves, jobstate.StageLeaf(uint32(i), hash32(req.Salts[i]), hash32(req.Roots[i])))
++	}
++	if int(g.Stage)%mi.LayerGroups > 0 {
++		if in.PrevRows, err = readRows(req.PrevRows); err != nil {
++			die(err)
++		}
++		p := g.Stage - 1
++		in.PrevReveal = &jobstate.StageReveal{Stage: p, Salt: hash32(req.Salts[p]), Root: hash32(req.Roots[p]),
++			Proof: jobstate.MerkleProof(in.StageLeaves, int(p))}
++	}
++	o, v, err := jobstate.BuildOneStep(in)
++	if err != nil {
++		die(err)
++	}
++	o.Job = hash32(req.Job)
++	fmt.Fprintf(os.Stderr, "one-step: stage %d leaf %d elem %d -> %08x, %d proven rows\n", g.Stage, g.Leaf, g.Elem, v, len(o.Inputs))
++	submit(key(keyPath), nil, o)
++}
+diff --git a/node/jobstate/onestep.go b/node/jobstate/onestep.go
+new file mode 100644
+index 00000000..2b7ee919
+--- /dev/null
++++ b/node/jobstate/onestep.go
+@@ -0,0 +1,228 @@
++package jobstate
++
++import (
++	"encoding/binary"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++)
++
++// One-step proofs for providers (build step 7): the last round of a dispute game, in which the
++// provider supplies every row the referee reads to recompute the disputed element, each with a
++// Merkle proof against a commitment (this stage's trace, the previous stage's trace, the
++// weights tree or the job's input tree).
++
++// WeightStore serves canonical weight rows and the weights-tree leaves.
++type WeightStore interface {
++	Row(w WeightRow) ([]uint32, error)
++	Leaves() []Hash
++}
++
++// FileWeights reads the store written by runtime/agent/weights_store.py.
++type FileWeights struct {
++	cfg    ModelCfg
++	f      *os.File
++	off    []uint64
++	leaves []Hash
++}
++
++func OpenFileWeights(dir string, cfg ModelCfg) (*FileWeights, error) {
++	f, err := os.Open(filepath.Join(dir, "rows.bin"))
++	if err != nil {
++		return nil, err
++	}
++	rawOff, err := os.ReadFile(filepath.Join(dir, "offsets.bin"))
++	if err != nil {
++		return nil, err
++	}
++	rawLv, err := os.ReadFile(filepath.Join(dir, "leaves.bin"))
++	if err != nil {
++		return nil, err
++	}
++	w := &FileWeights{cfg: cfg, f: f}
++	for i := 0; i+8 <= len(rawOff); i += 8 {
++		w.off = append(w.off, binary.LittleEndian.Uint64(rawOff[i:]))
++	}
++	for i := 0; i+32 <= len(rawLv); i += 32 {
++		var h Hash
++		copy(h[:], rawLv[i:])
++		w.leaves = append(w.leaves, h)
++	}
++	if len(w.off) != len(w.leaves)+1 {
++		return nil, fmt.Errorf("weights store: %d offsets for %d rows", len(w.off), len(w.leaves))
++	}
++	return w, nil
++}
++
++func (w *FileWeights) Leaves() []Hash { return w.leaves }
++
++func (w *FileWeights) Row(wr WeightRow) ([]uint32, error) {
++	i, n, err := w.cfg.weightIndex(wr)
++	if err != nil {
++		return nil, err
++	}
++	if i+1 >= len(w.off) {
++		return nil, fmt.Errorf("weight row %d not in store", i)
++	}
++	b := make([]byte, w.off[i+1]-w.off[i])
++	if _, err := w.f.ReadAt(b, int64(w.off[i])); err != nil && err != io.EOF {
++		return nil, err
++	}
++	out := make([]uint32, n)
++	switch wr.Name {
++	case "qkv", "o", "gu", "down": // int8 values, then the fp32 scale bits
++		if len(b) != n-1+4 {
++			return nil, fmt.Errorf("linear row %+v: %d bytes, want %d", wr, len(b), n+3)
++		}
++		for k := 0; k < n-1; k++ {
++			out[k] = uint32(int32(int8(b[k])))
++		}
++		out[n-1] = binary.LittleEndian.Uint32(b[n-1:])
++	default:
++		if len(b) != 4*n {
++			return nil, fmt.Errorf("row %+v: %d bytes, want %d", wr, len(b), 4*n)
++		}
++		for k := range out {
++			out[k] = binary.LittleEndian.Uint32(b[4*k:])
++		}
++	}
++	return out, nil
++}
++
++// readRecorder serves rows from memory and notes which ones the referee reads.
++type readRecorder struct {
++	mem     *MemSource
++	weights WeightStore
++	leaves  []LeafDesc
++	wrows   []WeightRow
++	inputs  []int
++	tokens  bool
++}
++
++func (r *readRecorder) Leaf(d LeafDesc) ([]uint32, error) {
++	r.leaves = append(r.leaves, d)
++	return r.mem.Leaf(d)
++}
++
++func (r *readRecorder) Weight(w WeightRow) ([]uint32, error) {
++	r.wrows = append(r.wrows, w)
++	return r.weights.Row(w)
++}
++
++func (r *readRecorder) StageInput(t int) ([]uint32, error) {
++	r.inputs = append(r.inputs, t)
++	return r.mem.StageInput(t)
++}
++
++func (r *readRecorder) Tokens() ([]uint32, error) { r.tokens = true; return r.mem.Tokens() }
++
++// OneStepInput is what a provider has when a game reaches its last round.
++type OneStepInput struct {
++	Cfg         ModelCfg
++	LayerGroups int
++	Stage       uint32
++	Leaf, Elem  int
++	Rows        [][]uint32 // this stage's trace rows, in program order
++	PrevRows    [][]uint32 // the previous stage's trace rows (layer group > 0)
++	Tokens      []uint32   // this batch's tokens
++	InputLeaves []Hash     // the job's input tree leaves (TokenLeaf per batch)
++	StageLeaves []Hash     // the provider's salted stage commitment leaves
++	PrevReveal  *StageReveal
++	Weights     WeightStore
++}
++
++// BuildOneStep returns the ONE_STEP op (Job unset) proving element Elem of leaf Leaf. It also
++// returns the value the referee will compute, which should equal the provider's own.
++func BuildOneStep(in OneStepInput) (*Op, uint32, error) {
++	G := in.LayerGroups
++	b, grp := int(in.Stage)/G, int(in.Stage)%G
++	lpg := in.Cfg.L / G
++	T := len(in.Tokens)
++	st := Stage{Cfg: in.Cfg, T: T, L0: grp * lpg, L1: (grp + 1) * lpg}
++	prog := Program(in.Cfg, T, st.L0, st.L1)
++	if len(in.Rows) != len(prog) {
++		return nil, 0, fmt.Errorf("stage has %d rows, program %d", len(in.Rows), len(prog))
++	}
++	if in.Leaf < 0 || in.Leaf >= len(prog) {
++		return nil, 0, fmt.Errorf("leaf %d out of range", in.Leaf)
++	}
++	mem := &MemSource{Toks: in.Tokens, Leaves: map[LeafDesc][]uint32{}}
++	for i, d := range prog {
++		mem.Leaves[d] = in.Rows[i]
++	}
++	var prevIdx programIndex
++	if grp > 0 {
++		pp := Program(in.Cfg, T, st.L0-lpg, st.L0)
++		if len(in.PrevRows) != len(pp) {
++			return nil, 0, fmt.Errorf("previous stage has %d rows, program %d", len(in.PrevRows), len(pp))
++		}
++		prevIdx = indexProgram(pp)
++		for t := 0; t < T; t++ {
++			mem.Input = append(mem.Input, in.PrevRows[prevIdx[LeafDesc{LR2, st.L0 - 1, t, -1}]])
++		}
++	}
++	rec := &readRecorder{mem: mem, weights: in.Weights}
++	v, err := st.Recompute(prog[in.Leaf], in.Elem, rec)
++	if err != nil {
++		return nil, 0, err
++	}
++	leafHashes := make([]Hash, len(in.Rows))
++	for i, r := range in.Rows {
++		leafHashes[i] = TraceLeaf(i, RowRoot(r))
++	}
++	idx := indexProgram(prog)
++	o := &Op{Kind: OpOneStep}
++	seen := map[string]bool{}
++	for _, d := range rec.leaves {
++		k := fmt.Sprint("l", d)
++		if seen[k] {
++			continue
++		}
++		seen[k] = true
++		i := idx[d]
++		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowLeaf, Leaf: d, Words: in.Rows[i], Proof: MerkleProof(leafHashes, i)})
++	}
++	wl := in.Weights.Leaves()
++	for _, wr := range rec.wrows {
++		k := fmt.Sprint("w", wr)
++		if seen[k] {
++			continue
++		}
++		seen[k] = true
++		i, _, err := in.Cfg.weightIndex(wr)
++		if err != nil {
++			return nil, 0, err
++		}
++		row, err := in.Weights.Row(wr)
++		if err != nil {
++			return nil, 0, err
++		}
++		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowWeight, W: wr, Words: row, Proof: MerkleProof(wl, i)})
++	}
++	if len(rec.inputs) > 0 {
++		prevLeaves := make([]Hash, len(in.PrevRows))
++		for i, r := range in.PrevRows {
++			prevLeaves[i] = TraceLeaf(i, RowRoot(r))
++		}
++		for _, t := range rec.inputs {
++			k := fmt.Sprint("i", t)
++			if seen[k] {
++				continue
++			}
++			seen[k] = true
++			i := prevIdx[LeafDesc{LR2, st.L0 - 1, t, -1}]
++			o.Inputs = append(o.Inputs, ProvenRow{Kind: RowInput, Index: t, Words: mem.Input[t], Proof: MerkleProof(prevLeaves, i)})
++		}
++	}
++	if rec.tokens {
++		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowTokens, Index: b, Words: in.Tokens, Proof: MerkleProof(in.InputLeaves, b)})
++	}
++	if grp > 0 {
++		if in.PrevReveal == nil {
++			return nil, 0, fmt.Errorf("the previous stage must be opened")
++		}
++		o.Reveals = []StageReveal{*in.PrevReveal}
++	}
++	return o, v, nil
++}
+diff --git a/node/jobstate/pool.go b/node/jobstate/pool.go
+index da279562..af4c68cd 100644
+--- a/node/jobstate/pool.go
++++ b/node/jobstate/pool.go
+@@ -254,6 +254,13 @@ func (s *State) poolRetire(o *Op) error {
+ 	return nil
+ }
+ 
++// BondBasis is the amount a claim's bond is sized against: the last per-unit payout, but never
++// more than the council's reference unit cost (InitPrice). The bond only has to cover what the
++// withheld payout does not (F + B >= S c): a payout far above cost, as after a dry spell when
++// one unit collects the accumulated budget, already deters cheating by itself, and basing the
++// bond on it would price every provider out and freeze the category (seen on the devnet).
++func (c *Category) BondBasis() Amount { return min(c.Price, c.Spec.InitPrice) }
++
+ // poolVerifierPay is escrowed from the category budget when a unit is claimed.
+ func poolVerifierPay(p Params, c *CategorySpec) Amount {
+ 	return Amount(int(c.K)*int(c.N)) * p.VerifierFloorPerSample
+@@ -278,7 +285,7 @@ func (s *State) poolClaim(p Params, h int32, o *Op) error {
+ 	if !VerifyMerkleProof(c.Spec.WorkRoot, UnitLeaf(o.U1, o.H1), int(o.U1), int(c.Spec.Units), o.Proof) {
+ 		return errors.New("input root is not this unit of the work list")
+ 	}
+-	if o.Amount < minBond(p, c.Price) {
++	if o.Amount < minBond(p, c.BondBasis()) {
+ 		return errors.New("bond below minimum")
+ 	}
+ 	vp := poolVerifierPay(p, &c.Spec)
+diff --git a/node/jobstate/pool_test.go b/node/jobstate/pool_test.go
+index c2ee77ac..ca24b0d5 100644
+--- a/node/jobstate/pool_test.go
++++ b/node/jobstate/pool_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"encoding/json"
++	"fmt"
+ 	"os"
+ 	"testing"
+ )
+@@ -61,7 +62,7 @@ func (w *poolWorld) openCategory(sp CategorySpec) Hash {
+ func (w *poolWorld) claimOp(cat Hash, prov AccountID, unit int) *Op {
+ 	c := w.st.Categories[cat]
+ 	return &Op{Kind: OpPoolClaim, Actor: prov, Job: cat, U1: uint32(unit), H1: w.inputs[unit],
+-		Proof: MerkleProof(w.wleaves, unit), Amount: minBond(w.p, c.Price), Ref: w.ref()}
++		Proof: MerkleProof(w.wleaves, unit), Amount: minBond(w.p, c.BondBasis()), Ref: w.ref()}
+ }
+ 
+ // runUnit claims a unit, commits tr, lets the committee verify honestly against truth, and
+@@ -1138,3 +1139,166 @@ func TestLargeJobsNeedLargerCommittees(t *testing.T) {
+ 		t.Fatal(r.OpErrors[0])
+ 	}
+ }
++
++// TestAgentVectors checks the devnet agent's Python protocol helpers (runtime/agent/proto.py):
++// sampled positions, salted stage commitments and reveals, verifier result hashes.
++func TestAgentVectors(t *testing.T) {
++	raw, err := os.ReadFile("testdata/agent_vectors.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var v struct {
++		P20, P5, P1000 []uint32
++		StageRoot      string `json:"stage_root"`
++		Reveal3        struct {
++			Stage      uint32
++			Salt, Root string
++			Proof      []string
++		} `json:"reveal3"`
++		Result string `json:"result"`
++	}
++	var m map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &m); err != nil {
++		t.Fatal(err)
++	}
++	json.Unmarshal(m["positions_20_3"], &v.P20)
++	json.Unmarshal(m["positions_5_9"], &v.P5)
++	json.Unmarshal(m["positions_1000_2"], &v.P1000)
++	json.Unmarshal(raw, &v)
++	salt := tagHash("salt")
++	eq := func(a, b []uint32) bool { return fmt.Sprint(a) == fmt.Sprint(b) }
++	if !eq(Positions(salt, 20, 3), v.P20) || !eq(Positions(salt, 5, 9), v.P5) || !eq(Positions(salt, 1000, 2), v.P1000) {
++		t.Fatalf("positions differ: %v %v %v", Positions(salt, 20, 3), Positions(salt, 5, 9), Positions(salt, 1000, 2))
++	}
++	var roots, leaves []Hash
++	for i := uint32(0); i < 5; i++ {
++		r, s := tagHash("root", u32b(i)), tagHash("s", u32b(i))
++		roots = append(roots, r)
++		leaves = append(leaves, StageLeaf(i, s, r))
++	}
++	sr := MerkleRoot(leaves)
++	if hex.EncodeToString(sr[:]) != v.StageRoot {
++		t.Fatal("stage root differs")
++	}
++	var proof []Hash
++	for _, p := range v.Reveal3.Proof {
++		var h Hash
++		b, _ := hex.DecodeString(p)
++		copy(h[:], b)
++		proof = append(proof, h)
++	}
++	if !VerifyMerkleProof(sr, leaves[3], 3, 5, proof) {
++		t.Fatal("reveal proof from the agent does not verify")
++	}
++	acct := AccountID(tagHash("acct"))
++	if rh := ResultHash(roots[:3], acct, salt); hex.EncodeToString(rh[:]) != v.Result {
++		t.Fatal("result hash differs")
++	}
++}
++
++// memWeights is an in-memory WeightStore for the tiny model.
++type memWeights struct {
++	tm *tinyModel
++}
++
++func (m memWeights) Row(w WeightRow) ([]uint32, error) {
++	r, ok := m.tm.weights[w]
++	if !ok {
++		return nil, fmt.Errorf("no weight row %+v", w)
++	}
++	return r, nil
++}
++func (m memWeights) Leaves() []Hash { return m.tm.wleaves }
++
++// TestBuildOneStepDefeatsALyingChallenger: an honest provider plays a lying watcher to the
++// last round and proves the element with BuildOneStep (the devnet agent's path).
++func TestBuildOneStepDefeatsALyingChallenger(t *testing.T) {
++	tm := loadTiny(t)
++	for _, stage := range []uint32{0, 3} { // first layer group (tokens) and second (stage input)
++		w, cat, _, _ := tinyPool(t, tm, 610+uint64(stage), nil)
++		prov := tm.newParty(t, acct(74), tm.weights, tm.tokens, nil, nil)
++		id, salts, sl := commitUnit(t, w, cat, prov)
++		liar := acct(83)
++		prog := Program(tm.cfg, len(tm.tokens[0]), int(stage%2), int(stage%2)+1)
++		chal := tm.newParty(t, liar, tm.weights, tm.tokens, corruptAt(stage, len(prog)/3, 7), nil)
++		mustOK(t, w.block([]Deposit{{liar, 1e8}}, []*Op{{Kind: OpChallenge, Actor: liar, Job: id, U1: stage,
++			H1: chal.root(stage), Amount: w.p.ChallengeBondMin}}, nil))
++		il, _ := tm.inputTree()
++		steps := 0
++		for i := 0; i < 3000 && w.st.Jobs[id].Status == StatusDisputed; i++ {
++			j := w.st.Jobs[id]
++			var ops []*Op
++			if g := j.Game; g != nil {
++				switch g.Phase {
++				case GReveal:
++					ops = append(ops, &Op{Kind: OpTraceReveal, Actor: prov.acct, Job: id, Reveals: []StageReveal{
++						{Stage: g.Stage, Salt: salts[g.Stage], Root: prov.root(g.Stage), Proof: MerkleProof(sl, int(g.Stage))}}})
++				case GOneStep:
++					b := int(g.Stage) / 2
++					in := OneStepInput{Cfg: tm.cfg, LayerGroups: 2, Stage: g.Stage, Leaf: g.Leaf, Elem: g.Elem,
++						Rows: prov.rows[g.Stage], Tokens: prov.tokens[b], InputLeaves: il, StageLeaves: sl,
++						Weights: memWeights{tm}}
++					if g.Stage%2 == 1 {
++						in.PrevRows = prov.rows[g.Stage-1]
++						in.PrevReveal = &StageReveal{Stage: g.Stage - 1, Salt: salts[g.Stage-1], Root: prov.root(g.Stage - 1),
++							Proof: MerkleProof(sl, int(g.Stage-1))}
++					}
++					o, v, err := BuildOneStep(in)
++					if err != nil {
++						t.Fatal(err)
++					}
++					if v != g.PWord {
++						t.Fatalf("one-step value %08x, provider's word %08x", v, g.PWord)
++					}
++					o.Actor, o.Job = prov.acct, id
++					ops = append(ops, o)
++					steps++
++				default:
++					if !g.PMoved {
++						ops = append(ops, prov.move(tm, j, g))
++					}
++					if !g.CMoved {
++						ops = append(ops, chal.move(tm, j, g))
++					}
++				}
++			}
++			res := w.block(nil, ops, nil)
++			for k, o := range ops {
++				if o.Kind == OpOneStep && res.OpErrors[k] != nil {
++					t.Fatalf("stage %d: ONE_STEP rejected: %v", stage, res.OpErrors[k])
++				}
++			}
++		}
++		j := w.st.Jobs[id]
++		if steps != 1 || j.Status == StatusFailed || j.Status == StatusDisputed {
++			t.Fatalf("stage %d: status %v after %d one-step proofs", stage, j.Status, steps)
++		}
++	}
++}
++
++// TestPoolBondAfterABigPayout: after one unit collects a large accumulated budget, new claims
++// are still bonded against the reference cost, so providers are not priced out.
++func TestPoolBondAfterABigPayout(t *testing.T) {
++	w := newPoolWorld(t, 520, 3)
++	w.p.PoolEpoch = 200
++	w.income = 50_000_000_000 // large income: the first delivery collects a big budget
++	cat := w.openCategory(w.spec(4))
++	prov := acct(75)
++	w.block([]Deposit{{prov, 1e9}}, nil, nil)
++	tr := w.newTrace(8)
++	id := w.runUnit(cat, prov, 0, tr, tr)
++	for w.st.Jobs[id].Status != StatusSettled {
++		w.block(nil, nil, nil)
++	}
++	w.runTo(w.nextEpochEnd())
++	c := w.st.Categories[cat]
++	if c.Price <= 100*c.Spec.InitPrice {
++		t.Fatalf("expected a big payout, price %d", c.Price)
++	}
++	w.block(nil, nil, nil)
++	o := w.claimOp(cat, prov, 1) // bond from claimOp uses Price; set it to the reference basis
++	o.Amount = minBond(w.p, c.Spec.InitPrice)
++	if r := w.block(nil, []*Op{o}, nil); r.OpErrors[0] != nil {
++		t.Fatalf("claim bonded against the reference cost rejected: %v", r.OpErrors[0])
++	}
++}
+diff --git a/node/jobstate/testdata/agent_vectors.json b/node/jobstate/testdata/agent_vectors.json
+new file mode 100644
+index 00000000..69d95b65
+--- /dev/null
++++ b/node/jobstate/testdata/agent_vectors.json
+@@ -0,0 +1,30 @@
++{
++ "positions_20_3": [
++  7,
++  9,
++  12
++ ],
++ "positions_5_9": [
++  0,
++  1,
++  2,
++  3,
++  4
++ ],
++ "positions_1000_2": [
++  72,
++  392
++ ],
++ "stage_root": "5e6829b3ccc07739d0d810bff1b5909c0e7e2b791ab518767ddf559c2c526632",
++ "reveal3": {
++  "stage": 3,
++  "salt": "f1031e0fcc7865b95b3da2c846144ef8ea091d92ea95de0fdb9c266dce172e17",
++  "root": "cbc4b630176ccc3841367fe3507293a183c99191b4b8acf93a7be0d927b620c0",
++  "proof": [
++   "800ae54217250f189c32d6515b6a19a1ac9d5b49468e4edb567d9434e8592f8c",
++   "9789f450c0854889dc932b16b5b8d5471b0a313ed408c4452cbcd4a313ff0a64",
++   "d45329395fe0da120a76f75c333c170865e01fc86583fc5b2a8bd1509b0994e6"
++  ]
++ },
++ "result": "8b1e7a9de9266e5035247357045127448600b8dde12c9aa5b2cbc566a1479fda"
++}
+\ No newline at end of file
+diff --git a/node/rpcjobs.go b/node/rpcjobs.go
+index a38d3621..68412a7b 100644
+--- a/node/rpcjobs.go
++++ b/node/rpcjobs.go
+@@ -125,7 +125,8 @@ func categorySummary(c *jobstate.Category) map[string]interface{} {
+ 		"model": hx(sp.Model[:]), "workroot": hx(sp.WorkRoot[:]), "units": sp.Units, "stagesperunit": sp.StagesPerUnit,
+ 		"seqlen": sp.SeqLen, "k": sp.K, "n": sp.N, "unitdeadline": sp.UnitDeadline, "capbp": sp.CapBP,
+ 		"curator": hx(sp.Curator[:]), "canaryleaves": sp.CanaryLeaves,
+-		"budget": c.Budget, "price": c.Price, "retired": c.Retired, "closed": c.Closed,
++		"budget": c.Budget, "price": c.Price, "bondbasis": c.BondBasis(), "initprice": sp.InitPrice,
++		"retired": c.Retired, "closed": c.Closed,
+ 		"inflight": c.InFlight, "done": c.Done, "epochdeliveries": len(c.Epoch),
+ 	}
+ }
+-- 
+2.30.2
+
