@@ -157,10 +157,10 @@ class Agent:
         d = os.path.join(self.a.devnet, "agent", "onestep", j["id"][:16])
         os.makedirs(d, exist_ok=True)
         req = {"job": j["id"], "model": self.a.model, "weights": self.a.weights, "rows": os.path.join(d, "rows.bin"),
-               "prev_rows": "", "batches": b, "salts": js["salts"], "roots": js["roots"]}
+               "prev_outputs": "", "batches": b, "salts": js["salts"], "roots": js["roots"]}
         if g["stage"] % self.G:
-            write_rows(os.path.join(d, "prev.bin"), self.rt.trace(b, g["stage"] - 1).rows)
-            req["prev_rows"] = os.path.join(d, "prev.bin")
+            write_rows(os.path.join(d, "prev.bin"), list(self.rt.stage_output(b, g["stage"] - 1)))
+            req["prev_outputs"] = os.path.join(d, "prev.bin")
         write_rows(req["rows"], self.rt.trace(b, g["stage"]).rows)
         json.dump(req, open(os.path.join(d, "req.json"), "w"))
         try:
@@ -317,7 +317,7 @@ class Provider(Agent):
         mined0 = self.rt.miner.hashed if self.rt.miner else 0
         torch_sync()
         roots, embs, inputs = [], [], []
-        for r, e, ins in self.rt.job_with_inputs(b):
+        for r, e, ins in self.rt.job_outputs(b):
             roots += r
             embs.append(e)
             inputs.append(ins)
@@ -350,8 +350,8 @@ class Provider(Agent):
         for b, ins in enumerate(inputs):
             for g, pk in ins.items():
                 stage = b * self.G + g
-                doc = {"stage": stage, "shape": list(pk["rows"].shape), "idx": pk["idx"], "proofs": pk["proofs"],
-                       "prev_leaves": pk["prev_leaves"], "reveal": sc.reveal(stage - 1),
+                doc = {"stage": stage, "shape": list(pk["rows"].shape), "proofs": pk["proofs"],
+                       "reveal": sc.reveal(stage - 1),
                        "rows": base64.b64encode(pk["rows"].astype("<f4").tobytes()).decode()}
                 with open(os.path.join(d, f"{stage}.json"), "w") as f:
                     json.dump(doc, f)
@@ -462,7 +462,7 @@ class Verifier(Agent):
             if raw:
                 try:
                     pkg = json.loads(raw)
-                    rows = check_stage_input(pkg, stage, bytes.fromhex(j["stageroot"]), j["stages"], pkg["prev_leaves"])
+                    rows = check_stage_input(pkg, stage, bytes.fromhex(j["stageroot"]), j["stages"])
                 except Exception as e:
                     log(f"{j['id'][:8]} stage {stage}: served input rejected ({e}); recomputing the prefix")
                     return None
@@ -499,13 +499,17 @@ class Watcher(Agent):
             stage = rng.randrange(j["stages"])
             t = time.time()
             root = self.rt.stage_root(b, stage).hex()
-            if rng.random() < self.a.lie:  # fault injection: claim a root with one element flipped
+            if rng.random() < self.a.lie:  # fault injection: claim an output root with one element flipped
+                from .game import split
+                from .proto import stage_output_root
                 tr = self.rt.trace(b, stage)
-                leaf = rng.randrange(len(tr.rows))
-                elem = rng.randrange(len(tr.rows[leaf]))
+                _, out_at, _, _ = split(tr)
+                t = rng.randrange(len(out_at))
+                leaf, elem = out_at[t], rng.randrange(len(tr.rows[out_at[t]]))
                 js["lie"] = [leaf, elem]
-                root = self.corrupted(tr, leaf, elem).root.hex()
-                log(f"lying about {jid[:8]} stage {stage}: leaf {leaf} elem {elem}")
+                bad = self.corrupted(tr, leaf, elem)
+                root = stage_output_root([bad.rows[i] for i in out_at]).hex()
+                log(f"lying about {jid[:8]} stage {stage}: output row {t} elem {elem}")
             js.update(stage=stage, root=root, computed=round(time.time() - t, 1))
             opened = {r["stage"]: r["root"] for r in j.get("revealed") or []}
             if opened.get(stage) == root:

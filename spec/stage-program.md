@@ -79,3 +79,24 @@ A committee member may request the input of a stage with g > 0 while verificatio
 provider must post every input row, each proven against the opened previous stage root, within
 `ServeWindow`, or fail (bond ½ to the requester). Verification phases wait for pending requests
 and then allow a full window.
+
+## Step 7 change: stages are committed by their outputs
+
+The per-stage roots in `TRACE_COMMIT` (and in verifiers' commit-reveal) are now **output roots**:
+`StageOutputRoot = MerkleRoot(StageOutLeaf(t, RowRoot(row_t)))` over the stage's T output rows
+(the last layer's R2 rows, by token); `StageOutLeaf = sha256(0x00 ‖ "sout" ‖ u32 t ‖ row_root)`.
+Providers and verifiers compute only the forward pass.
+
+A full trace is built only when a stage is disputed. The game opens with a **top round**
+(phase 7):
+- Each party posts `(BodyRoot, OutputRoot)` of its trace. The body is every program leaf except
+  the output rows, in program order, as `TraceLeaf(body index, row_root)`.
+- The posted output root must equal the one the party committed.
+- If the body roots differ, play bisects the body tree; otherwise it bisects the output tree
+  (the outputs must differ). The rest is unchanged: leaf, row blocks, one element, one-step proof.
+- One-step inputs from the stage are proven in the provider's body tree.
+- Stage-input rows (one-step proofs and `DATA_SERVE`) are proven against the previous stage's
+  output root, at index t.
+
+A deviation that int8 quantization absorbs leaves every output unchanged; it is not a wrong
+commitment and is not penalized.

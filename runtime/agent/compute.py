@@ -8,7 +8,7 @@ import time
 import numpy as np
 import torch
 
-from detrt.stage import run_stage
+from detrt.stage import merkle_root, run_stage
 
 from .model_info import load
 from .proto import pooled
@@ -29,30 +29,59 @@ class Runtime:
         self.cache: dict[tuple, tuple[list[bytes], np.ndarray]] = {}
         print(f"runtime: {info['model_dir']} on {device} in {time.time() - t:.0f}s", flush=True)
 
-    def batch(self, tokens: list[int], upto: int | None = None) -> tuple[list[bytes], np.ndarray | None]:
-        """Roots of groups 0..upto (default all) for one sequence, and the pooled output if all ran."""
+    def outputs(self, seqs: list[list[int]], upto: int | None = None, chunk: int = 8):
+        """Stage outputs (the rows each stage is committed by) for groups 0..upto of each
+        sequence: forward pass only, batched over sequences. Returns per sequence a list of
+        (T, D) float32 arrays, one per group."""
+        from detrt.fast import run_stages
         upto = self.G - 1 if upto is None else upto
-        key = tuple(tokens)
-        roots, out = self.cache.get(key, ([], None))
-        if len(roots) > upto:
-            return roots[:upto + 1], out
-        x = None
-        if roots:  # resume from the cached last output is not kept; recompute from the start
-            roots = []
-        toks = torch.tensor(tokens, dtype=torch.long)
         if self.miner is not None:
             self.miner.refresh()
-        for g in range(upto + 1):
-            st = run_stage(self.m, toks if g == 0 else None, x, g * self.lpg, (g + 1) * self.lpg)
-            roots.append(st.root)
-            x = torch.from_numpy(st.output)
-            del st
-        emb = pooled(x.numpy()) if upto == self.G - 1 else None
-        if emb is not None:
-            self.cache[key] = (roots, emb)
-            if len(self.cache) > 64:
-                self.cache.pop(next(iter(self.cache)))
-        return roots, emb
+        out = []
+        for c0 in range(0, len(seqs), chunk):
+            toks = [torch.tensor(t, dtype=torch.long) for t in seqs[c0:c0 + chunk]]
+            res = [[] for _ in toks]
+            xs = None
+            for g in range(upto + 1):
+                ys = run_stages(self.m, toks if g == 0 else None, xs, g * self.lpg, (g + 1) * self.lpg, keep_rows=False)
+                for r, y in zip(res, ys):
+                    r.append(y)
+                xs = [torch.from_numpy(y) for y in ys]
+            out += res
+        return out
+
+    def batch(self, tokens: list[int], upto: int | None = None) -> tuple[list[bytes], np.ndarray | None]:
+        """Output roots of groups 0..upto for one sequence, and its pooled output if all ran."""
+        from .proto import stage_output_root
+        outs = self.outputs([tokens], upto)[0]
+        emb = pooled(outs[-1]) if len(outs) == self.G else None
+        return [stage_output_root(o) for o in outs], emb
+
+    def job_outputs(self, batches: list[list[int]]):
+        """A provider's job: per batch (output roots of every stage, pooled output, and each later
+        stage's input with Merkle proofs in the previous stage's output tree)."""
+        from .proto import multi_proofs, stage_out_leaves
+        res = []
+        for outs in self.outputs(batches):
+            leaves = [stage_out_leaves(o) for o in outs]
+            roots = [merkle_root(lv) for lv in leaves]
+            inputs = {}
+            for g in range(1, self.G):
+                pr = multi_proofs(leaves[g - 1], range(len(leaves[g - 1])))
+                inputs[g] = {"rows": outs[g - 1], "proofs": [[h.hex() for h in pr[t]] for t in range(len(pr))]}
+            res.append((roots, pooled(outs[-1]), inputs))
+        return res
+
+    def stage_output(self, batches: list[list[int]], stage: int) -> np.ndarray:
+        b, g = divmod(stage, self.G)
+        return self.outputs([batches[b]], g)[0][g]
+
+    def stage_root_from_input(self, rows: np.ndarray, g: int) -> bytes:
+        """One stage (layer group g >= 1) from its served input rows: its output root."""
+        from detrt.fast import run_stages
+        from .proto import stage_output_root
+        y = run_stages(self.m, None, [torch.from_numpy(rows)], g * self.lpg, (g + 1) * self.lpg, keep_rows=False)[0]
+        return stage_output_root(y)
 
     def trace(self, batches: list[list[int]], stage: int):
         """The full trace of one stage (for dispute games): recompute the batch up to it."""
@@ -61,73 +90,14 @@ class Runtime:
         if key in getattr(self, "traces", {}):
             return self.traces[key]
         toks = torch.tensor(batches[b], dtype=torch.long)
-        x = None
-        for gg in range(g + 1):
-            st = run_stage(self.m, toks if gg == 0 else None, x, gg * self.lpg, (gg + 1) * self.lpg)
-            x = torch.from_numpy(st.output)
+        x = torch.from_numpy(self.outputs([batches[b]], g - 1)[0][g - 1]) if g > 0 else None
+        st = run_stage(self.m, toks if g == 0 else None, x, g * self.lpg, (g + 1) * self.lpg)
         traces = getattr(self, "traces", {})
         traces[key] = st
         while len(traces) > 3:  # traces are large: keep the last few (one per running game)
             traces.pop(next(iter(traces)))
         self.traces = traces
         return st
-
-    def batch_with_inputs(self, tokens: list[int]):
-        """Like batch(), and also each later stage's input with proofs: for group g >= 1, the
-        rows group g-1 produced and their Merkle proofs in group g-1's trace (for verifiers who
-        recompute one stage instead of the whole prefix)."""
-        from .proto import multi_proofs
-        from detrt.stage import R2
-        toks = torch.tensor(tokens, dtype=torch.long)
-        if self.miner is not None:
-            self.miner.refresh()
-        roots, inputs, x = [], {}, None
-        for g in range(self.G):
-            st = run_stage(self.m, toks if g == 0 else None, x, g * self.lpg, (g + 1) * self.lpg)
-            roots.append(st.root)
-            if g + 1 < self.G:
-                last = (g + 1) * self.lpg - 1
-                idx = sorted((lf.t, i) for i, lf in enumerate(st.leaves) if lf.op == R2 and lf.layer == last)
-                idx = [i for _, i in idx]
-                pr = multi_proofs(st.leaf_hashes, idx)
-                inputs[g + 1] = {"rows": st.output.copy(), "idx": idx, "proofs": [[h.hex() for h in pr[i]] for i in idx],
-                                 "prev_leaves": len(st.leaves)}
-            x = torch.from_numpy(st.output)
-            del st
-        return roots, pooled(x.numpy()), inputs
-
-    def job_with_inputs(self, batches: list[list[int]], chunk: int = 8):
-        """batch_with_inputs for a whole job, using the batched runtime (detrt.fast: same rows and
-        roots, about 3x faster per sequence-stage). Returns per-batch (roots, embedding, inputs)."""
-        from detrt.fast import run_stages
-        from detrt.stage import R2
-        from .proto import multi_proofs
-        if self.miner is not None:
-            self.miner.refresh()
-        out = []
-        for c0 in range(0, len(batches), chunk):
-            seqs = [torch.tensor(t, dtype=torch.long) for t in batches[c0:c0 + chunk]]
-            res = [([], {}) for _ in seqs]
-            xs = None
-            for g in range(self.G):
-                trs = run_stages(self.m, seqs if g == 0 else None, xs, g * self.lpg, (g + 1) * self.lpg)
-                for (roots, inputs), st in zip(res, trs):
-                    roots.append(st.root)
-                    if g + 1 < self.G:
-                        last = (g + 1) * self.lpg - 1
-                        idx = [i for _, i in sorted((lf.t, i) for i, lf in enumerate(st.leaves)
-                                                    if lf.op == R2 and lf.layer == last)]
-                        pr = multi_proofs(st.leaf_hashes, idx)
-                        inputs[g + 1] = {"rows": st.output.copy(), "idx": idx,
-                                         "proofs": [[h.hex() for h in pr[i]] for i in idx], "prev_leaves": len(st.leaves)}
-                xs = [torch.from_numpy(st.output) for st in trs]
-                del trs
-            out += [(roots, pooled(x.numpy()), inputs) for (roots, inputs), x in zip(res, xs)]
-        return out
-
-    def stage_root_from_input(self, rows: np.ndarray, g: int) -> bytes:
-        """One stage (layer group g >= 1) from its served input rows."""
-        return run_stage(self.m, None, torch.from_numpy(rows), g * self.lpg, (g + 1) * self.lpg).root
 
     def stage_root(self, batches: list[list[int]], stage: int) -> bytes:
         b, g = divmod(stage, self.G)

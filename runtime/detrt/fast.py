@@ -65,9 +65,12 @@ def finalize_parallel(tr: StageTrace, workers: int) -> StageTrace:
 
 @torch.no_grad()
 def run_stages(m: DetQwen3, tokens: list[torch.Tensor] | None, x_in: list[torch.Tensor] | None, l0: int, l1: int,
-               workers: int | None = None) -> list[StageTrace]:
+               workers: int | None = None, keep_rows: bool = True):
     """Stage traces for B sequences of equal length T: tokens (B x (T,)) when l0 == 0, else
-    x_in (B x (T, D) float32, each the previous stage's output). Same rows as run_stage."""
+    x_in (B x (T, D) float32, each the previous stage's output). Same rows as run_stage.
+    With keep_rows=False, only the forward pass runs and the B stage outputs ((T, D) float32,
+    the rows the stage is committed by) are returned: what providers and verifiers compute."""
+    keep = keep_rows
     cfg = model_cfg(m)
     H, Hkv, hd, D = cfg["H"], cfg["Hkv"], cfg["hd"], cfg["D"]
     dev = m.device
@@ -92,7 +95,8 @@ def run_stages(m: DetQwen3, tokens: list[torch.Tensor] | None, x_in: list[torch.
 
     if l0 == 0:
         x = m.embed[torch.cat([t.to(dev) for t in tokens])]
-        put_tok(EMBED, 0, _np(x))
+        if keep:
+            put_tok(EMBED, 0, _np(x))
     else:
         x = torch.cat([xi.to(dev, F32) for xi in x_in])
     pos = torch.arange(T, device=dev).repeat(B)
@@ -113,18 +117,19 @@ def run_stages(m: DetQwen3, tokens: list[torch.Tensor] | None, x_in: list[torch.
         vq, vs = core.quant_sym(v.reshape(N, Hkv, hd), 127)
         qq, qs = core.quant_sym(qr, 127)
 
-        put_tok(N1, l, _np(h1))
-        put_tok(QA1, l, np.concatenate([_np(q1), _bits(_np(s1).reshape(N, 1))], axis=1))
-        put_tok(QKV, l, _np(qkv))
-        put_head(QN, l, _np(qn), H)
-        put_head(QR, l, _np(qr), H)
-        put_head(QQ, l, np.concatenate([_np(qq.to(torch.int32)), _bits(_np(qs).reshape(N, H, 1))], axis=2), H)
-        put_head(KN, l, _np(kn), Hkv)
-        put_head(KR, l, _np(kr), Hkv)
-        put_head(KQ, l, np.concatenate([_np(kq.to(torch.int32)), _bits(_np(ks).reshape(N, Hkv, 1))], axis=2), Hkv)
-        put_head(VQ, l, np.concatenate([_np(vq.to(torch.int32)), _bits(_np(vs).reshape(N, Hkv, 1))], axis=2), Hkv)
-        vq_all, vs_all = _np(vq.to(torch.int32)), _np(vs)
-        for b in range(B):
+        if keep:
+            put_tok(N1, l, _np(h1))
+            put_tok(QA1, l, np.concatenate([_np(q1), _bits(_np(s1).reshape(N, 1))], axis=1))
+            put_tok(QKV, l, _np(qkv))
+            put_head(QN, l, _np(qn), H)
+            put_head(QR, l, _np(qr), H)
+            put_head(QQ, l, np.concatenate([_np(qq.to(torch.int32)), _bits(_np(qs).reshape(N, H, 1))], axis=2), H)
+            put_head(KN, l, _np(kn), Hkv)
+            put_head(KR, l, _np(kr), Hkv)
+            put_head(KQ, l, np.concatenate([_np(kq.to(torch.int32)), _bits(_np(ks).reshape(N, Hkv, 1))], axis=2), Hkv)
+            put_head(VQ, l, np.concatenate([_np(vq.to(torch.int32)), _bits(_np(vs).reshape(N, Hkv, 1))], axis=2), Hkv)
+            vq_all, vs_all = _np(vq.to(torch.int32)), _np(vs)
+        for b in range(B if keep else 0):
             vq_i = vq_all[b * T:(b + 1) * T]
             for hh in range(Hkv):
                 for d in range(hd):
@@ -159,8 +164,9 @@ def run_stages(m: DetQwen3, tokens: list[torch.Tensor] | None, x_in: list[torch.
             acc += (core.exact_matmul_small(hi[..., c0:c0 + KEY_CHUNK], Vf[..., c0:c0 + KEY_CHUNK, :], bnd).to(I64) << 7) \
                 + core.exact_matmul_small(lo[..., c0:c0 + KEY_CHUNK], Vf[..., c0:c0 + KEY_CHUNK, :], bnd).to(I64)
         o = fmul(acc.to(F32), sp)                                          # (B, H, T, hd)
-        sc_n, pi_n, sp_n, o_n = _np(sc), _np(pi), _bits(_np(sp)), _np(o)
-        for b in range(B):
+        if keep:
+            sc_n, pi_n, sp_n, o_n = _np(sc), _np(pi), _bits(_np(sp)), _np(o)
+        for b in range(B if keep else 0):
             rb = rows[b]
             for t in range(T):
                 for hh in range(H):
@@ -179,19 +185,22 @@ def run_stages(m: DetQwen3, tokens: list[torch.Tensor] | None, x_in: list[torch.
         q4, s4 = core.quant_act(sm, L["down"].bs)
         dn = fmul(fmul(L["down"].int_gemm(q4).to(F32), s4[:, None]), L["down"].sw[None, :])
         r2 = fadd(r1, dn)
-        put_tok(QA2, l, np.concatenate([_np(q2), _bits(_np(s2).reshape(N, 1))], axis=1))
-        put_tok(OP, l, _np(op))
-        put_tok(R1, l, _np(r1))
-        put_tok(N2, l, _np(h2))
-        put_tok(QA3, l, np.concatenate([_np(q3), _bits(_np(s3).reshape(N, 1))], axis=1))
-        put_tok(GU, l, _np(gu))
-        put_tok(SM, l, _np(sm))
-        put_tok(QA4, l, np.concatenate([_np(q4), _bits(_np(s4).reshape(N, 1))], axis=1))
-        put_tok(DN, l, _np(dn))
-        put_tok(R2, l, _np(r2))
+        if keep:
+            put_tok(QA2, l, np.concatenate([_np(q2), _bits(_np(s2).reshape(N, 1))], axis=1))
+            put_tok(OP, l, _np(op))
+            put_tok(R1, l, _np(r1))
+            put_tok(N2, l, _np(h2))
+            put_tok(QA3, l, np.concatenate([_np(q3), _bits(_np(s3).reshape(N, 1))], axis=1))
+            put_tok(GU, l, _np(gu))
+            put_tok(SM, l, _np(sm))
+            put_tok(QA4, l, np.concatenate([_np(q4), _bits(_np(s4).reshape(N, 1))], axis=1))
+            put_tok(DN, l, _np(dn))
+            put_tok(R2, l, _np(r2))
         x = r2
-    leaves = program(cfg, T, l0, l1)
     out = _np(x)
+    if not keep:
+        return [out[b * T:(b + 1) * T].copy() for b in range(B)]
+    leaves = program(cfg, T, l0, l1)
     workers = workers if workers is not None else max(1, (os.cpu_count() or 2) - 2)
     traces = []
     for b in range(B):

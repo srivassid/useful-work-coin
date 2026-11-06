@@ -1,0 +1,1707 @@
+From 4ed98c57948bc82d5741296ae8d0e009c97e4402 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 16:10:59 +0530
+Subject: [PATCH] Stages are committed by their outputs; full traces only in
+ disputes (build step 7)
+
+TRACE_COMMIT's per-stage roots are now StageOutputRoot over the stage's T output rows (the
+last layer's R2 rows). A disputed stage's trace is committed in a new top round as
+nodeHash(BodyRoot, OutputRoot) (body = every other leaf, program order), with the output root
+required to equal the committed one; play then bisects the body tree if the bodies differ, else
+the output tree. One-step inputs are proven in the provider's body tree; stage inputs (one-step
+and DATA_SERVE) against the previous stage's output root. BuildOneStep takes the previous
+stage's outputs instead of its trace; uwcctl onestep reads prev_outputs; getjob reports the tree.
+
+Full-trace commitments cost ~25x the GEMMs they describe; with output commitments the provider
+computes only the forward pass (0.02 s vs 1.1 s per sequence-stage) and live lambda rises from
+1.6e-4 to 0.03. Fault suite: every deviation that changes an output is caught by one
+recomputation (50 of 60 random ones; the other 10 are absorbed by int8 quantization and rightly
+settle). TestAgentTraceCommit checks the agent's split against TraceCommit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/cmd/uwcctl/onestep.go                |  14 +-
+ node/jobstate/dispute.go                  |  91 ++-
+ node/jobstate/dispute_test.go             | 143 ++--
+ node/jobstate/onestep.go                  |  36 +-
+ node/jobstate/pool_test.go                |  45 +-
+ node/jobstate/program.go                  |  58 ++
+ node/jobstate/state.go                    |   2 +-
+ node/jobstate/testdata/agent_vectors.json | 943 +++++++++++++++++++++-
+ node/rpcjobs.go                           |   3 +-
+ 9 files changed, 1229 insertions(+), 106 deletions(-)
+
+diff --git a/node/cmd/uwcctl/onestep.go b/node/cmd/uwcctl/onestep.go
+index fa0ea953..a7597d58 100644
+--- a/node/cmd/uwcctl/onestep.go
++++ b/node/cmd/uwcctl/onestep.go
+@@ -12,12 +12,12 @@ import (
+ // oneStepReq is written by the devnet agent when a game it plays as provider reaches its last round.
+ type oneStepReq struct {
+ 	Job      string     `json:"job"`
+-	Model    string     `json:"model"`   // model json (agent.model_info): cfg, layer_groups
+-	Weights  string     `json:"weights"` // weights store directory (agent.weights_store)
+-	Rows     string     `json:"rows"`    // this stage's trace rows
+-	PrevRows string     `json:"prev_rows"`
+-	Batches  [][]uint32 `json:"batches"` // the job's token batches
+-	Salts    []string   `json:"salts"`   // the provider's stage salts and roots
++	Model    string     `json:"model"`        // model json (agent.model_info): cfg, layer_groups
++	Weights  string     `json:"weights"`      // weights store directory (agent.weights_store)
++	Rows     string     `json:"rows"`         // this stage's trace rows
++	PrevRows string     `json:"prev_outputs"` // the previous stage's output rows, by token
++	Batches  [][]uint32 `json:"batches"`      // the job's token batches
++	Salts    []string   `json:"salts"`        // the provider's stage salts and roots
+ 	Roots    []string   `json:"roots"`
+ }
+ 
+@@ -109,7 +109,7 @@ func oneStep(keyPath, reqPath string) {
+ 		in.StageLeaves = append(in.StageLeaves, jobstate.StageLeaf(uint32(i), hash32(req.Salts[i]), hash32(req.Roots[i])))
+ 	}
+ 	if int(g.Stage)%mi.LayerGroups > 0 {
+-		if in.PrevRows, err = readRows(req.PrevRows); err != nil {
++		if in.PrevOutputs, err = readRows(req.PrevRows); err != nil {
+ 			die(err)
+ 		}
+ 		p := g.Stage - 1
+diff --git a/node/jobstate/dispute.go b/node/jobstate/dispute.go
+index d37c7987..289c9510 100644
+--- a/node/jobstate/dispute.go
++++ b/node/jobstate/dispute.go
+@@ -8,9 +8,13 @@ import (
+ // Dispute games (design doc: "bisect inside the stage to one int8 operation; full nodes
+ // recompute it on CPU"). A game is played between the provider and Disputes[0] over one stage:
+ //
+-//	GReveal   provider must open the disputed stage's root (if it was never sampled)
+-//	GTree     bisect the stage trace tree: each round both post the two children of their
+-//	          current node; play continues in the leftmost subtree where they differ
++//	GReveal   provider must open the disputed stage's output root (if it was never sampled)
++//	GTop      each party commits its full trace of the stage as (body root, output root); the
++//	          output root must be the one it committed. Play continues in the body tree if the
++//	          bodies differ, else in the output tree (stage outputs are committed cheaply; the
++//	          trace is built only now, see program.go "stage commitments")
++//	GTree     bisect that tree: each round both post the two children of their current node;
++//	          play continues in the leftmost subtree where they differ
+ //	GLeaf     both post the row root of the first differing leaf
+ //	GBlocks   bisect that row's block tree the same way
+ //	GBlock    both post the bytes of the first differing 1 KiB block
+@@ -27,6 +31,13 @@ const (
+ 	GBlocks
+ 	GBlock
+ 	GOneStep
++	GTop // both post (body root, output root) of their trace; the output root must be the one committed
++)
++
++// Trees a game bisects after the top round.
++const (
++	TreeBody uint8 = iota
++	TreeOut
+ )
+ 
+ // Game is the state of the dispute currently being played on a job.
+@@ -47,6 +58,9 @@ type Game struct {
+ 	Elem           int
+ 	PWord, CWord   uint32
+ 	Deadline       int32
++	Tree           uint8 // TreeBody or TreeOut, chosen by the top round
++	NB, NO         int   // body leaves, output rows
++	PB             Hash  // the provider's body root (inputs of a one-step proof are proven against it)
+ }
+ 
+ // DataReq is a committee member's on-chain request for a stage's input (serve-or-slash).
+@@ -113,17 +127,20 @@ func (s *State) provenSource(j *Job, g *Game, rows []ProvenRow) (*ProvenSource,
+ 	c := m.Cfg
+ 	prog := Program(c, st.T, st.L0, st.L1)
+ 	idx := indexProgram(prog)
++	_, bodyAt, _ := SplitProgram(prog, st.L1)
++	bodyIdx := make(map[int]int, len(bodyAt)) // program index -> body index
++	for bi, pi := range bodyAt {
++		bodyIdx[pi] = bi
++	}
+ 	nw := c.V + c.L*(4+(c.H+2*c.Hkv)*c.Hd+c.D+2*c.I+c.D) + 2*c.MaxPos
+ 	ps := &ProvenSource{MemSource{Weights: map[WeightRow][]uint32{}, Leaves: map[LeafDesc][]uint32{}}}
+-	var prevRoot Hash
+-	var prevIdx programIndex
++	var prevRoot Hash // the previous stage's committed output root: the stage input
+ 	if grp > 0 {
+ 		r, ok := revealedRoot(j, g.Stage-1)
+ 		if !ok {
+ 			return nil, st, errors.New("previous stage not opened")
+ 		}
+ 		prevRoot = r
+-		prevIdx = indexProgram(Program(c, st.T, st.L0-(st.L1-st.L0), st.L0))
+ 	}
+ 	inputs := map[int][]uint32{}
+ 	for _, in := range rows {
+@@ -131,10 +148,11 @@ func (s *State) provenSource(j *Job, g *Game, rows []ProvenRow) (*ProvenSource,
+ 		switch in.Kind {
+ 		case RowLeaf:
+ 			i, ok := idx[in.Leaf]
+-			if !ok || i >= g.Leaf || len(in.Words) != c.RowLen(in.Leaf, st.T) {
++			bi, inBody := bodyIdx[i]
++			if !ok || !inBody || i >= g.Leaf || len(in.Words) != c.RowLen(in.Leaf, st.T) {
+ 				return nil, st, errors.New("input leaf not an earlier leaf of the stage")
+ 			}
+-			if !VerifyMerkleProof(g.ProvRoot, TraceLeaf(i, rr), i, g.N, in.Proof) {
++			if !VerifyMerkleProof(g.PB, TraceLeaf(bi, rr), bi, g.NB, in.Proof) {
+ 				return nil, st, errors.New("input leaf proof fails")
+ 			}
+ 			ps.Leaves[in.Leaf] = in.Words
+@@ -151,8 +169,7 @@ func (s *State) provenSource(j *Job, g *Game, rows []ProvenRow) (*ProvenSource,
+ 			if grp == 0 || in.Index < 0 || in.Index >= st.T || len(in.Words) != c.D {
+ 				return nil, st, errors.New("bad stage input row")
+ 			}
+-			i := prevIdx[LeafDesc{LR2, st.L0 - 1, in.Index, -1}]
+-			if !VerifyMerkleProof(prevRoot, TraceLeaf(i, rr), i, len(prevIdx), in.Proof) {
++			if !VerifyMerkleProof(prevRoot, StageOutLeaf(in.Index, rr), in.Index, st.T, in.Proof) {
+ 				return nil, st, errors.New("stage input proof fails")
+ 			}
+ 			inputs[in.Index] = in.Words
+@@ -198,7 +215,9 @@ func (s *State) startGame(p Params, h int32, j *Job) {
+ 	if err != nil {
+ 		g.Phase = GReveal // cannot happen for validated disputes; provider must answer anyway
+ 	}
+-	g.N = len(Program(st.Cfg, st.T, st.L0, st.L1))
++	prog := Program(st.Cfg, st.T, st.L0, st.L1)
++	body, _, outAt := SplitProgram(prog, st.L1)
++	g.N, g.NB, g.NO = len(prog), len(body), len(outAt)
+ 	j.Game = g
+ 	if r, ok := revealedRoot(j, d.Stage); ok {
+ 		s.beginTree(p, h, j, r)
+@@ -218,10 +237,7 @@ func (s *State) beginTree(p Params, h int32, j *Job, provRoot Hash) {
+ 		s.endGame(p, h, j, false, true)
+ 		return
+ 	}
+-	g.Phase, g.Lo, g.Size, g.HP, g.HC = GTree, 0, g.N, provRoot, g.ChalRoot
+-	if g.Size == 1 {
+-		g.Phase = GLeaf
+-	}
++	g.Phase = GTop // each party now commits its trace as (body root, output root)
+ 	s.newRound(p, h, g)
+ }
+ 
+@@ -248,6 +264,19 @@ func (s *State) move(p Params, h int32, j *Job, o *Op) error {
+ 		own = g.HP
+ 	}
+ 	switch g.Phase {
++	case GTop:
++		claimed := g.ChalRoot
++		if prov {
++			claimed = g.ProvRoot
++		}
++		if o.H2 != claimed {
++			return errors.New("the trace's output root must be the committed output root")
++		}
++		if prov {
++			g.PL, g.PR = o.H1, o.H2
++		} else {
++			g.CL, g.CR = o.H1, o.H2
++		}
+ 	case GTree, GBlocks:
+ 		if g.Size <= 1 || nodeHash(o.H1, o.H2) != own {
+ 			return errors.New("children do not hash to your node")
+@@ -258,7 +287,11 @@ func (s *State) move(p Params, h int32, j *Job, o *Op) error {
+ 			g.CL, g.CR = o.H1, o.H2
+ 		}
+ 	case GLeaf:
+-		if TraceLeaf(g.Lo, o.H1) != own {
++		leaf := TraceLeaf(g.Lo, o.H1)
++		if g.Tree == TreeOut {
++			leaf = StageOutLeaf(g.Lo, o.H1)
++		}
++		if leaf != own {
+ 			return errors.New("row root does not hash to your leaf")
+ 		}
+ 		if prov {
+@@ -339,6 +372,18 @@ func (s *State) advanceGame(p Params, h int32, j *Job) {
+ 		return
+ 	}
+ 	switch g.Phase {
++	case GTop:
++		// descend into the body if the bodies differ, else into the outputs (which must differ)
++		g.PB = g.PL
++		if g.PL != g.CL {
++			g.Tree, g.Lo, g.Size, g.HP, g.HC = TreeBody, 0, g.NB, g.PL, g.CL
++		} else {
++			g.Tree, g.Lo, g.Size, g.HP, g.HC = TreeOut, 0, g.NO, g.PR, g.CR
++		}
++		g.Phase = GTree
++		if g.Size == 1 {
++			g.Phase = GLeaf
++		}
+ 	case GTree, GBlocks:
+ 		k := splitPoint(g.Size)
+ 		if g.PL != g.CL {
+@@ -356,7 +401,13 @@ func (s *State) advanceGame(p Params, h int32, j *Job) {
+ 	case GLeaf:
+ 		st, _, _, _ := s.stageShape(j, g.Stage)
+ 		prog := Program(st.Cfg, st.T, st.L0, st.L1)
+-		g.Leaf, g.RowLen = g.Lo, st.Cfg.RowLen(prog[g.Lo], st.T)
++		_, bodyAt, outAt := SplitProgram(prog, st.L1)
++		if g.Tree == TreeOut {
++			g.Leaf = outAt[g.Lo]
++		} else {
++			g.Leaf = bodyAt[g.Lo]
++		}
++		g.RowLen = st.Cfg.RowLen(prog[g.Leaf], st.T)
+ 		nb := (4*g.RowLen + RowBlock - 1) / RowBlock
+ 		g.Phase, g.Lo, g.Size, g.HP, g.HC = GBlocks, 0, nb, g.PL, g.CL
+ 		if nb == 1 { // the row root is the single block's leaf hash
+@@ -494,14 +545,12 @@ func (s *State) dataServe(p Params, h int32, j *Job, o *Op) error {
+ 		return errors.New("previous stage not opened")
+ 	}
+ 	st, _, _, _ := s.stageShape(j, o.U1)
+-	prev := indexProgram(Program(st.Cfg, st.T, st.L0-(st.L1-st.L0), st.L0))
+ 	for _, in := range o.Inputs {
+ 		if in.Kind != RowInput || in.Index < 0 || in.Index >= st.T || len(in.Words) != st.Cfg.D {
+ 			return errors.New("bad served row")
+ 		}
+-		i := prev[LeafDesc{LR2, st.L0 - 1, in.Index, -1}]
+-		if !VerifyMerkleProof(prevRoot, TraceLeaf(i, RowRoot(in.Words)), i, len(prev), in.Proof) {
+-			return errors.New("served row does not open the previous stage")
++		if !VerifyMerkleProof(prevRoot, StageOutLeaf(in.Index, RowRoot(in.Words)), in.Index, st.T, in.Proof) {
++			return errors.New("served row does not open the previous stage's output")
+ 		}
+ 	}
+ 	for _, in := range o.Inputs { // all rows valid: mark them (whole op is all-or-nothing)
+diff --git a/node/jobstate/dispute_test.go b/node/jobstate/dispute_test.go
+index fb0b6049..992709b3 100644
+--- a/node/jobstate/dispute_test.go
++++ b/node/jobstate/dispute_test.go
+@@ -75,15 +75,19 @@ type party struct {
+ 	acct    AccountID
+ 	weights map[WeightRow][]uint32
+ 	tokens  [][]uint32
+-	rows    map[uint32][][]uint32 // by stage
+-	leaves  map[uint32][]Hash
+-	silent  bool // never moves in games
+-	badMove bool // posts garbage children
++	rows    map[uint32][][]uint32 // by stage, program order
++	leaves  map[uint32][]Hash     // full-program trace leaves (unused by the protocol now)
++	outputs map[uint32][][]uint32 // stage output rows by token
++	body    map[uint32][]Hash     // body-tree leaves
++	outLv   map[uint32][]Hash     // output-tree leaves
++	silent  bool                  // never moves in games
++	badMove bool                  // posts garbage children
+ }
+ 
+ func (tm *tinyModel) newParty(t *testing.T, a AccountID, w map[WeightRow][]uint32, tokens [][]uint32,
+ 	fault func(stage uint32) func(int, []uint32), inputFault func(stage uint32, rows [][]uint32)) *party {
+-	p := &party{acct: a, weights: w, tokens: tokens, rows: map[uint32][][]uint32{}, leaves: map[uint32][]Hash{}}
++	p := &party{acct: a, weights: w, tokens: tokens, rows: map[uint32][][]uint32{}, leaves: map[uint32][]Hash{},
++		outputs: map[uint32][][]uint32{}, body: map[uint32][]Hash{}, outLv: map[uint32][]Hash{}}
+ 	G := 2
+ 	lpg := tm.cfg.L / G
+ 	for b := range tokens {
+@@ -112,6 +116,8 @@ func (tm *tinyModel) newParty(t *testing.T, a AccountID, w map[WeightRow][]uint3
+ 					prevOut = append(prevOut, rows[i])
+ 				}
+ 			}
++			p.outputs[s] = prevOut
++			p.body[s], p.outLv[s], _ = TraceCommit(prog, (g+1)*lpg, rows)
+ 		}
+ 	}
+ 	return p
+@@ -125,7 +131,8 @@ func cloneRows(r [][]uint32) [][]uint32 {
+ 	return o
+ }
+ 
+-func (p *party) root(s uint32) Hash { return MerkleRoot(p.leaves[s]) }
++// root is the party's committed stage root: the stage's output root.
++func (p *party) root(s uint32) Hash { return StageOutputRoot(p.outputs[s]) }
+ 
+ func rangeRoot(l []Hash) Hash { return MerkleRoot(l) }
+ 
+@@ -135,14 +142,25 @@ func (p *party) move(tm *tinyModel, j *Job, g *Game) *Op {
+ 		return nil
+ 	}
+ 	rows := p.rows[g.Stage]
+-	leaves := p.leaves[g.Stage]
++	leaves := p.body[g.Stage]
++	G := 2
++	lpg := tm.cfg.L / G
++	grp := int(g.Stage) % G
++	prog := Program(tm.cfg, len(p.tokens[int(g.Stage)/G]), grp*lpg, (grp+1)*lpg)
++	_, bodyAt, outAt := SplitProgram(prog, (grp+1)*lpg)
++	at := bodyAt
++	if g.Tree == TreeOut {
++		leaves, at = p.outLv[g.Stage], outAt
++	}
+ 	o := &Op{Kind: OpDisputeMove, Actor: p.acct, Job: j.ID}
+ 	switch g.Phase {
++	case GTop:
++		o.H1, o.H2 = MerkleRoot(p.body[g.Stage]), MerkleRoot(p.outLv[g.Stage])
+ 	case GTree:
+ 		k := splitPoint(g.Size)
+ 		o.H1, o.H2 = rangeRoot(leaves[g.Lo:g.Lo+k]), rangeRoot(leaves[g.Lo+k:g.Lo+g.Size])
+ 	case GLeaf:
+-		o.H1 = RowRoot(rows[g.Lo])
++		o.H1 = RowRoot(rows[at[g.Lo]])
+ 	case GBlocks:
+ 		bl := blockLeaves(rowWords(rows[g.Leaf]))
+ 		k := splitPoint(g.Size)
+@@ -187,52 +205,38 @@ func (p *party) oneStep(tm *tinyModel, w *world, j *Job, g *Game, salts []Hash,
+ 		return nil
+ 	}
+ 	G := 2
+-	b, grp := int(g.Stage)/G, int(g.Stage)%G
+-	lpg := tm.cfg.L / G
+-	T := len(p.tokens[b])
+-	st := Stage{Cfg: tm.cfg, T: T, L0: grp * lpg, L1: (grp + 1) * lpg}
+-	prog := Program(tm.cfg, T, st.L0, st.L1)
+-	mem := &MemSource{Weights: p.weights, Toks: p.tokens[b], Leaves: map[LeafDesc][]uint32{}}
+-	for i, d := range prog {
+-		mem.Leaves[d] = p.rows[g.Stage][i]
+-	}
+-	var prevIdx programIndex
+-	if grp > 0 {
+-		pp := Program(tm.cfg, T, st.L0-lpg, st.L0)
+-		prevIdx = indexProgram(pp)
+-		for t := 0; t < T; t++ {
+-			mem.Input = append(mem.Input, p.rows[g.Stage-1][prevIdx[LeafDesc{LR2, st.L0 - 1, t, -1}]])
+-		}
+-	}
+-	rec := &recorder{inner: mem}
+-	if _, err := st.Recompute(prog[g.Leaf], g.Elem, rec); err != nil {
++	il, _ := tm.inputTree()
++	in := OneStepInput{Cfg: tm.cfg, LayerGroups: G, Stage: g.Stage, Leaf: g.Leaf, Elem: g.Elem, Rows: p.rows[g.Stage],
++		Tokens: p.tokens[int(g.Stage)/G], InputLeaves: il, StageLeaves: stageLeaves, Weights: partyWeights{p, tm}}
++	if int(g.Stage)%G > 0 {
++		in.PrevOutputs = p.outputs[g.Stage-1]
++		in.PrevReveal = &StageReveal{Stage: g.Stage - 1, Salt: salts[g.Stage-1], Root: p.root(g.Stage - 1),
++			Proof: MerkleProof(stageLeaves, int(g.Stage-1))}
++	}
++	o, _, err := BuildOneStep(in)
++	if err != nil {
+ 		return nil
+ 	}
+-	idx := indexProgram(prog)
+-	o := &Op{Kind: OpOneStep, Actor: p.acct, Job: j.ID}
+-	for _, d := range rec.leaves {
+-		i := idx[d]
+-		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowLeaf, Leaf: d, Words: p.rows[g.Stage][i], Proof: MerkleProof(p.leaves[g.Stage], i)})
+-	}
+-	for _, wr := range rec.weights {
+-		i, _, _ := tm.cfg.weightIndex(wr)
+-		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowWeight, W: wr, Words: p.weights[wr], Proof: MerkleProof(tm.wleaves, i)})
+-	}
+-	for _, t := range rec.inputs {
+-		i := prevIdx[LeafDesc{LR2, st.L0 - 1, t, -1}]
+-		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowInput, Index: t, Words: mem.Input[t], Proof: MerkleProof(p.leaves[g.Stage-1], i)})
+-	}
+-	if rec.tokens {
+-		lv, _ := tm.inputTree()
+-		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowTokens, Index: b, Words: p.tokens[b], Proof: MerkleProof(lv, b)})
+-	}
+-	if grp > 0 {
+-		o.Reveals = []StageReveal{{Stage: g.Stage - 1, Salt: salts[g.Stage-1], Root: p.root(g.Stage - 1),
+-			Proof: MerkleProof(stageLeaves, int(g.Stage-1))}}
+-	}
++	o.Actor, o.Job = p.acct, j.ID
+ 	return o
+ }
+ 
++// partyWeights serves the party's own weights (possibly substituted) with the registered tree's
++// proofs: a substituted row fails its proof, as it should.
++type partyWeights struct {
++	p  *party
++	tm *tinyModel
++}
++
++func (w partyWeights) Row(r WeightRow) ([]uint32, error) {
++	row, ok := w.p.weights[r]
++	if !ok {
++		return nil, fmt.Errorf("no weight row %+v", r)
++	}
++	return row, nil
++}
++func (w partyWeights) Leaves() []Hash { return w.tm.wleaves }
++
+ // ---------------------------------------------------------------- scenario driver
+ 
+ type scenario struct {
+@@ -328,15 +332,12 @@ func runScenario(t *testing.T, tm *tinyModel, sc scenario, seed uint64) outcome
+ 		switch sc.serve {
+ 		case "ok", "bad":
+ 			var rows []ProvenRow
+-			pp := Program(tm.cfg, len(tm.tokens[0]), 0, 1)
+-			idx := indexProgram(pp)
+ 			for tt := 0; tt < len(tm.tokens[0]); tt++ {
+-				i := idx[LeafDesc{LR2, 0, tt, -1}]
+-				words := append([]uint32(nil), prov.rows[0][i]...)
++				words := append([]uint32(nil), prov.outputs[0][tt]...)
+ 				if sc.serve == "bad" && tt == 3 {
+ 					words[5] ^= 1
+ 				}
+-				rows = append(rows, ProvenRow{Kind: RowInput, Index: tt, Words: words, Proof: MerkleProof(prov.leaves[0], i)})
++				rows = append(rows, ProvenRow{Kind: RowInput, Index: tt, Words: words, Proof: MerkleProof(prov.outLv[0], tt)})
+ 			}
+ 			w.block(nil, []*Op{{Kind: OpDataServe, Actor: wd.provider, Job: jid, U1: 1, Inputs: rows,
+ 				Reveals: []StageReveal{{Stage: 0, Salt: salts[0], Root: prov.root(0), Proof: MerkleProof(sl, 0)}}}}, nil)
+@@ -397,7 +398,7 @@ func runScenario(t *testing.T, tm *tinyModel, sc scenario, seed uint64) outcome
+ 		j = w.st.Jobs[jid]
+ 		var ops []*Op
+ 		if g := j.Game; g != nil && j.Status == StatusDisputed {
+-			if g.Phase == GTree && g.Lo == 0 && g.Size == g.N && !g.PMoved && !g.CMoved {
++			if g.Phase == GTop && !g.PMoved && !g.CMoved {
+ 				games++
+ 			}
+ 			disputant := seats[j.Disputes[0].Challenger]
+@@ -598,6 +599,9 @@ func TestFaultsAreCaughtAndTheRightPartyIsSlashed(t *testing.T) {
+ 	prog0 := Program(tm.cfg, len(tm.tokens[0]), 0, 1)
+ 	prog1 := Program(tm.cfg, len(tm.tokens[0]), 1, 2)
+ 	seen := map[uint8]bool{}
++	caughtOps := map[uint8]bool{}
++	absorbed := 0
++	honestParty := tm.newParty(t, acct(98), tm.weights, tm.tokens, nil, nil)
+ 	for trial := 0; trial < 60; trial++ {
+ 		stage := uint32(rng.IntN(4))
+ 		prog := prog0
+@@ -620,19 +624,48 @@ func TestFaultsAreCaughtAndTheRightPartyIsSlashed(t *testing.T) {
+ 		e := rng.IntN(tm.cfg.RowLen(prog[i], len(tm.tokens[0])))
+ 		seen[prog[i].Op] = true
+ 		name := fmt.Sprintf("trial %d stage %d leaf %d (%d) elem %d", trial, stage, i, prog[i].Op, e)
++		// Stages are committed by their outputs: a lie that the int8 quantization absorbs leaves
++		// every stage output unchanged, so there is nothing to catch and nobody may be penalized.
++		liar := tm.newParty(t, acct(99), tm.weights, tm.tokens, corruptAt(stage, i, e), nil)
++		changed := false
++		for st := uint32(0); st < 4; st++ {
++			changed = changed || liar.root(st) != honestParty.root(st)
++		}
++		if !changed {
++			absorbed++
++		}
+ 		if trial%2 == 0 {
+ 			o := runScenario(t, tm, scenario{providerFault: corruptAt(stage, i, e)}, uint64(100+trial))
++			if !changed {
++				if o.status != StatusSettled || o.provider <= 0 || o.games != 0 {
++					t.Fatalf("%s: an output-preserving deviation must settle normally: %+v", name, o)
++				}
++				continue
++			}
+ 			expectProviderSlashed(t, o, name)
+ 			if o.oneStepOK != 1 {
+ 				t.Fatalf("%s: verdict must come from one accepted recomputation: %+v", name, o)
+ 			}
++			caughtOps[prog[i].Op] = true
+ 		} else {
+ 			o := runScenario(t, tm, scenario{verifierFault: corruptAt(stage, i, e)}, uint64(100+trial))
++			if !changed {
++				if o.status != StatusSettled || o.verifierStake != 0 || o.games != 0 {
++					t.Fatalf("%s: a verifier whose outputs are right must not be penalized: %+v", name, o)
++				}
++				continue
++			}
+ 			if o.status != StatusSettled || o.verifierStake != -DefaultParams().VerifierNoShowPenalty || o.oneStepOK != 1 {
+ 				t.Fatalf("%s: lying verifier not penalized by recomputation: %+v", name, o)
+ 			}
++			caughtOps[prog[i].Op] = true
+ 		}
+ 	}
++	t.Logf("%d of 60 deviations were absorbed by quantization (outputs unchanged); every other one was caught; "+
++		"ops caught through a game: %d", absorbed, len(caughtOps))
++	if absorbed > 30 {
++		t.Fatalf("too few deviations reached the outputs (%d absorbed) to test the games", absorbed)
++	}
+ 	for op := uint8(0); op <= LR2; op++ {
+ 		if !seen[op] && !(op == LEmbed) {
+ 			t.Fatalf("op %d never corrupted", op)
+diff --git a/node/jobstate/onestep.go b/node/jobstate/onestep.go
+index 2b7ee919..003c5d00 100644
+--- a/node/jobstate/onestep.go
++++ b/node/jobstate/onestep.go
+@@ -124,7 +124,7 @@ type OneStepInput struct {
+ 	Stage       uint32
+ 	Leaf, Elem  int
+ 	Rows        [][]uint32 // this stage's trace rows, in program order
+-	PrevRows    [][]uint32 // the previous stage's trace rows (layer group > 0)
++	PrevOutputs [][]uint32 // the previous stage's output rows, by token (layer group > 0)
+ 	Tokens      []uint32   // this batch's tokens
+ 	InputLeaves []Hash     // the job's input tree leaves (TokenLeaf per batch)
+ 	StageLeaves []Hash     // the provider's salted stage commitment leaves
+@@ -151,25 +151,22 @@ func BuildOneStep(in OneStepInput) (*Op, uint32, error) {
+ 	for i, d := range prog {
+ 		mem.Leaves[d] = in.Rows[i]
+ 	}
+-	var prevIdx programIndex
+ 	if grp > 0 {
+-		pp := Program(in.Cfg, T, st.L0-lpg, st.L0)
+-		if len(in.PrevRows) != len(pp) {
+-			return nil, 0, fmt.Errorf("previous stage has %d rows, program %d", len(in.PrevRows), len(pp))
+-		}
+-		prevIdx = indexProgram(pp)
+-		for t := 0; t < T; t++ {
+-			mem.Input = append(mem.Input, in.PrevRows[prevIdx[LeafDesc{LR2, st.L0 - 1, t, -1}]])
++		if len(in.PrevOutputs) != T {
++			return nil, 0, fmt.Errorf("previous stage has %d output rows, want %d", len(in.PrevOutputs), T)
+ 		}
++		mem.Input = in.PrevOutputs
+ 	}
+ 	rec := &readRecorder{mem: mem, weights: in.Weights}
+ 	v, err := st.Recompute(prog[in.Leaf], in.Elem, rec)
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
+-	leafHashes := make([]Hash, len(in.Rows))
+-	for i, r := range in.Rows {
+-		leafHashes[i] = TraceLeaf(i, RowRoot(r))
++	bodyLeaves, _, _ := TraceCommit(prog, st.L1, in.Rows)
++	_, bodyAt, _ := SplitProgram(prog, st.L1)
++	bodyIdx := make(map[int]int, len(bodyAt))
++	for bi, pi := range bodyAt {
++		bodyIdx[pi] = bi
+ 	}
+ 	idx := indexProgram(prog)
+ 	o := &Op{Kind: OpOneStep}
+@@ -181,7 +178,11 @@ func BuildOneStep(in OneStepInput) (*Op, uint32, error) {
+ 		}
+ 		seen[k] = true
+ 		i := idx[d]
+-		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowLeaf, Leaf: d, Words: in.Rows[i], Proof: MerkleProof(leafHashes, i)})
++		bi, ok := bodyIdx[i]
++		if !ok {
++			return nil, 0, fmt.Errorf("the referee read an output row %+v", d)
++		}
++		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowLeaf, Leaf: d, Words: in.Rows[i], Proof: MerkleProof(bodyLeaves, bi)})
+ 	}
+ 	wl := in.Weights.Leaves()
+ 	for _, wr := range rec.wrows {
+@@ -201,9 +202,9 @@ func BuildOneStep(in OneStepInput) (*Op, uint32, error) {
+ 		o.Inputs = append(o.Inputs, ProvenRow{Kind: RowWeight, W: wr, Words: row, Proof: MerkleProof(wl, i)})
+ 	}
+ 	if len(rec.inputs) > 0 {
+-		prevLeaves := make([]Hash, len(in.PrevRows))
+-		for i, r := range in.PrevRows {
+-			prevLeaves[i] = TraceLeaf(i, RowRoot(r))
++		outLeaves := make([]Hash, T)
++		for t, r := range in.PrevOutputs {
++			outLeaves[t] = StageOutLeaf(t, RowRoot(r))
+ 		}
+ 		for _, t := range rec.inputs {
+ 			k := fmt.Sprint("i", t)
+@@ -211,8 +212,7 @@ func BuildOneStep(in OneStepInput) (*Op, uint32, error) {
+ 				continue
+ 			}
+ 			seen[k] = true
+-			i := prevIdx[LeafDesc{LR2, st.L0 - 1, t, -1}]
+-			o.Inputs = append(o.Inputs, ProvenRow{Kind: RowInput, Index: t, Words: mem.Input[t], Proof: MerkleProof(prevLeaves, i)})
++			o.Inputs = append(o.Inputs, ProvenRow{Kind: RowInput, Index: t, Words: mem.Input[t], Proof: MerkleProof(outLeaves, t)})
+ 		}
+ 	}
+ 	if rec.tokens {
+diff --git a/node/jobstate/pool_test.go b/node/jobstate/pool_test.go
+index 4ee69927..471dd137 100644
+--- a/node/jobstate/pool_test.go
++++ b/node/jobstate/pool_test.go
+@@ -618,7 +618,7 @@ func playOut(t *testing.T, w *poolWorld, tm *tinyModel, jid Hash, prov *party, s
+ 		j := w.st.Jobs[jid]
+ 		var ops []*Op
+ 		if g := j.Game; g != nil {
+-			if g.Phase == GTree && g.Lo == 0 && g.Size == g.N && !g.PMoved && !g.CMoved {
++			if g.Phase == GTop && !g.PMoved && !g.CMoved {
+ 				games++
+ 			}
+ 			disputant := parties[j.Disputes[0].Challenger]
+@@ -1239,7 +1239,7 @@ func TestBuildOneStepDefeatsALyingChallenger(t *testing.T) {
+ 						Rows: prov.rows[g.Stage], Tokens: prov.tokens[b], InputLeaves: il, StageLeaves: sl,
+ 						Weights: memWeights{tm}}
+ 					if g.Stage%2 == 1 {
+-						in.PrevRows = prov.rows[g.Stage-1]
++						in.PrevOutputs = prov.outputs[g.Stage-1]
+ 						in.PrevReveal = &StageReveal{Stage: g.Stage - 1, Salt: salts[g.Stage-1], Root: prov.root(g.Stage - 1),
+ 							Proof: MerkleProof(sl, int(g.Stage-1))}
+ 					}
+@@ -1362,3 +1362,44 @@ func TestRulesVersionGatesBondBasis(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestAgentTraceCommit: the agent's body/output split and output roots (runtime/agent/game.py,
++// proto.stage_output_root) match TraceCommit and StageOutputRoot.
++func TestAgentTraceCommit(t *testing.T) {
++	raw, err := os.ReadFile("testdata/agent_vectors.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var v struct {
++		TC struct {
++			T        int
++			Rows     [][]uint32
++			BodyRoot string `json:"body_root"`
++			OutRoot  string `json:"out_root"`
++			OutRoot2 string `json:"out_root2"`
++			NBody    int    `json:"n_body"`
++		} `json:"trace_commit"`
++	}
++	if err := json.Unmarshal(raw, &v); err != nil {
++		t.Fatal(err)
++	}
++	cfg := ModelCfg{D: 8, H: 2, Hkv: 1, Hd: 4, I: 8, L: 2, V: 16, Eps: 1e-6, Bs: 0, MaxPos: 64}
++	prog := Program(cfg, v.TC.T, 0, 2)
++	if len(prog) != len(v.TC.Rows) {
++		t.Fatalf("program %d leaves, agent %d", len(prog), len(v.TC.Rows))
++	}
++	body, out, commit := TraceCommit(prog, 2, v.TC.Rows)
++	br, or := MerkleRoot(body), MerkleRoot(out)
++	if hex.EncodeToString(br[:]) != v.TC.BodyRoot || hex.EncodeToString(or[:]) != v.TC.OutRoot || len(body) != v.TC.NBody {
++		t.Fatal("body or output root differs from the agent's")
++	}
++	_, _, outAt := SplitProgram(prog, 2)
++	var outs [][]uint32
++	for _, i := range outAt {
++		outs = append(outs, v.TC.Rows[i])
++	}
++	so := StageOutputRoot(outs)
++	if hex.EncodeToString(so[:]) != v.TC.OutRoot2 || so != or || commit != nodeHash(br, or) {
++		t.Fatal("stage output root differs")
++	}
++}
+diff --git a/node/jobstate/program.go b/node/jobstate/program.go
+index ff263510..97ddf382 100644
+--- a/node/jobstate/program.go
++++ b/node/jobstate/program.go
+@@ -266,3 +266,61 @@ func f32w(v float32) uint32 { return math.Float32bits(v) }
+ func wf32(w uint32) float32 { return math.Float32frombits(w) }
+ 
+ func sqrtF64(x float64) float64 { return math.Sqrt(x) }
++
++// ---------------------------------------------------------------- stage commitments (step 7)
++//
++// A stage is committed by its OUTPUT: the T rows the next stage reads (the last layer's R2
++// rows), as StageOutputRoot. Providers and verifiers then compute only the forward pass and
++// hash T rows per stage. The full trace is built only when a stage is disputed, as
++//   TraceCommit = nodeHash(BodyRoot, OutputRoot)
++// where the body is every program leaf except those output rows, in program order. Every op
++// still depends only on earlier leaves, so bisection over the body and then the outputs ends at
++// one element whose inputs both parties agree on.
++
++// StageOutLeaf is the output-tree leaf of token t.
++func StageOutLeaf(t int, rowRoot Hash) Hash {
++	var b [4 + 4 + 32]byte
++	copy(b[:4], "sout")
++	binary.LittleEndian.PutUint32(b[4:8], uint32(t))
++	copy(b[8:], rowRoot[:])
++	return leafHash(b[:])
++}
++
++// StageOutputRoot commits a stage's output rows (one per token, in token order).
++func StageOutputRoot(rows [][]uint32) Hash {
++	lv := make([]Hash, len(rows))
++	for t, r := range rows {
++		lv[t] = StageOutLeaf(t, RowRoot(r))
++	}
++	return MerkleRoot(lv)
++}
++
++// isOutput reports whether d is one of the stage's output rows (last layer's R2).
++func isOutput(d LeafDesc, l1 int) bool { return d.Op == LR2 && d.Layer == l1-1 }
++
++// SplitProgram returns the body (program order, outputs removed), the program index of each
++// body leaf, and the program index of each output row by token.
++func SplitProgram(prog []LeafDesc, l1 int) (body []LeafDesc, bodyAt []int, outAt []int) {
++	for i, d := range prog {
++		if isOutput(d, l1) {
++			outAt = append(outAt, i)
++		} else {
++			body = append(body, d)
++			bodyAt = append(bodyAt, i)
++		}
++	}
++	return
++}
++
++// TraceCommit splits a full trace (rows in program order) into body leaves, output leaves and
++// the dispute commitment nodeHash(BodyRoot, OutputRoot).
++func TraceCommit(prog []LeafDesc, l1 int, rows [][]uint32) (bodyLeaves, outLeaves []Hash, commit Hash) {
++	_, bodyAt, outAt := SplitProgram(prog, l1)
++	for bi, pi := range bodyAt {
++		bodyLeaves = append(bodyLeaves, TraceLeaf(bi, RowRoot(rows[pi])))
++	}
++	for t, pi := range outAt {
++		outLeaves = append(outLeaves, StageOutLeaf(t, RowRoot(rows[pi])))
++	}
++	return bodyLeaves, outLeaves, nodeHash(MerkleRoot(bodyLeaves), MerkleRoot(outLeaves))
++}
+diff --git a/node/jobstate/state.go b/node/jobstate/state.go
+index b95dfa18..764e523d 100644
+--- a/node/jobstate/state.go
++++ b/node/jobstate/state.go
+@@ -218,7 +218,7 @@ func encodeJob(j *Job) []byte {
+ 	if g := j.Game; g != nil {
+ 		e.w(true, g.Stage, g.Phase, g.ProvRoot, g.ChalRoot, int64(g.N), int64(g.Lo), int64(g.Size), g.HP, g.HC,
+ 			g.PMoved, g.CMoved, g.PL, g.PR, g.CL, g.CR, g.PData, g.CData, int64(g.Leaf), int64(g.RowLen),
+-			int64(g.Block), int64(g.Elem), g.PWord, g.CWord, g.Deadline)
++			int64(g.Block), int64(g.Elem), g.PWord, g.CWord, g.Deadline, g.Tree, int64(g.NB), int64(g.NO), g.PB)
+ 	} else {
+ 		e.w(false)
+ 	}
+diff --git a/node/jobstate/testdata/agent_vectors.json b/node/jobstate/testdata/agent_vectors.json
+index 69d95b65..b618c33a 100644
+--- a/node/jobstate/testdata/agent_vectors.json
++++ b/node/jobstate/testdata/agent_vectors.json
+@@ -26,5 +26,946 @@
+    "d45329395fe0da120a76f75c333c170865e01fc86583fc5b2a8bd1509b0994e6"
+   ]
+  },
+- "result": "8b1e7a9de9266e5035247357045127448600b8dde12c9aa5b2cbc566a1479fda"
++ "result": "8b1e7a9de9266e5035247357045127448600b8dde12c9aa5b2cbc566a1479fda",
++ "trace_commit": {
++  "T": 3,
++  "rows": [
++   [
++    983645465
++   ],
++   [
++    1050211629,
++    3196869580
++   ],
++   [
++    3211001300,
++    3202927260,
++    3212696716
++   ],
++   [
++    1031166243,
++    1068207148,
++    3204186750,
++    3206469489
++   ],
++   [
++    1056623764,
++    1052162533,
++    1037558637,
++    3211670311,
++    3169821061
++   ],
++   [
++    1060241252
++   ],
++   [
++    3215724345,
++    3203026077
++   ],
++   [
++    3220396868,
++    3215265683,
++    3219897849
++   ],
++   [
++    3195059131,
++    3215080368,
++    1049289513,
++    1042318171
++   ],
++   [
++    3191827155,
++    3223392919,
++    3205097415,
++    3175524589,
++    1038618251
++   ],
++   [
++    3217283965
++   ],
++   [
++    3203701780,
++    3212476474
++   ],
++   [
++    3209629685,
++    1065864071,
++    3209607832
++   ],
++   [
++    3171235195,
++    1063413600,
++    3205850839,
++    3185886206
++   ],
++   [
++    1038236422,
++    1031970821,
++    3214724769,
++    1033629545,
++    1068363245
++   ],
++   [
++    3217426646
++   ],
++   [
++    1062994049,
++    1039429602
++   ],
++   [
++    3206821735,
++    1073743571,
++    1061364596
++   ],
++   [
++    3214508620,
++    1033411575,
++    1058251246,
++    3191951386
++   ],
++   [
++    1060033333,
++    3179821628,
++    1059770556,
++    1069031810,
++    3207395380
++   ],
++   [
++    1045431185
++   ],
++   [
++    3203217063,
++    1040339623
++   ],
++   [
++    3214407166,
++    3205778716,
++    3192448921
++   ],
++   [
++    1063654756,
++    1066571426,
++    3215550812,
++    3209391535
++   ],
++   [
++    1059429238,
++    3221161885,
++    3203212442,
++    3183951454,
++    1067509214
++   ],
++   [
++    1060142278
++   ],
++   [
++    3198650500,
++    3200038395
++   ],
++   [
++    3196066205,
++    1069744899,
++    3202033174
++   ],
++   [
++    3197860863,
++    1052018318,
++    3187103359,
++    3192521952
++   ],
++   [
++    3213793729,
++    3158099082,
++    3202555156,
++    1066746797,
++    1059533007
++   ],
++   [
++    3167078612
++   ],
++   [
++    1059789573,
++    3199075170
++   ],
++   [
++    1065790484,
++    3148934860,
++    1058363532
++   ],
++   [
++    3215277053,
++    1051820044,
++    3218609939,
++    3221373652
++   ],
++   [
++    3197887589,
++    3211157928,
++    1042808181,
++    1074768408,
++    3210013647
++   ],
++   [
++    3206527684
++   ],
++   [
++    1045583209,
++    1056730173
++   ],
++   [
++    3191120843,
++    3193102183,
++    1060361373
++   ],
++   [
++    1057298603,
++    3213119357,
++    3181521361,
++    1024493809
++   ],
++   [
++    3213293914,
++    1048906145,
++    3210453769,
++    1064884573,
++    1044733743
++   ],
++   [
++    1035396690
++   ],
++   [
++    3205975458,
++    3186813365
++   ],
++   [
++    3221206567,
++    3213939190,
++    1052362275
++   ],
++   [
++    3221764721,
++    1062779734,
++    3219095575,
++    1061271965
++   ],
++   [
++    3210244734,
++    1061645302,
++    1040586771,
++    3217340162,
++    1067443227
++   ],
++   [
++    1069058524
++   ],
++   [
++    3179726009,
++    3196862145
++   ],
++   [
++    3190010922,
++    3212419989,
++    1066180222
++   ],
++   [
++    3205167863,
++    3176246538,
++    3209368953,
++    3206563412
++   ],
++   [
++    3215166591,
++    1067509670,
++    3189623074,
++    1064781476,
++    1012551529
++   ],
++   [
++    3207709806
++   ],
++   [
++    3198632778,
++    3205458765
++   ],
++   [
++    1006790370,
++    3200262906,
++    3197734743
++   ],
++   [
++    3216012579,
++    3209596276,
++    1070839848,
++    3207321073
++   ],
++   [
++    3213290636,
++    1051506185,
++    1068769663,
++    3216645496,
++    3193276096
++   ],
++   [
++    3206663730
++   ],
++   [
++    3219220758,
++    1060906024
++   ],
++   [
++    3166702966,
++    1032998938,
++    3208681340
++   ],
++   [
++    1055447416,
++    3205107556,
++    3188872504,
++    3213745021
++   ],
++   [
++    3214649665,
++    1068167861,
++    3204567453,
++    1049974561,
++    3171575767
++   ],
++   [
++    3202473417
++   ],
++   [
++    3204581819,
++    1059147032
++   ],
++   [
++    3197800036,
++    3189445643,
++    1018563068
++   ],
++   [
++    1066833875,
++    1059993080,
++    1053025327,
++    3205514807
++   ],
++   [
++    3216041050,
++    1064506469,
++    1064790292,
++    3188725213,
++    1057667302
++   ],
++   [
++    1061686439
++   ],
++   [
++    1062520961,
++    1064034250
++   ],
++   [
++    3202959031,
++    1069673122,
++    3214905437
++   ],
++   [
++    1063033314,
++    1056761002,
++    1063232897,
++    1072726872
++   ],
++   [
++    1069417039,
++    3214054696,
++    3218613860,
++    1062281124,
++    3212962797
++   ],
++   [
++    3159048185
++   ],
++   [
++    1062664289,
++    3218237428
++   ],
++   [
++    3221686763,
++    1048888023,
++    1026936315
++   ],
++   [
++    3195777997,
++    1025365665,
++    3210496704,
++    3217144367
++   ],
++   [
++    3190466450,
++    3212362215,
++    3218234777,
++    1057059921,
++    3178986785
++   ],
++   [
++    1053828226
++   ],
++   [
++    3212657263,
++    3207100042
++   ],
++   [
++    3212820809,
++    3210935030,
++    1044912387
++   ],
++   [
++    3209195782,
++    1052134994,
++    1051587709,
++    1073847357
++   ],
++   [
++    3216131817,
++    1063472530,
++    3182904695,
++    3160792308,
++    3216610595
++   ],
++   [
++    3203112582
++   ],
++   [
++    1061044781,
++    3181963884
++   ],
++   [
++    1034289109,
++    3197425873,
++    1066649841
++   ],
++   [
++    3165644605,
++    3222066076,
++    3207670699,
++    3220963719
++   ],
++   [
++    3226474385,
++    3204953508,
++    1068151319,
++    1027670221,
++    3214284282
++   ],
++   [
++    3211841973
++   ],
++   [
++    1066448879,
++    1042376928
++   ],
++   [
++    1027906266,
++    3176856256,
++    1025329560
++   ],
++   [
++    1062088465,
++    1057846541,
++    1046274481,
++    3213196470
++   ],
++   [
++    1057150982,
++    3207539409,
++    1066140451,
++    3215110603,
++    3188518019
++   ],
++   [
++    3153141191
++   ],
++   [
++    3215560188,
++    1071409553
++   ],
++   [
++    1069215388,
++    3203226330,
++    1061523333
++   ],
++   [
++    1052893652,
++    3223798927,
++    1048589355,
++    3178972142
++   ],
++   [
++    1034579420,
++    3213481738,
++    3196708827,
++    3191245175,
++    1066931065
++   ],
++   [
++    1051408902
++   ],
++   [
++    3149268729,
++    1069790538
++   ],
++   [
++    3205375162,
++    3200738153,
++    3219688302
++   ],
++   [
++    1070127222,
++    1064754812,
++    1063958158,
++    1059798254
++   ],
++   [
++    1038194069,
++    1046260002,
++    3196126978,
++    3192945825,
++    1029598583
++   ],
++   [
++    1069646753
++   ],
++   [
++    1057898896,
++    3178197987
++   ],
++   [
++    3205780234,
++    3206713155,
++    1070409072
++   ],
++   [
++    1057076802,
++    1032476658,
++    3199286975,
++    3213751670
++   ],
++   [
++    3179867830,
++    1063233550,
++    3200842404,
++    3194532424,
++    3194115796
++   ],
++   [
++    1038119683
++   ],
++   [
++    3217811400,
++    3195079748
++   ],
++   [
++    3210394026,
++    1063416874,
++    3208988148
++   ],
++   [
++    1058257238,
++    1069752516,
++    3198193584,
++    3206152423
++   ],
++   [
++    1044645585,
++    3137665391,
++    3212729764,
++    1055653281,
++    1073806903
++   ],
++   [
++    3196331841
++   ],
++   [
++    3192897223,
++    3213213781
++   ],
++   [
++    1050894224,
++    3214908651,
++    3213733866
++   ],
++   [
++    1067699235,
++    3211250630,
++    1066035693,
++    1069751850
++   ],
++   [
++    1048888944,
++    1057860367,
++    1073341276,
++    3192484652,
++    3206008634
++   ],
++   [
++    3215799981
++   ],
++   [
++    1026217227,
++    1069372569
++   ],
++   [
++    1064675339,
++    3211865316,
++    3210410466
++   ],
++   [
++    3204518238,
++    1049994281,
++    3193060649,
++    1046190545
++   ],
++   [
++    1050144313,
++    3197696218,
++    3173289326,
++    1045662964,
++    3182164047
++   ],
++   [
++    1057023678
++   ],
++   [
++    1072658651,
++    1058507647
++   ],
++   [
++    1030003097,
++    3218592444,
++    1053205072
++   ],
++   [
++    3220778178,
++    3216268091,
++    1062914467,
++    1060424658
++   ],
++   [
++    3189344668,
++    3218792869,
++    3200131429,
++    3207446987,
++    1059260415
++   ],
++   [
++    1074822824
++   ],
++   [
++    1046356743,
++    3209134319
++   ],
++   [
++    3214267554,
++    3177562910,
++    3191146822
++   ],
++   [
++    3214107899,
++    1039027111,
++    3214102818,
++    1066293640
++   ],
++   [
++    1065878767,
++    1066064161,
++    3203577534,
++    1057208223,
++    3188145466
++   ],
++   [
++    3200717408
++   ],
++   [
++    3199050880,
++    3215351058
++   ],
++   [
++    3216560263,
++    1061902391,
++    3192116023
++   ],
++   [
++    1046322810,
++    1065367564,
++    3218986825,
++    3209215168
++   ],
++   [
++    1043565306,
++    1053343910,
++    3200323559,
++    1065597989,
++    1045918149
++   ],
++   [
++    3214626843
++   ],
++   [
++    3211675273,
++    1062089562
++   ],
++   [
++    1055750993,
++    3220378736,
++    1068270038
++   ],
++   [
++    1058609229,
++    1068233386,
++    3200545905,
++    3197593294
++   ],
++   [
++    3213897663,
++    1075993870,
++    3191056966,
++    1070281802,
++    3206919413
++   ],
++   [
++    1042793980
++   ],
++   [
++    3218468577,
++    3200517930
++   ],
++   [
++    1065080669,
++    3214948644,
++    1065959105
++   ],
++   [
++    1051503215,
++    3213205551,
++    3204475054,
++    3203074728
++   ],
++   [
++    3175797962,
++    3205054651,
++    3209939236,
++    3197891307,
++    3213062431
++   ],
++   [
++    3215265589
++   ],
++   [
++    3175437492,
++    1063388172
++   ],
++   [
++    3217277556,
++    996534532,
++    3206964103
++   ],
++   [
++    3212453428,
++    1062894308,
++    3204753093,
++    1069533273
++   ],
++   [
++    3209143181,
++    1053156247,
++    3194535136,
++    3208710035,
++    1058435551
++   ],
++   [
++    3189683136
++   ],
++   [
++    1058696194,
++    3175199933
++   ],
++   [
++    3213556743,
++    3184593326,
++    1028968178
++   ],
++   [
++    1064656340,
++    3211264319,
++    3173062743,
++    3218892422
++   ],
++   [
++    1059506240,
++    3213520393,
++    3219601098,
++    3178401114,
++    1066239766
++   ],
++   [
++    3217236244
++   ],
++   [
++    3213575360,
++    3208529731
++   ],
++   [
++    3213923161,
++    1052918879,
++    3209605026
++   ],
++   [
++    3208164657,
++    1058362241,
++    3208735080,
++    1054709082
++   ],
++   [
++    3212356787,
++    3214616411,
++    3219845121,
++    1072577509,
++    3198417150
++   ],
++   [
++    1048168875
++   ],
++   [
++    3170786186,
++    1042533636
++   ],
++   [
++    1028359181,
++    1072971893,
++    3213163404
++   ],
++   [
++    3217513195,
++    3212937189,
++    3215644607,
++    1061107944
++   ],
++   [
++    1062339662,
++    3212187847,
++    3216112077,
++    3199576040,
++    1068634201
++   ],
++   [
++    3224662995
++   ],
++   [
++    1057411331,
++    3213472345
++   ],
++   [
++    1065691840,
++    3213490537,
++    3197248006
++   ],
++   [
++    3217083841,
++    3212455314,
++    1068589869,
++    1062343026
++   ],
++   [
++    3201148787,
++    3210658718,
++    3220334662,
++    3200879967,
++    3170707665
++   ],
++   [
++    3182175409
++   ],
++   [
++    3183482363,
++    3213858677
++   ],
++   [
++    3179788954,
++    3172886522,
++    1067790627
++   ],
++   [
++    1072623903,
++    3188475610,
++    3208916128,
++    3179615578
++   ],
++   [
++    3206253841,
++    3208515620,
++    3178248996,
++    3213200128,
++    1058744784
++   ],
++   [
++    3184841133
++   ],
++   [
++    1048576279,
++    3191559330
++   ],
++   [
++    3208260953,
++    3211963770,
++    3195205755
++   ],
++   [
++    3205266319,
++    1047495637,
++    3146856402,
++    3215876113
++   ],
++   [
++    1032419044,
++    3215712986,
++    3206402426,
++    3197547908,
++    3221541191
++   ],
++   [
++    1035692098
++   ],
++   [
++    1041931105,
++    3189887256
++   ],
++   [
++    3201908765,
++    3200207099,
++    3212443262
++   ],
++   [
++    3196720683,
++    3205330936,
++    1035715981,
++    3214549282
++   ],
++   [
++    1047608955,
++    1041410041,
++    3188782553,
++    3202408308,
++    1057842726
++   ],
++   [
++    3218411947
++   ],
++   [
++    1055637642,
++    1048108752
++   ]
++  ],
++  "body_root": "97dc3bbc39eb96aad3e3efb75c55adfcc2c342cb077024e4029b2dfdb90008e3",
++  "out_root": "e8a16040901ff4457b8a36bb1b87f6ca9013dd6e289c1d56cd52d96f35b158c4",
++  "out_root2": "e8a16040901ff4457b8a36bb1b87f6ca9013dd6e289c1d56cd52d96f35b158c4",
++  "n_body": 184
++ }
+ }
+\ No newline at end of file
+diff --git a/node/rpcjobs.go b/node/rpcjobs.go
+index 68412a7b..cbff7f66 100644
+--- a/node/rpcjobs.go
++++ b/node/rpcjobs.go
+@@ -163,7 +163,8 @@ func jobJSON(j *jobstate.Job) map[string]interface{} {
+ 	if g := j.Game; g != nil {
+ 		out["game"] = map[string]interface{}{"stage": g.Stage, "phase": g.Phase, "lo": g.Lo, "size": g.Size,
+ 			"n": g.N, "leaf": g.Leaf, "block": g.Block, "elem": g.Elem, "pmoved": g.PMoved, "cmoved": g.CMoved,
+-			"deadline": g.Deadline, "provroot": hx(g.ProvRoot[:]), "chalroot": hx(g.ChalRoot[:])}
++			"deadline": g.Deadline, "provroot": hx(g.ProvRoot[:]), "chalroot": hx(g.ChalRoot[:]),
++			"tree": g.Tree, "nb": g.NB, "no": g.NO}
+ 	}
+ 	var reqs []interface{}
+ 	for _, r := range j.DataReqs {
+-- 
+2.30.2
+

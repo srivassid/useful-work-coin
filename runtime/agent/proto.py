@@ -21,6 +21,20 @@ def u32(v: int) -> bytes:
     return struct.pack("<I", v)
 
 
+def stage_out_leaf(t: int, rroot: bytes) -> bytes:
+    """jobstate.StageOutLeaf: the output-tree leaf of token t."""
+    return _leaf_hash(b"sout" + u32(t) + rroot)
+
+
+def stage_out_leaves(rows) -> list[bytes]:
+    return [stage_out_leaf(t, row_root(np.ascontiguousarray(r, dtype=np.float32))) for t, r in enumerate(rows)]
+
+
+def stage_output_root(rows) -> bytes:
+    """jobstate.StageOutputRoot: what a stage is committed by (its T output rows)."""
+    return merkle_root(stage_out_leaves(rows))
+
+
 def stage_leaf(stage: int, salt: bytes, root: bytes) -> bytes:
     """Leaf of TRACE_COMMIT's stage_root: sha256(0x00 || "stage" || u32 stage || salt || root)."""
     return _leaf_hash(b"stage" + u32(stage) + salt + root)
@@ -129,13 +143,12 @@ def verify_merkle(root: bytes, leaf: bytes, i: int, n: int, proof: list[bytes]) 
     return ok and h == root
 
 
-def check_stage_input(pkg: dict, stage: int, stage_root: bytes, stages: int, prev_leaves: int):
+def check_stage_input(pkg: dict, stage: int, stage_root: bytes, stages: int):
     """A served stage input, checked against the provider's on-chain commitment: the previous
-    stage's (salt, root) must open stage_root, and every row must open that root. Returns the
-    (T, D) float32 rows, or raises ValueError. A provider cannot frame a verifier with a wrong
-    input, because only the committed rows pass."""
+    stage's (salt, output root) must open stage_root, and every row must open that output root.
+    Returns the (T, D) float32 rows, or raises ValueError. A provider cannot frame a verifier
+    with a wrong input, because only the committed rows pass."""
     import base64
-    from detrt.stage import leaf_hash, row_root
     rv = pkg["reveal"]
     if rv["stage"] != stage - 1:
         raise ValueError("reveal is not the previous stage")
@@ -144,10 +157,9 @@ def check_stage_input(pkg: dict, stage: int, stage_root: bytes, stages: int, pre
                          [bytes.fromhex(h) for h in rv["proof"]]):
         raise ValueError("previous stage does not open the stage commitment")
     T, D = pkg["shape"]
-    rows = np.frombuffer(base64.b64decode(pkg["rows"]), dtype="<f4").reshape(T, D)
+    rows = np.frombuffer(base64.b64decode(pkg["rows"]), dtype="<f4").reshape(T, D).copy()
     for t in range(T):
-        i = pkg["idx"][t]
-        if not verify_merkle(root, leaf_hash(i, row_root(rows[t].copy())), i, prev_leaves,
+        if not verify_merkle(root, stage_out_leaf(t, row_root(rows[t])), t, T,
                              [bytes.fromhex(h) for h in pkg["proofs"][t]]):
-            raise ValueError(f"row {t} does not open the previous stage")
-    return rows.copy()
+            raise ValueError(f"row {t} does not open the previous stage's output")
+    return rows

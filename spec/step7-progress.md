@@ -248,6 +248,31 @@ Proposed protocol change, not yet made:
 This changes `TRACE_COMMIT`, the verifier result hashes and the start of a dispute game
 (consensus), and the agents.
 
+## Output commitments (patch 0014, 2026-11-06)
+
+Stages are committed by their outputs; full traces are built only for disputed stages (spec in
+`stage-program.md`, last section). Results on .245 (Qwen3-1.7B, 3080 Ti):
+
+| | Before (full-trace roots) | After (output roots) |
+|---|---|---|
+| Provider, per sequence-stage | 1.1 s (batched), 3.2 s (reference) | **0.02 s** |
+| Verifier, one sampled stage from a served input | 3.1 s | **0.04 s** |
+| Live λ with mining on (32–128 sequences) | 1.6 × 10⁻⁴ | **0.03** |
+
+- Output roots match the reference runtime exactly.
+- Served inputs are checked against the commitment.
+- Fault suite: all 50 of 60 random deviations that change an output are caught by one
+  recomputation; the 10 absorbed by int8 rounding settle with no penalty.
+- The agent's Python trace split matches Go's `TraceCommit` (`TestAgentTraceCommit`).
+
+**What limits λ now:** the deterministic float ops. A GPU profile shows about 68,000 kernel
+launches for 16 sequences × 7 stages, mostly dtype copies and elementwise ops from the
+fp64-emulated arithmetic; the int8 GEMMs are about 3% of the time. Next lever: fused
+deterministic kernels (same rounding) or CUDA graphs. No protocol change is needed.
+
+This is a consensus change from genesis: the stopped devnet's chain is not valid under it.
+The testnet starts fresh with it.
+
 ## Where to resume (2026-11-06, end of session)
 
 The devnet keeps running on its own: nodes, gateways, miners (box 71 GPUs 0 and 2, the 5090),
