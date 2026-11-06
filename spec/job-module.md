@@ -26,7 +26,7 @@ needs no job-module rules, and a block is never invalid because of a job operati
 | # | Op / event | By | Effect |
 |---|---|---|---|
 | 1 | `MODEL_REG(weights_root, runtime_hash, layer_groups, rotation_block)` | registrant | locks `ModelRegBond`; model id = hash of the record |
-| 2 | `JOB_POST(model, input_root, stages S, fee F, deadline, k, n)` | client | escrows F; fixes verifier pay V = max(F·1%, k·n·`VerifierFloorPerSample`) and treasury T = F·1%; needs F ≥ V + T |
+| 2 | `JOB_POST(model, input_root, stages S, fee F, deadline, k, n)` | client | escrows F; fixes verifier pay V = max(F·1%, k·n·`VerifierFloorPerSample`) and treasury T = F·1%; needs F ≥ V + T; F ≥ `LargeJobRewards` block rewards needs k ≥ `MinKLarge` (step 6) |
 | 3 | `JOB_ACCEPT(job, bond B)` | provider | needs B ≥ F · `MinBondBP`; locks B; before the deadline |
 | 4 | `TRACE_COMMIT(job, stage_root, output_root)` | provider | before the deadline. stage_root = Merkle root over H(stage ‖ salt_i ‖ root_i), so unrevealed roots stay hidden |
 | 5 | committee draw (automatic) | – | at the end of block commit+`CommitteeDelay`: k verifiers by stake-weighted lottery on H(that block's hash ‖ job ‖ account), excluding client and provider |

@@ -1,0 +1,203 @@
+From fe68fa3f18162e95c183cc5fa798ddd895c3e564 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 08:47:33 +0530
+Subject: [PATCH] jobstate: jobs worth LargeJobRewards block rewards or more
+ need k >= MinKLarge (build step 6)
+
+A provider that also mines can re-roll its verifier committee by discarding the seed block.
+sim.py part H: with a third of stake colluding and a tampering gain of 10x the job, k = 2
+becomes profitable to attack from about 5 block rewards; k = 3 is not, up to 100. The node
+now passes the block subsidy to ApplyBlock; a JOB_POST with fee >= 5 x the miner's share of
+the subsidy needs k >= 3 (verifier pay is 1% of such fees whatever k is).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/blockchain/jobs.go        | 12 +++++++-----
+ node/blockchain/jobs_test.go   |  1 +
+ node/jobstate/apply.go         |  8 +++++++-
+ node/jobstate/jobstate_test.go |  4 +++-
+ node/jobstate/pool_test.go     | 21 +++++++++++++++++++++
+ node/jobstate/state.go         |  2 ++
+ node/jobstate/types.go         |  7 +++++++
+ 7 files changed, 48 insertions(+), 7 deletions(-)
+
+diff --git a/node/blockchain/jobs.go b/node/blockchain/jobs.go
+index 63a776d4..1f0e716d 100644
+--- a/node/blockchain/jobs.go
++++ b/node/blockchain/jobs.go
+@@ -246,10 +246,10 @@ func (b *BlockChain) checkJobRules(node *blockNode, block *btcutil.Block, deps [
+ 		return 0, err
+ 	}
+ 	st := parentState.Clone()
++	subsidy := CalcBlockSubsidy(node.height, b.chainParams)
+ 	res := jobstate.ApplyBlock(st, *jp, jobstate.BlockInput{Height: node.height,
+-		PrevHash: jobstate.Hash(node.parent.hash), Deposits: deps, Ops: ops})
++		PrevHash: jobstate.Hash(node.parent.hash), Subsidy: subsidy, Deposits: deps, Ops: ops})
+ 
+-	subsidy := CalcBlockSubsidy(node.height, b.chainParams)
+ 	coinbase := block.Transactions()[0].MsgTx()
+ 	var pool int64
+ 	var commits [][]byte
+@@ -301,7 +301,8 @@ func (b *BlockChain) ensureJobState(node *blockNode, block *btcutil.Block, stxos
+ 	deps, ops := jobOpsFromStxos(block, stxos)
+ 	st := parentState.Clone()
+ 	jobstate.ApplyBlock(st, *b.chainParams.JobModule, jobstate.BlockInput{Height: node.height,
+-		PrevHash: jobstate.Hash(node.parent.hash), Deposits: deps, Ops: ops})
++		PrevHash: jobstate.Hash(node.parent.hash), Subsidy: CalcBlockSubsidy(node.height, b.chainParams),
++		Deposits: deps, Ops: ops})
+ 	b.jobs.put(node.hash, st)
+ 	return st, nil
+ }
+@@ -341,11 +342,12 @@ func (b *BlockChain) JobTemplateFor(txs []*btcutil.Tx, extraDeposits []jobstate.
+ 		return nil, err
+ 	}
+ 	deps, ops := jobOpsFromBlock(blk, view)
+-	pool := jobstate.PoolIssuance(*jp, CalcBlockSubsidy(height, b.chainParams))
++	subsidy := CalcBlockSubsidy(height, b.chainParams)
++	pool := jobstate.PoolIssuance(*jp, subsidy)
+ 	deps = append(append([]jobstate.Deposit{{Account: jobstate.PoolAccount, Amount: pool}}, extraDeposits...), deps...)
+ 	st := parentState.Clone()
+ 	res := jobstate.ApplyBlock(st, *jp, jobstate.BlockInput{Height: height, PrevHash: jobstate.Hash(tip.hash),
+-		Deposits: deps, Ops: ops})
++		Subsidy: subsidy, Deposits: deps, Ops: ops})
+ 	return &JobTemplate{PoolDeposit: pool, Withdrawals: res.Withdrawals, Root: res.Root}, nil
+ }
+ 
+diff --git a/node/blockchain/jobs_test.go b/node/blockchain/jobs_test.go
+index 10c3a4c4..aeb2889a 100644
+--- a/node/blockchain/jobs_test.go
++++ b/node/blockchain/jobs_test.go
+@@ -438,6 +438,7 @@ func (c *jchain) buildBlockOn(parent *btcutil.Block, ps *jobstate.State) (*btcut
+ 	pool := jobstate.PoolIssuance(c.jp, subsidy)
+ 	st := ps.Clone()
+ 	res := jobstate.ApplyBlock(st, c.jp, jobstate.BlockInput{Height: height, PrevHash: jobstate.Hash(*parent.Hash()),
++		Subsidy:  subsidy,
+ 		Deposits: []jobstate.Deposit{{Account: jobstate.PoolAccount, Amount: pool}}})
+ 	cbScript, _ := txscript.NewScriptBuilder().AddInt64(int64(height)).AddInt64(time.Now().UnixNano()).Script()
+ 	cb := wire.NewMsgTx(1)
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+index c3013042..b35c6313 100644
+--- a/node/jobstate/apply.go
++++ b/node/jobstate/apply.go
+@@ -26,7 +26,8 @@ type Verdict struct {
+ // BlockInput is everything the module needs from one block, in transaction order.
+ type BlockInput struct {
+ 	Height   int32
+-	PrevHash Hash // hash of the previous block: randomness for committee draws in this block
++	PrevHash Hash   // hash of the previous block: randomness for committee draws in this block
++	Subsidy  Amount // this block's subsidy (0 disables the large-job rule, as in unit tests)
+ 	Deposits []Deposit
+ 	Ops      []*Op
+ 	Verdicts []Verdict
+@@ -46,6 +47,8 @@ func PoolIssuance(p Params, subsidy Amount) Amount { return subsidy * p.PoolShar
+ // failed op is reported in OpErrors and has no effect.
+ func ApplyBlock(st *State, p Params, b BlockInput) *BlockResult {
+ 	res := &BlockResult{}
++	st.reward = b.Subsidy - PoolIssuance(p, b.Subsidy)
++	defer func() { st.reward = 0 }()
+ 	income := Amount(0) // this block's pool income (the coinbase's pool deposit, plus any donations)
+ 	for _, d := range b.Deposits {
+ 		if d.Amount > 0 {
+@@ -353,6 +356,9 @@ func (s *State) jobPost(p Params, h int32, o *Op) error {
+ 	case o.U2 == 0 || int(o.U2) > m.Cfg.MaxPos:
+ 		return errors.New("bad sequence length")
+ 	}
++	if s.reward > 0 && p.LargeJobRewards > 0 && o.Amount/p.LargeJobRewards >= s.reward && int(o.K) < p.MinKLarge {
++		return fmt.Errorf("a fee of %d block rewards or more needs k >= %d", p.LargeJobRewards, p.MinKLarge)
++	}
+ 	vp, tc := JobPay(p, o.Amount, int(o.K), int(o.N))
+ 	if o.Amount < vp+tc {
+ 		return errors.New("fee does not cover verifier pay and treasury share")
+diff --git a/node/jobstate/jobstate_test.go b/node/jobstate/jobstate_test.go
+index f1fe5690..bc43d2bb 100644
+--- a/node/jobstate/jobstate_test.go
++++ b/node/jobstate/jobstate_test.go
+@@ -32,6 +32,8 @@ type sim struct {
+ 	refN uint64
+ 	// income is deposited to PoolAccount in every block (the coinbase's pool share)
+ 	income Amount
++	// subsidy is passed to ApplyBlock (0: the large-job rule is off)
++	subsidy Amount
+ }
+ 
+ func newSim(t *testing.T, seed uint64) *sim {
+@@ -67,7 +69,7 @@ func (s *sim) block(deps []Deposit, ops []*Op, verdicts []Verdict) *BlockResult
+ 	}
+ 	before := s.st.Clone()
+ 	parentRoot := before.Root()
+-	in := BlockInput{Height: s.h, PrevHash: prev, Deposits: deps, Ops: ops, Verdicts: verdicts}
++	in := BlockInput{Height: s.h, PrevHash: prev, Subsidy: s.subsidy, Deposits: deps, Ops: ops, Verdicts: verdicts}
+ 	res := ApplyBlock(s.st, s.p, in)
+ 	// a snapshot must not share mutable state with the state a block is applied to (the node
+ 	// evaluates competing blocks on clones of one cached parent state)
+diff --git a/node/jobstate/pool_test.go b/node/jobstate/pool_test.go
+index 25f32b02..c2ee77ac 100644
+--- a/node/jobstate/pool_test.go
++++ b/node/jobstate/pool_test.go
+@@ -1117,3 +1117,24 @@ func TestStep5Vectors(t *testing.T) {
+ 		t.Fatal("canary proof from the Python tool does not verify")
+ 	}
+ }
++
++// TestLargeJobsNeedLargerCommittees: a fee of LargeJobRewards block rewards or more needs
++// k >= MinKLarge (build step 6, sim.py part H: re-rolling committees by withholding blocks).
++func TestLargeJobsNeedLargerCommittees(t *testing.T) {
++	w := newWorld(t, 801, 4)
++	w.subsidy = 10_000_000
++	reward := w.subsidy - PoolIssuance(w.p, w.subsidy) // 9,000,000 to the miner
++	big := reward * w.p.LargeJobRewards
++	post := func(fee Amount, k uint8) *Op {
++		return &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, H1: w.randHash(), U1: 8, Amount: fee,
++			Deadline: w.h + 20, K: k, N: 2, U2: 4}
++	}
++	r := w.block([]Deposit{{w.client, 10 * big}}, []*Op{post(big, 2), post(big, 3), post(big-1, 2)}, nil)
++	if r.OpErrors[0] == nil || r.OpErrors[1] != nil || r.OpErrors[2] != nil {
++		t.Fatalf("large-job rule: %v", r.OpErrors)
++	}
++	w.subsidy = 0 // no subsidy information: the rule is off
++	if r := w.block(nil, []*Op{post(big, 2)}, nil); r.OpErrors[0] != nil {
++		t.Fatal(r.OpErrors[0])
++	}
++}
+diff --git a/node/jobstate/state.go b/node/jobstate/state.go
+index 3ca4bc3b..b95dfa18 100644
+--- a/node/jobstate/state.go
++++ b/node/jobstate/state.go
+@@ -23,6 +23,8 @@ type State struct {
+ 	Proposals  map[Hash]*Proposal // council actions waiting for approvals
+ 	FECommits  map[Hash]*FECommit // forced-error commitments and their reserves
+ 	Stats      Stats
++
++	reward Amount // miner's share of the current block's subsidy, set only inside ApplyBlock
+ }
+ 
+ func NewState() *State {
+diff --git a/node/jobstate/types.go b/node/jobstate/types.go
+index ba050e09..06cacc9e 100644
+--- a/node/jobstate/types.go
++++ b/node/jobstate/types.go
+@@ -78,6 +78,12 @@ type Params struct {
+ 	Council          []AccountID
+ 	CouncilThreshold int
+ 	ProposalWindow   int32
++
++	// Large jobs (build step 6): a JOB_POST whose fee is at least LargeJobRewards block rewards
++	// (the miner's share of the subsidy) needs k >= MinKLarge, because a provider that mines can
++	// re-roll the committee by discarding seed blocks (spec/step6-results.md, sim.py part H).
++	LargeJobRewards int64
++	MinKLarge       int
+ }
+ 
+ // DefaultParams follow the starting values of Design v3 (fee split 98/1/1, bond >= 50% of fee,
+@@ -93,6 +99,7 @@ func DefaultParams() Params {
+ 		GameWindow: 10, ServeWindow: 10,
+ 		PoolEpoch: 60, PoolSpendBP: 10_000,
+ 		WatchFee: 10_000, Jackpot: 5_000_000, FERevealWindow: 20_160, ProposalWindow: 1440,
++		LargeJobRewards: 5, MinKLarge: 3,
+ 	}
+ }
+ 
+-- 
+2.30.2
+

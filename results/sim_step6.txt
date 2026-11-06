@@ -1,0 +1,222 @@
+A. Public-good pool equilibrium (homogeneous GPUs)
+  rho  lambda   u sim  u formula   H sim   1-rho
+ 0.05    0.50   0.100      0.100   0.950   0.950
+ 0.10    0.50   0.200      0.200   0.900   0.900
+ 0.20    0.50   0.400      0.400   0.800   0.800
+ 0.30    0.50   0.600      0.600   0.700   0.700
+ 0.05    0.70   0.166      0.167   0.950   0.950
+ 0.10    0.70   0.333      0.333   0.900   0.900
+ 0.20    0.70   0.667      0.667   0.800   0.800
+ 0.30    0.70   1.000      1.000   0.700   0.700
+ 0.05    0.90   0.500      0.500   0.950   0.950
+ 0.10    0.90   1.000      1.000   0.900   0.900
+ 0.20    0.90   1.000      1.000   0.900   0.800
+ 0.30    0.90   1.000      1.000   0.900   0.700
+
+A2. Heterogeneous GPUs (lambda_i uniform +/- 0.2 around the mean)
+rho=0.10 mean lambda=0.50: u sim=0.256 (homogeneous formula 0.200), H=0.911
+rho=0.20 mean lambda=0.50: u sim=0.441 (homogeneous formula 0.400), H=0.831
+rho=0.10 mean lambda=0.70: u sim=0.403 (homogeneous formula 0.333), H=0.929
+rho=0.20 mean lambda=0.70: u sim=0.629 (homogeneous formula 0.667), H=0.862
+
+B. Self-dealing a premium ticket job (M = 4, burn 10%)
+  fee   at floor: extra reward 0.01245, burn 0.01229, net +0.00017 per job (expected net +0.00000)
+  fee half floor: extra reward 0.01235, burn 0.00614, net +0.00621 per job (expected net +0.00614)
+
+C. Skipping stages (S = 1000 stages, cost 1 per stage)
+fee/cost bond/cost samples n  worst m  max gain  overhead
+     1.0       0.0         1      533     0.000     0.10%
+     1.0       0.0         2     1000     0.000     0.20%
+     1.0       0.0         4     1000     0.000     0.40%
+     1.0       0.5         1        1    -0.500     0.10%
+     1.0       0.5         2        1    -2.000     0.20%
+     1.0       0.5         4        1    -5.000     0.40%
+     1.2       0.0         1        1    -0.200     0.10%
+     1.2       0.0         2        1    -1.400     0.20%
+     1.2       0.0         4        1    -3.800     0.40%
+     1.2       0.5         1        1    -0.700     0.10%
+     1.2       0.5         2        1    -2.400     0.20%
+     1.2       0.5         4        1    -5.800     0.40%
+  Monte Carlo check: S=1000, m=50, n=3: sim 0.1430 vs exact 0.1428
+
+D. Fully faked job passes (k verifiers, colluding stake q, watcher rate w)
+    q   k     w      sim  formula
+ 0.10   2  0.00   0.0100   0.0100
+ 0.10   2  0.10   0.0091   0.0090
+ 0.10   3  0.00   0.0010   0.0010
+ 0.10   3  0.10   0.0009   0.0009
+ 0.10   5  0.00   0.0000   0.0000
+ 0.10   5  0.10   0.0000   0.0000
+ 0.33   2  0.00   0.1096   0.1089
+ 0.33   2  0.10   0.0979   0.0980
+ 0.33   3  0.00   0.0362   0.0359
+ 0.33   3  0.10   0.0327   0.0323
+ 0.33   5  0.00   0.0038   0.0039
+ 0.33   5  0.10   0.0035   0.0035
+ 0.50   2  0.00   0.2491   0.2500
+ 0.50   2  0.10   0.2254   0.2250
+ 0.50   3  0.00   0.1256   0.1250
+ 0.50   3  0.10   0.1117   0.1125
+ 0.50   5  0.00   0.0310   0.0312
+ 0.50   5  0.10   0.0283   0.0281
+
+E. Measured lambda (compiled runtime, 8192-token batches)
+  table matches results/*.json
+  GPU       model  lam emb  lam scr mining +time  client/rent int8  client/rent bf16  GMAC given up/token
+ 3080  Qwen3-1.7B    0.379    0.369          39%              0.88              0.47                 2.31
+ 3080    Qwen3-4B    0.488    0.468          33%              0.70                 -                 3.81
+ 5090  Qwen3-1.7B    0.357    0.334          42%              0.93              0.50                 2.54
+ 5090    Qwen3-4B    0.407    0.394          35%              0.82              0.43                 5.29
+ 5090    Qwen3-8B    0.492    0.481          30%              0.67              0.32                 7.17
+  client/rent < 1: buying a job costs less than renting the same GPU at cost to run it without mining.
+  GMAC given up per token: hashes a GPU forgoes per pool token; the pool's open race goes to the lowest first.
+
+F. GPU count responding to revenue (free entry; 6000 3080s + 1500 5090s, electricity $0.03-0.20/kWh)
+  Y = $300/h of block rewards. rho = 0: 3340 GPUs on (3080 2284, 5090 1056), H = 501.3 PMAC/s, cost $240/h
+  rho  demand    on  3080 noise/pool/cli  5090 noise/pool/cli  u hash formula  H kept  fixed-N  useful pool Mtok/h client/rent
+ 0.00    0.0M  3340    2284/    0/    0    1056/    0/    0    0.0%    0.0%   1.000    1.000    0.0%           0            
+ 0.05    0.0M  3340    1599/  685/    0    1056/    0/    0    9.8%    9.8%   0.950    0.950   20.5%       23632            
+ 0.10    0.0M  3340     913/ 1371/    0    1056/    0/    0   19.5%   19.5%   0.900    0.900   41.0%       47298            
+ 0.20    0.0M  3514       0/ 2509/    0    1005/    0/    0   35.8%   39.1%   0.816    0.800   71.4%       86557            
+ 0.30    0.0M  3866       0/ 2981/    0     830/   55/    0   46.4%   58.6%   0.752    0.700   78.5%      109948            
+ 0.00    1.5M  3364    2157/    0/  143    1064/    0/    0    0.0%    0.0%   0.997    1.000    4.3%           0        0.68
+ 0.05    1.5M  3366    1472/  684/  145    1065/    0/    0    9.7%    9.8%   0.948    0.950   24.6%       23597        0.69
+ 0.10    1.5M  3367     769/ 1364/  169    1065/    0/    0   19.3%   19.5%   0.897    0.900   45.5%       47056        0.68
+ 0.20    1.5M  3596       0/ 2442/  156     998/    0/    0   34.5%   39.1%   0.818    0.800   72.2%       84246        0.78
+ 0.30    1.5M  3905       0/ 2957/   51     804/   55/   38   45.6%   58.6%   0.747    0.700   79.4%      109120        0.91
+  u hash = pool GPUs' share of active noise-mining capacity (the formula's u, rho/(1-lam)); useful = share of GPUs by count on pool or client work
+  demand in tokens/s of 4B embeddings; client/rent = equilibrium client price per token over
+  renting a GPU for what it would earn noise mining and running the job in int8 without mining
+  Coin price shock (rho = 0.10): block rewards fall from $300/h to $150/h, then recover
+    Y=$150/h: 1934 GPUs on, H = 0.537 of the $300 baseline, useful 42.2%, cost $129/h
+    Y=$300/h: 3341 GPUs on, H = 0.900 of the $300 baseline, useful 41.0%, cost $240/h
+
+G1. Risk-averse cheaters (CARA, risk aversion a per unit of the job's cost S*c)
+fee/cost bond/cost   n  a*S*c  worst m best CE gain
+     1.0       0.0   1    0.0      535        0.000
+     1.0       0.0   1    0.5     1000        0.000
+     1.0       0.0   1    2.0     1000        0.000
+     1.0       0.5   1    0.0        1       -0.500
+     1.0       0.5   1    0.5        1       -1.233
+     1.0       0.5   1    2.0        1       -8.453
+     1.0       0.5   2    0.0        1       -2.000
+     1.0       0.5   2    0.5        1       -3.463
+     1.0       0.5   2    2.0        1      -17.730
+  Risk aversion only makes cheating worse, so bonds sized for a risk-neutral cheater are conservative.
+
+G2. Honest providers' risk premium per job, as a share of the fee F
+  (false slash with probability eps loses F+B; bond capital locked for job + challenge window ~1.5 days at 15%/year; CARA risk aversion a per unit of F)
+ bond/F     eps   a*F  capital     risk    total
+   0.25   0e+00   1.0  0.0154%  0.0000%  0.0154%
+   0.25   1e-04   1.0  0.0154%  0.0249%  0.0403%
+   0.25   1e-03   1.0  0.0154%  0.2487%  0.2641%
+   0.50   0e+00   1.0  0.0308%  0.0000%  0.0308%
+   0.50   1e-04   1.0  0.0308%  0.0348%  0.0656%
+   0.50   1e-03   1.0  0.0308%  0.3476%  0.3784%
+   1.00   0e+00   1.0  0.0616%  0.0000%  0.0616%
+   1.00   1e-04   1.0  0.0616%  0.0639%  0.1255%
+   1.00   1e-03   1.0  0.0616%  0.6369%  0.6985%
+   2.00   0e+00   1.0  0.1233%  0.0000%  0.1233%
+   2.00   1e-04   1.0  0.1233%  0.1907%  0.3140%
+   2.00   1e-03   1.0  0.1233%  1.8906%  2.0139%
+  With a bit-exact runtime (eps ~ 0) a bond costs an honest provider only capital: 0.06% of the fee at bond = F.
+
+G3. Payout variance: noise mining is a lottery, pool units are paid every epoch
+  a GPU with 0.01% of hashrate: daily solo-mining income CV = 2.64; pool-unit income CV ~ 0 (equal split of each epoch's budget, 24 epochs/day)
+  a GPU with 0.10% of hashrate: daily solo-mining income CV = 0.83; pool-unit income CV ~ 0 (equal split of each epoch's budget, 24 epochs/day)
+  A pool GPU still mines its lam share (a lottery), but its pool income is a near-deterministic
+  share of each epoch's budget. Solo miners pay mining pools (~1-2%) to remove variance; the
+  same fee on the pool GPU's mined part is smaller, so risk aversion tilts slightly toward pool work:
+                                    scenario 3080 pool 5090 pool  u hash  H kept
+                                risk-neutral      1371         0   19.5%   0.900
+          mining-pool fee 2% on mined income      1377         0   19.9%   0.899
+   + false-slash premium 0.5% on pool income      1371         0   19.8%   0.899
+pool income discounted 10% (strong aversion)      1237         0   17.7%   0.903
+
+H. Block withholding: re-rolling the committee by discarding the seed block
+  A provider that also mines (hashrate share alpha) sees the committee its own seed block would
+  draw, and can discard the block when an honest verifier is in it. Fully faked job; loss if
+  caught L = 1.5 job costs (fee + 50% bond); colluding stake q = 1/3; watchers check w = 10%.
+  V = the attacker's gain if the fake passes, in job costs (1 = the compute it saved; more for
+  tampering with chosen outputs). Job size in block rewards R.
+  k  alpha    V  job/R    pass  reroll     sim discards  gain/job      sim
+  2   0.30    1      1  0.1000  0.1000  0.0988    0.000    -1.250   -1.253
+  2   0.30    1     10  0.1000  0.1370  0.1368    0.369    -1.195   -1.195
+  2   0.30    1    100  0.1000  0.1370  0.1371    0.371    -1.161   -1.161
+  2   0.30   10      1  0.1000  0.1370  0.1365    0.368    -0.295   -0.298
+  2   0.30   10     10  0.1000  0.1370  0.1382    0.371    +0.038   +0.052
+  2   0.30   10    100  0.1000  0.1370  0.1381    0.370    +0.072   +0.084
+  3   0.30    1      1  0.0333  0.0333  0.0339    0.000    -1.417   -1.415
+  3   0.30    1     10  0.0333  0.0333  0.0336    0.000    -1.417   -1.416
+  3   0.30    1    100  0.0333  0.0469  0.0474    0.410    -1.387   -1.386
+  3   0.30   10      1  0.0333  0.0333  0.0341    0.000    -1.117   -1.108
+  3   0.30   10     10  0.0333  0.0469  0.0458    0.410    -1.001   -1.014
+  3   0.30   10    100  0.0333  0.0469  0.0467    0.411    -0.964   -0.968
+  5   0.30    1      1  0.0037  0.0037  0.0036    0.000    -1.491   -1.491
+  5   0.30    1     10  0.0037  0.0037  0.0037    0.000    -1.491   -1.491
+  5   0.30    1    100  0.0037  0.0037  0.0038    0.000    -1.491   -1.490
+  5   0.30   10      1  0.0037  0.0037  0.0035    0.000    -1.457   -1.459
+  5   0.30   10     10  0.0037  0.0037  0.0037    0.000    -1.457   -1.458
+  5   0.30   10    100  0.0037  0.0053  0.0051    0.427    -1.444   -1.446
+  pass = q^k (1-w) without re-rolls; reroll = x / (1 - alpha (1-x)) when discarding pays.
+
+  Job size (in block rewards) from which re-rolling pays:
+    q   k  alpha       V=1      V=10
+ 0.33   2   0.10     4.5 R     0.9 R
+ 0.33   2   0.30     4.5 R     0.9 R
+ 0.33   3   0.10    12.6 R     2.8 R
+ 0.33   3   0.30    12.6 R     2.8 R
+ 0.33   5   0.10   112.2 R    25.1 R
+ 0.33   5   0.30   112.2 R    25.1 R
+ 0.50   2   0.10     1.8 R     0.4 R
+ 0.50   2   0.30     1.8 R     0.4 R
+ 0.50   3   0.10     4.0 R     0.8 R
+ 0.50   3   0.30     4.0 R     0.8 R
+ 0.50   5   0.10    15.8 R     3.2 R
+ 0.50   5   0.30    15.8 R     3.2 R
+  Re-rolling multiplies the pass chance by at most 1/(1-alpha) and never makes a job that
+  loses money on average (V = 1) profitable; it matters for tampering (V >> 1) on large jobs.
+  A longer draw delay does not help: whoever mines the seed block can always discard it.
+
+  Private (VRF) sortition is immune to re-rolls but its committee size varies; expected
+  seats needed to match a fixed committee of k (no re-rolls):
+    q=0.33 k=2:  3.3 expected seats (+65% verifier pay); pass 0.1105 vs q^k 0.1111
+    q=0.33 k=3:  4.9 expected seats (+65% verifier pay); pass 0.0369 vs q^k 0.0370
+    q=0.33 k=5:  8.2 expected seats (+65% verifier pay); pass 0.0037 vs q^k 0.0041
+    q=0.50 k=2:  2.8 expected seats (+39% verifier pay); pass 0.2498 vs q^k 0.2500
+    q=0.50 k=3:  4.2 expected seats (+39% verifier pay); pass 0.1227 vs q^k 0.1250
+    q=0.50 k=5:  6.9 expected seats (+39% verifier pay); pass 0.0315 vs q^k 0.0312
+
+I. Retune with measured lambda
+  lambda of the v1 pool job (Qwen3-4B embeddings): 0.407-0.488
+
+  rho (free entry, part F; u hash = pool share of mining capacity):
+  rho u formula  u hash GPUs useful  H kept  1-rho
+ 0.05      9.8%    9.8%       20.5%   0.950  0.950
+ 0.10     19.5%   19.5%       41.0%   0.900  0.900
+ 0.20     39.1%   35.8%       71.4%   0.816  0.800
+ 0.30     58.6%   46.4%       78.5%   0.752  0.700
+
+  k: smallest committee that keeps a fully faked job unprofitable (colluding stake 1/3,
+  attacker hashrate 0.3 re-rolling by withholding, watchers 10%, loss 1.5 job costs):
+ job size  V=1  V=10  V=30
+    0.1 R    2     2     3
+    0.5 R    2     2     3
+    1.0 R    2     2     3
+    3.0 R    2     2     3
+   10.0 R    2     3     3
+  100.0 R    2     3     3
+
+  Recommendations (spec/step6-results.md):
+  rho  = 10%, unchanged. With measured lambda (~0.45) the pool takes rho/(1-lambda) ~ 20% of mining
+         capacity (~40% of GPUs by count, the ones that give up the fewest hashes per token) at a
+         hashrate cost of rho; free entry keeps that cost at rho until the cheap class saturates,
+         then lowers it. Saturation is at rho ~ 0.5.
+  k    = 2 minimum for jobs below one block reward; 3 from one block reward up (consensus rule
+         JOB_POST: fee >= LargeJobFee needs k >= MinKLarge). Clients exposed to tampering worth
+         more than ~10x the job still buy more (k = 5 covers 30x at 100 R).
+  n    = 2, unchanged: deterrence of skipping needs one sample once F + B >= S c (part C), and
+         risk aversion only strengthens it (G1).
+  bond = 50% of the fee, unchanged: with a bit-exact runtime it costs an honest provider ~0.03% of
+         the fee (G2); a 1e-3 false-slash rate would cost ~0.4%, so bonds are not the place to save.
+

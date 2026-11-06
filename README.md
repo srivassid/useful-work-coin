@@ -10,7 +10,8 @@ plus a verified job market. Work follows the doc's build plan.
 | 3. Job module in Pearl's node | **done**: see `spec/step3-results.md`, code in `chain/patches/` |
 | 4. Verification (bisection to one op, serve-or-slash) | **done**: see `spec/step4-results.md`, `spec/stage-program.md` |
 | 5. Pool and watchers (budget, unit pricing, canaries, forced errors with threshold keys) | **done**: see `spec/step5-results.md`, `spec/pool-and-watchers.md` |
-| 6–7. Simulator extended, testnet | not started |
+| 6. Simulator extended (free entry, risk aversion, block withholding, measured λ) and retune | **done**: see `spec/step6-results.md`, `sim/sim.py`, `results/sim_step6.txt` |
+| 7. Public testnet | not started |
 
 Layout (from the doc): `chain/`, `miner/` (`miner/ampere`: Ampere port of Pearl's NoisyGEMM
 miner), `runtime/`, `verifier/` (`forced_errors.py`: keyholder shares and curator trees),
