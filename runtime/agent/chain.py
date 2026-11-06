@@ -20,7 +20,10 @@ class Chain:
                 if "=" in line and not line.startswith("#"):
                     k, v = line.split("=", 1)
                     env[k] = os.path.expandvars(v)
-        env.update(UWC_RPC="127.0.0.1:18671", UWC_RPC_USER=env["RPC_USER"], UWC_RPC_PASS=env["RPC_PASS"])
+        env.update(UWC_RPC=f"127.0.0.1:{env.get('RPC_PORT', '18671')}", UWC_RPC_USER=env["RPC_USER"],
+                   UWC_RPC_PASS=env["RPC_PASS"])
+        if env.get("NET") == "uwctestnet":
+            env["UWC_NET"] = "testnet"
         self.env = env
         self.bin = os.path.join(self.dir, "bin", "uwcctl")
 

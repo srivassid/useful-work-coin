@@ -4,7 +4,8 @@ set -euo pipefail
 D=$(cd "$(dirname "$0")" && pwd)
 source "$D/env"
 mkdir -p "$D/node" "$D/logs"
-exec "$D/bin/pearld" --uwcdevnet --configfile=/dev/null --datadir="$D/node" --logdir="$D/logs/node" \
-  --listen="$NODE_IP:18670" --addpeer="$PEER_IP:18670" \
-  --rpclisten=127.0.0.1:18671 --rpcuser="$RPC_USER" --rpcpass="$RPC_PASS" --notls \
+NET=${NET:-uwcdevnet}; P2P_PORT=${P2P_PORT:-18670}; RPC_PORT=${RPC_PORT:-18671}
+exec "$D/bin/pearld" --$NET --configfile=/dev/null --datadir="$D/node" --logdir="$D/logs/node" \
+  --listen="$NODE_IP:$P2P_PORT" --addpeer="$PEER_IP:$P2P_PORT" \
+  --rpclisten=127.0.0.1:$RPC_PORT --rpcuser="$RPC_USER" --rpcpass="$RPC_PASS" --notls \
   --txindex --addrindex --miningaddr="$MINING_ADDR" --debuglevel=info

@@ -11,6 +11,11 @@ Per box, `~/Documents/useful-work-coin/devnet/` holds `bin/` (pearld, prlctl, uw
     RPC_USER=... RPC_PASS=...    # RPC listens on 127.0.0.1:18671 only
     MINING_ADDR=rprl1p...        # coinbase address (uwcctl info <key>)
     VENV=~/Documents/useful-work-coin/port/.venv
+    NET=uwcdevnet                # or uwctestnet (then P2P_PORT=18690 RPC_PORT=18691 DATA_PORT=18692)
+    P2P_PORT=18670 RPC_PORT=18671
 
 Scripts: `node.sh` (pearld), `gateway.sh` (Pearl's gateway with the UWC coinbase outputs),
-`miner.sh <gpu>` (Ampere noise miner), `ctl.sh <cmd>` (prlctl against the local node).
+`miner.sh <gpu>` (Ampere noise miner), `ctl.sh <cmd>` (prlctl against the local node),
+`up.sh`/`down.sh`, `agent.sh <role> <key>`, `data.sh` (data service, live metrics at `/`),
+`metrics.sh` (refreshes the live metrics). The same scripts run the testnet from a copy of this
+folder with `NET=uwctestnet` in its `env`.

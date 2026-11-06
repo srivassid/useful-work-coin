@@ -72,6 +72,34 @@ class Runtime:
         self.traces = traces
         return st
 
+    def batch_with_inputs(self, tokens: list[int]):
+        """Like batch(), and also each later stage's input with proofs: for group g >= 1, the
+        rows group g-1 produced and their Merkle proofs in group g-1's trace (for verifiers who
+        recompute one stage instead of the whole prefix)."""
+        from .proto import multi_proofs
+        from detrt.stage import R2
+        toks = torch.tensor(tokens, dtype=torch.long)
+        if self.miner is not None:
+            self.miner.refresh()
+        roots, inputs, x = [], {}, None
+        for g in range(self.G):
+            st = run_stage(self.m, toks if g == 0 else None, x, g * self.lpg, (g + 1) * self.lpg)
+            roots.append(st.root)
+            if g + 1 < self.G:
+                last = (g + 1) * self.lpg - 1
+                idx = sorted((lf.t, i) for i, lf in enumerate(st.leaves) if lf.op == R2 and lf.layer == last)
+                idx = [i for _, i in idx]
+                pr = multi_proofs(st.leaf_hashes, idx)
+                inputs[g + 1] = {"rows": st.output.copy(), "idx": idx, "proofs": [[h.hex() for h in pr[i]] for i in idx],
+                                 "prev_leaves": len(st.leaves)}
+            x = torch.from_numpy(st.output)
+            del st
+        return roots, pooled(x.numpy()), inputs
+
+    def stage_root_from_input(self, rows: np.ndarray, g: int) -> bytes:
+        """One stage (layer group g >= 1) from its served input rows."""
+        return run_stage(self.m, None, torch.from_numpy(rows), g * self.lpg, (g + 1) * self.lpg).root
+
     def stage_root(self, batches: list[list[int]], stage: int) -> bytes:
         b, g = divmod(stage, self.G)
         return self.batch(batches[b], g)[0][g]

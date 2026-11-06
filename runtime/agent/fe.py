@@ -31,7 +31,7 @@ def wait_mempool(chain: Chain):
 
 def subprocess_out(chain: Chain, *args) -> str:
     import subprocess
-    p = subprocess.run([os.path.join(chain.dir, "bin", "prlctl"), "--configfile=/dev/null", "--rpcserver=127.0.0.1:18671",
+    p = subprocess.run([os.path.join(chain.dir, "bin", "prlctl"), "--configfile=/dev/null", f"--rpcserver=127.0.0.1:{chain.env.get('RPC_PORT', '18671')}",
                         f"--rpcuser={chain.env['RPC_USER']}", f"--rpcpass={chain.env['RPC_PASS']}", "--notls", *args],
                        capture_output=True, text=True)
     return p.stdout

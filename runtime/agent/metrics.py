@@ -25,10 +25,10 @@ GRAIN = 1e8
 
 
 def block_info(chain: Chain, h: int) -> dict:
-    out = subprocess.run([os.path.join(chain.dir, "bin", "prlctl"), "--configfile=/dev/null", "--rpcserver=127.0.0.1:18671",
+    out = subprocess.run([os.path.join(chain.dir, "bin", "prlctl"), "--configfile=/dev/null", f"--rpcserver=127.0.0.1:{chain.env.get('RPC_PORT', '18671')}",
                           f"--rpcuser={chain.env['RPC_USER']}", f"--rpcpass={chain.env['RPC_PASS']}", "--notls",
                           "getblockhash", str(h)], capture_output=True, text=True).stdout.strip()
-    hdr = subprocess.run([os.path.join(chain.dir, "bin", "prlctl"), "--configfile=/dev/null", "--rpcserver=127.0.0.1:18671",
+    hdr = subprocess.run([os.path.join(chain.dir, "bin", "prlctl"), "--configfile=/dev/null", f"--rpcserver=127.0.0.1:{chain.env.get('RPC_PORT', '18671')}",
                           f"--rpcuser={chain.env['RPC_USER']}", f"--rpcpass={chain.env['RPC_PASS']}", "--notls",
                           "getblockheader", out], capture_output=True, text=True).stdout
     return json.loads(hdr)

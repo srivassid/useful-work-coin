@@ -27,7 +27,7 @@ from .chain import Chain, ChainError
 from .data import Data
 from .inputs import input_root, unit_proof, wikitext_sequences
 from .game import GONESTEP, GREVEAL, move, write_rows
-from .proto import StageCommit, job_id, output_root, positions, result_hash
+from .proto import StageCommit, check_stage_input, job_id, output_root, positions, result_hash
 
 DEVNET = os.path.expanduser("~/Documents/useful-work-coin/devnet")
 DATA_URL = "http://192.168.29.71:18680"
@@ -287,6 +287,8 @@ class Provider(Agent):
             return
         if "roots" not in js:
             return
+        if j["status"] in ("committed", "verify-commit", "verify-reveal"):
+            self.serve_stage_inputs(jid)
         sc = self.commit_of(js)
         open_ = {r["stage"] for r in (j.get("revealed") or [])}
         want = set()
@@ -314,13 +316,15 @@ class Provider(Agent):
         t = time.time()
         mined0 = self.rt.miner.hashed if self.rt.miner else 0
         torch_sync()
-        roots, embs = [], []
+        roots, embs, inputs = [], [], []
         for toks in b:
-            r, e = self.rt.batch(toks)
+            r, e, ins = self.rt.batch_with_inputs(toks)
             roots += r
             embs.append(e)
+            inputs.append(ins)
         salts = [secrets.token_bytes(32) for _ in roots]
         out_root = output_root(embs).hex()
+        self.save_stage_inputs(jid, StageCommit(roots, salts), inputs)
         buf = io.BytesIO()
         np.save(buf, np.stack(embs))
         self.data.put(f"/outputs/{jid}.npy", buf.getvalue())
@@ -335,6 +339,41 @@ class Provider(Agent):
                                                        outputroot=out_root, computed=round(time.time() - t, 1), **extra)
         self.save()
         log(f"job {jid[:8]}: {len(roots)} stages in {time.time() - t:.0f}s")
+
+    def stagein_dir(self, jid: str) -> str:
+        return os.path.join(self.a.devnet, "agent", "stagein", jid)
+
+    def save_stage_inputs(self, jid: str, sc: StageCommit, inputs: list[dict]):
+        """Keep each later stage's input (rows, proofs, previous stage opened) until asked for."""
+        import base64
+        d = self.stagein_dir(jid)
+        os.makedirs(d, exist_ok=True)
+        for b, ins in enumerate(inputs):
+            for g, pk in ins.items():
+                stage = b * self.G + g
+                doc = {"stage": stage, "shape": list(pk["rows"].shape), "idx": pk["idx"], "proofs": pk["proofs"],
+                       "prev_leaves": pk["prev_leaves"], "reveal": sc.reveal(stage - 1),
+                       "rows": base64.b64encode(pk["rows"].astype("<f4").tobytes()).decode()}
+                with open(os.path.join(d, f"{stage}.json"), "w") as f:
+                    json.dump(doc, f)
+
+    def serve_stage_inputs(self, jid: str):
+        """Answer verifiers' requests for stage inputs (off-chain; DATA_REQUEST stays the fallback)."""
+        try:
+            names = json.loads(self.data.get(f"/req/{jid}/") or b"[]")
+        except Exception:
+            return
+        served = self.st["jobs"].setdefault(jid, {}).setdefault("served", [])
+        for name in names:
+            if name in served:
+                continue
+            stage = int(name.split("-")[0])
+            path = os.path.join(self.stagein_dir(jid), f"{stage}.json")
+            if os.path.exists(path):
+                self.data.put(f"/stagein/{jid}/{name}", open(path, "rb").read())
+                log(f"served stage {stage} input of {jid[:8]}")
+            served.append(name)
+            self.save()
 
     @staticmethod
     def commit_of(js: dict) -> StageCommit:
@@ -385,9 +424,13 @@ class Verifier(Agent):
                     salt = secrets.token_bytes(32)
                     pos = positions(salt, j["stages"], j["n"])
                     t = time.time()
-                    roots = [self.rt.stage_root(b, p) for p in pos]
+                    roots, served = [], 0
+                    for p in pos:
+                        r = self.served_stage_root(j, p)
+                        served += r is not None
+                        roots.append(r if r is not None else self.rt.stage_root(b, p))
                     js.update(salt=salt.hex(), positions=pos, roots=[r.hex() for r in roots],
-                              computed=round(time.time() - t, 1))
+                              computed=round(time.time() - t, 1), served_inputs=served)
                     rh = result_hash(roots, bytes.fromhex(self.account), salt)
                     if self.send([{"kind": "VERIFY_COMMIT", "job": jid, "h1": hashlib.sha256(salt).hexdigest(),
                                    "h2": rh.hex()}], f"verify-commit {jid[:8]} stages {pos}"):
@@ -399,6 +442,35 @@ class Verifier(Agent):
                                  f"verify-reveal {jid[:8]}"):
                         js["revealed"], js["sent_h"] = True, self.chain.height()
                         self.save()
+
+
+    def served_stage_root(self, j: dict, stage: int) -> bytes | None:
+        """Recompute one stage from its served input, checked against the commitment; None (so
+        the caller recomputes the prefix) when the stage reads tokens or nothing valid arrives."""
+        g = stage % self.G
+        if g == 0 or not self.a.fetch_inputs:
+            return None
+        nonce = secrets.token_hex(16)
+        name = f"{stage}-{nonce}.json"
+        try:
+            self.data.put(f"/req/{j['id']}/{name}", b"{}")
+        except Exception as e:
+            log(f"stage input request failed: {e}")
+            return None
+        deadline = time.time() + self.a.input_wait
+        while time.time() < deadline:
+            raw = self.data.get(f"/stagein/{j['id']}/{name}")
+            if raw:
+                try:
+                    pkg = json.loads(raw)
+                    rows = check_stage_input(pkg, stage, bytes.fromhex(j["stageroot"]), j["stages"], pkg["prev_leaves"])
+                except Exception as e:
+                    log(f"{j['id'][:8]} stage {stage}: served input rejected ({e}); recomputing the prefix")
+                    return None
+                return self.rt.stage_root_from_input(rows, g)
+            time.sleep(3)
+        log(f"{j['id'][:8]} stage {stage}: no input served in {self.a.input_wait:.0f}s; recomputing the prefix")
+        return None
 
 
 # ---------------------------------------------------------------- watcher
@@ -666,6 +738,9 @@ def main() -> None:
     ap.add_argument("--mine", action="store_true", help="provider: mine on every job GEMM (needs this box's gateway)")
     # verifier
     ap.add_argument("--stake", type=int, default=100_000_000)
+    ap.add_argument("--fetch-inputs", action=argparse.BooleanOptionalAction, default=True,
+                    help="verifier: ask the provider for stage inputs instead of recomputing the prefix")
+    ap.add_argument("--input-wait", type=float, default=90.0, help="verifier: seconds to wait for a served input")
     # watcher
     ap.add_argument("--rate", type=float, default=0.5)
     ap.add_argument("--bond", type=int, default=100_000)

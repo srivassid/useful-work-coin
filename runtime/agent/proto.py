@@ -78,3 +78,76 @@ class StageCommit:
     def reveal(self, stage: int) -> dict:
         return {"stage": stage, "salt": self.salts[stage].hex(), "root": self.roots[stage].hex(),
                 "proof": [h.hex() for h in merkle_proof(self.leaves, stage)]}
+
+
+def multi_proofs(leaves: list[bytes], indices) -> dict[int, list[bytes]]:
+    """Merkle proofs (as detrt.stage.merkle_proof / jobstate.MerkleProof) for many leaves at
+    once, computing each subtree root a single time: O(len(leaves)) hashes in total."""
+    from detrt.stage import _node, _split
+    want = sorted(set(indices))
+    out: dict[int, list[bytes]] = {i: [] for i in want}
+
+    def rec(lo: int, hi: int, idx: list[int]) -> bytes:
+        n = hi - lo
+        if n == 1:
+            return leaves[lo]
+        k = _split(n)
+        left = [i for i in idx if i < lo + k]
+        right = [i for i in idx if i >= lo + k]
+        lroot = rec(lo, lo + k, left)
+        rroot = rec(lo + k, hi, right)
+        for i in left:
+            out[i].append(rroot)
+        for i in right:
+            out[i].append(lroot)
+        return _node(lroot, rroot)
+
+    if leaves:
+        rec(0, len(leaves), want)
+    return out
+
+
+def verify_merkle(root: bytes, leaf: bytes, i: int, n: int, proof: list[bytes]) -> bool:
+    """jobstate.VerifyMerkleProof."""
+    from detrt.stage import _node, _split
+
+    def walk(leaf, i, n, proof):
+        if n == 1:
+            return leaf, len(proof) == 0
+        if not proof:
+            return b"", False
+        k = _split(n)
+        sib, rest = proof[-1], proof[:-1]
+        if i < k:
+            h, ok = walk(leaf, i, k, rest)
+            return _node(h, sib), ok
+        h, ok = walk(leaf, i - k, n - k, rest)
+        return _node(sib, h), ok
+    if not 0 <= i < n:
+        return False
+    h, ok = walk(leaf, i, n, proof)
+    return ok and h == root
+
+
+def check_stage_input(pkg: dict, stage: int, stage_root: bytes, stages: int, prev_leaves: int):
+    """A served stage input, checked against the provider's on-chain commitment: the previous
+    stage's (salt, root) must open stage_root, and every row must open that root. Returns the
+    (T, D) float32 rows, or raises ValueError. A provider cannot frame a verifier with a wrong
+    input, because only the committed rows pass."""
+    import base64
+    from detrt.stage import leaf_hash, row_root
+    rv = pkg["reveal"]
+    if rv["stage"] != stage - 1:
+        raise ValueError("reveal is not the previous stage")
+    salt, root = bytes.fromhex(rv["salt"]), bytes.fromhex(rv["root"])
+    if not verify_merkle(stage_root, stage_leaf(stage - 1, salt, root), stage - 1, stages,
+                         [bytes.fromhex(h) for h in rv["proof"]]):
+        raise ValueError("previous stage does not open the stage commitment")
+    T, D = pkg["shape"]
+    rows = np.frombuffer(base64.b64decode(pkg["rows"]), dtype="<f4").reshape(T, D)
+    for t in range(T):
+        i = pkg["idx"][t]
+        if not verify_merkle(root, leaf_hash(i, row_root(rows[t].copy())), i, prev_leaves,
+                             [bytes.fromhex(h) for h in pkg["proofs"][t]]):
+            raise ValueError(f"row {t} does not open the previous stage")
+    return rows.copy()
