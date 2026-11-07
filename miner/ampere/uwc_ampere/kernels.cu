@@ -371,6 +371,38 @@ noise_rows(const i8* __restrict__ src, int rows, int k, int r,
   }
 }
 
+// The projection X = src * S^T of noise_rows (S: r x k, +1 at P_lo, -1 at P_hi of each column)
+// computed as an exact int8 GEMM elsewhere (proj, int32 rows x r); this writes its base-128 limbs
+// into corr and the row-wide max |X| into maxabs, exactly as noise_rows' tail does.
+extern "C" __global__ void __launch_bounds__(256)
+proj_corr(const i32* __restrict__ proj, int rows, int r, i8* __restrict__ corr, int corr_off, i32* __restrict__ maxabs,
+          int lmax) {
+  const u64 limb_stride = (u64)rows * 2 * r;
+  int local_max = 0;
+  for (u64 i = (u64)blockIdx.x * 256 + threadIdx.x; i < (u64)rows * r; i += (u64)gridDim.x * 256) {
+    const u64 rr = i / r; const int j = (int)(i - rr * r);
+    int v = proj[i];
+    local_max = max(local_max, abs(v));
+    const u64 base = rr * 2 * r;
+    for (int li = 0; li < lmax; li++) {
+      int d = ((v + 64) & 127) - 64;
+      corr[li * limb_stride + base + corr_off + j] = (i8)d;
+      v = (v - d) >> 7;
+    }
+  }
+  for (int s = 16; s > 0; s >>= 1) local_max = max(local_max, __shfl_xor_sync(0xffffffffu, local_max, s));
+  if ((threadIdx.x & 31) == 0 && maxabs) atomicMax(maxabs, local_max);
+}
+
+// S^T (r x k int8) of a noise permutation: S^T[j][l] = (lo(P[l]) == j) - (hi(P[l]) == j).
+extern "C" __global__ void proj_matrix_k(const u32* __restrict__ P, int k, int r, i8* __restrict__ St) {
+  for (u64 i = (u64)blockIdx.x * 256 + threadIdx.x; i < (u64)r * k; i += (u64)gridDim.x * 256) {
+    const int j = (int)(i / k), l = (int)(i - (u64)j * k);
+    const u32 p = P[l];
+    St[i] = (i8)((int)((p & 0xFFFF) == (u32)j) - (int)((p >> 16) == (u32)j));
+  }
+}
+
 // ------------------------------------------------------------------ main GEMM
 __device__ __forceinline__ u32 smem_u32addr(const void* p) { return (u32)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void cp_async16(u32 dst, const void* src) {

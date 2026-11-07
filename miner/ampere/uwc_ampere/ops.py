@@ -32,7 +32,8 @@ OUT_NONE, OUT_I32, OUT_BF16 = 0, 1, 2
 QUANT_MAX_SMEM = 96 * 1024  # dynamic smem for quant_rows_had (k <= 24576); fits every GPU's opt-in limit
 
 # GEMM configurations: (BN, STAGES, MINB). The hash-tile pattern is the same for all.
-CONFIGS = {"256x3": (256, 3, 1), "256x4": (256, 4, 1), "128x3": (128, 3, 2), "128x4": (128, 4, 2)}
+CONFIGS = {"256x3": (256, 3, 1), "256x4": (256, 4, 1), "128x3": (128, 3, 2), "128x4": (128, 4, 2), "64x3": (64, 3, 4),
+           "64x4": (64, 4, 4)}
 DEFAULT_CFG = os.environ.get("UWC_GEMM_CFG", "128x3")
 
 
@@ -141,6 +142,32 @@ def noise_rows(src, rows, k, r, *, E=None, Pn=None, dst=None, Pp=None, corr=None
                       shared_mem=smem)
 
 
+# ------------------------------------------------------------------ projections as int8 GEMMs
+PROJ_GEMM = os.environ.get("UWC_PROJ_GEMM", "0") != "0"  # opt-in: faster per kernel on Ampere at large m only
+AUTOTUNE = os.environ.get("UWC_AUTOTUNE", "0") != "0"  # opt-in: ~1% at small m
+TUNE_CFGS = ("128x3", "64x3", "64x4")
+_TUNED: dict = {}
+
+
+def proj_matrix(P: torch.Tensor, k: int, r: int) -> torch.Tensor:
+    """S^T for a noise permutation P (k entries, +index in the low 16 bits, -index in the high 16):
+    r x k int8 with S^T[lo(l), l] += 1 and S^T[hi(l), l] -= 1, so src @ S = noise_rows' projection."""
+    St = torch.empty((r, k), dtype=torch.int8, device=P.device)
+    n = r * k
+    _fn("proj_matrix_k")((min(4096, -(-n // 256)),), (256,), (_p(P), np.int32(k), np.int32(r), _p(St)), stream=_stream())
+    return St
+
+
+def project(src: torch.Tensor, St: torch.Tensor, corr: torch.Tensor, corr_off: int, maxabs: torch.Tensor):
+    """noise_rows' projection part (corr limbs at corr_off, maxabs) with the sum on the tensor cores:
+    exact, since every term is an integer and int8 x int8 GEMMs accumulate exactly in int32."""
+    rows, r = src.shape[0], St.shape[0]
+    proj = torch._int_mm(src, St.t())
+    n = rows * r
+    _fn("proj_corr")((min(4096, -(-n // 256)),), (256,), (_p(proj), np.int32(rows), np.int32(r), _p(corr), np.int32(corr_off),
+                                                       _p(maxabs), np.int32(corr.shape[0])), stream=_stream())
+
+
 # ------------------------------------------------------------------ activation quantizer
 def quant_rows_had(x: torch.Tensor, bs: int, q: torch.Tensor | None = None, scale: torch.Tensor | None = None):
     """x: m x k bf16 (contiguous) -> (int8 q in [-64, 64], float32 per-row scale), block Hadamard of size bs."""
@@ -225,6 +252,7 @@ class MinedWeight:
             self.BpEBt = torch.empty((n, k), dtype=torch.int8, device=dev)
             self.corrB = torch.zeros((limbs_for(k), n, 2 * r), dtype=torch.int8, device=dev)
         noise_rows(Bt, n, k, r, E=self.EBRt, Pn=self.PB, dst=self.BpEBt, corr=self.corrB, ecopy_off=0)
+        self.SBt = proj_matrix(self.PB, k, r)
         del Bt
 
     def _buf(self, m: int):
@@ -250,7 +278,42 @@ class MinedWeight:
 
     def forward(self, A: torch.Tensor, a_scale: torch.Tensor, out: torch.Tensor | None = None,
                 out_mode: int = OUT_BF16, hash_tiles: bool = True) -> torch.Tensor:
-        """A: m x k int8 (values in [-64, 64]). Returns A @ Bt^T scaled (bf16) or exact int32."""
+        """A: m x k int8 (values in [-64, 64]). Returns A @ Bt^T scaled (bf16) or exact int32.
+
+        The GEMM tile config and the projection path are picked per (GPU, m, n, k) by timing each
+        once (AUTOTUNE): every choice gives bit-identical outputs and winning tiles
+        (tests/test_gemm_cfgs.py, tests/test_proj_gemm.py), so only speed differs."""
+        m = A.shape[0]
+        key = (str(A.device), torch.cuda.get_device_name(A.device), m, self.n, self.k)
+        choice = _TUNED.get(key)
+        if choice is None and AUTOTUNE and self.SBt_ready():
+            times = {}
+            opts = [(c, p) for c in TUNE_CFGS for p in (True, False)]
+            for _ in range(2):          # warm up every option (compiles each config's module once)
+                for c, p in opts:
+                    out = self._forward(A, a_scale, out, out_mode, hash_tiles, c, p)
+            for rnd in range(3):        # interleaved rounds, so clock drift hits every option alike
+                for c, p in opts:
+                    t0, t1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    t0.record()
+                    for _ in range(5):
+                        out = self._forward(A, a_scale, out, out_mode, hash_tiles, c, p)
+                    t1.record()
+                    t1.synchronize()
+                    times.setdefault((c, p), []).append(t0.elapsed_time(t1))
+            med = {o: sorted(v)[1] for o, v in times.items()}
+            default = (DEFAULT_CFG, PROJ_GEMM)
+            best = min(med, key=med.get)
+            choice = _TUNED[key] = best if med[best] < 0.97 * med.get(default, float("inf")) else default
+        cfg, proj = choice if choice is not None else (DEFAULT_CFG, PROJ_GEMM)
+        return self._forward(A, a_scale, out, out_mode, hash_tiles, cfg, proj)
+
+    def SBt_ready(self) -> bool:
+        if getattr(self, "SBt", None) is None and self.PB is not None:
+            self.SBt = proj_matrix(self.PB, self.k, self.r)
+        return getattr(self, "SBt", None) is not None
+
+    def _forward(self, A, a_scale, out, out_mode, hash_tiles, cfg, proj):
         m, k = A.shape
         n, r = self.n, self.r
         dev = A.device
@@ -266,14 +329,21 @@ class MinedWeight:
         b["wins"][:1].zero_()
         noise_perm(b["PA"], k, r, c["LABEL_A"], b["a_seed"])
         # 3. ApEA = A + EAL*P_A ; X = A * P_B^T (limbs) ; EAL copy
-        noise_rows(A, m, k, r, E=b["EAL"], Pn=b["PA"], dst=b["ApEA"], Pp=self.PB, corr=b["corrA"], corr_off=0,
-                   ecopy_off=r, maxabs=b["maxabs"][0:1])
-        # 4. Y = BpEBt * P_A^T (limbs)
-        noise_rows(self.BpEBt, n, k, r, Pp=b["PA"], corr=self.corrB, corr_off=r, maxabs=b["maxabs"][1:2])
+        if proj and getattr(self, "SBt", None) is not None and m > 16:
+            noise_rows(A, m, k, r, E=b["EAL"], Pn=b["PA"], dst=b["ApEA"], corr=b["corrA"], ecopy_off=r)
+            project(A, self.SBt, b["corrA"], 0, b["maxabs"][0:1])
+            # 4. Y = BpEBt * P_A^T (limbs)
+            project(self.BpEBt, proj_matrix(b["PA"], k, r), self.corrB, r, b["maxabs"][1:2])
+        else:
+            noise_rows(A, m, k, r, E=b["EAL"], Pn=b["PA"], dst=b["ApEA"], Pp=self.PB, corr=b["corrA"], corr_off=0,
+                       ecopy_off=r, maxabs=b["maxabs"][0:1])
+            # 4. Y = BpEBt * P_A^T (limbs)
+            noise_rows(self.BpEBt, n, k, r, Pp=b["PA"], corr=self.corrB, corr_off=r, maxabs=b["maxabs"][1:2])
         # 5. noisy GEMM: hash every tile, denoise exactly, scale
         gemm(b["ApEA"], self.BpEBt, r=r, flags=(FLAG_HASH if hash_tiles else 0) | FLAG_DENOISE,
              corrA=b["corrA"], corrB=self.corrB, maxabs=b["maxabs"], key=b["a_seed"], target=self.target,
-             wins=b["wins"], max_wins=self.max_wins, a_scale=a_scale, b_scale=self.b_scale, out=out, out_mode=out_mode)
+             wins=b["wins"], max_wins=self.max_wins, a_scale=a_scale, b_scale=self.b_scale, out=out, out_mode=out_mode,
+             cfg=cfg)
         return out
 
     def noise_mine(self, A: torch.Tensor):
