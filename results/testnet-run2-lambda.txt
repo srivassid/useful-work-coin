@@ -1,0 +1,2 @@
+agent/provider-f0aef8ba.json: NVIDIA GeForce RTX 3080: 7 jobs, GPU time median 0.159s, with saving 1.25s, live lambda median 0.254 (min 0.143, max 0.271)
+agent/provider-19845da4.json: NVIDIA GeForce RTX 5090: 7 jobs, GPU time median 0.041s, with saving 0.38s, live lambda median 0.227 (min 0.166, max 0.227)
