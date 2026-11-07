@@ -15,10 +15,14 @@ from .proto import pooled
 
 
 class Runtime:
-    def __init__(self, model_json: str, device: str, mine_socket: str | None = None):
+    def __init__(self, model_json: str, device: str, mine_socket: str | None = None, engine: str = "detgpu"):
         info = json.load(open(model_json))
         self.info = info
         self.device = torch.device(device)
+        # detgpu: bit-identical to detrt (tests/test_detgpu.py), native fp32 and fused kernels, stage
+        # roots hashed on the GPU. detrt.fast stays the reference and the CPU path.
+        self.gpu = engine == "detgpu" and self.device.type == "cuda"
+        self.last_gpu_s = None
         self.G = info["layer_groups"]
         t = time.time()
         self.m = load(info["model_dir"], device, info["rotation_block"], info["cfg"]["MaxPos"], mine=bool(mine_socket))
@@ -53,6 +57,13 @@ class Runtime:
         if self.miner is not None:
             self.miner.refresh()
         out = []
+        if self.gpu:
+            from detgpu.stages import job_outputs
+            for c0 in range(0, len(seqs), chunk):
+                outs = job_outputs(self.m, torch.tensor(seqs[c0:c0 + chunk], dtype=torch.long), self.G, upto)
+                host = [o.cpu().numpy() for o in outs]
+                out += [[h[b] for h in host] for b in range(len(seqs[c0:c0 + chunk]))]
+            return out
         for c0 in range(0, len(seqs), chunk):
             toks = [torch.tensor(t, dtype=torch.long) for t in seqs[c0:c0 + chunk]]
             res = [[] for _ in toks]
@@ -76,6 +87,8 @@ class Runtime:
         """A provider's job: per batch (output roots of every stage, pooled output, and each later
         stage's input with Merkle proofs in the previous stage's output tree)."""
         from .proto import multi_proofs, stage_out_leaves
+        if self.gpu:
+            return self._job_outputs_gpu(batches)
         res = []
         for outs in self.outputs(batches):
             leaves = [stage_out_leaves(o) for o in outs]
@@ -87,6 +100,37 @@ class Runtime:
             res.append((roots, pooled(outs[-1]), inputs))
         return res
 
+    def _job_outputs_gpu(self, batches: list[list[int]], chunk: int = 16):
+        """job_outputs with detgpu: every stage's output root from leaves hashed on the GPU. The
+        GPU part (forward pass + hashing, where the job's GEMMs mine) is timed as last_gpu_s;
+        copying the rows verifiers may ask for and the pooled outputs come after it."""
+        from detgpu.sha import sout_leaves
+        from detgpu.stages import job_outputs
+        from .proto import multi_proofs
+        self.bind()
+        if self.miner is not None:
+            self.miner.refresh()
+        torch.cuda.synchronize()
+        t = time.time()
+        groups = []   # per chunk: (outs on GPU, leaves (G, B, T, 32))
+        for c0 in range(0, len(batches), chunk):
+            outs = job_outputs(self.m, torch.tensor(batches[c0:c0 + chunk], dtype=torch.long), self.G)
+            groups.append((outs, [sout_leaves(o) for o in outs]))
+        torch.cuda.synchronize()
+        self.last_gpu_s = time.time() - t
+        res = []
+        for outs, leaves in groups:
+            host = [o.cpu().numpy() for o in outs[:-1]] + [outs[-1].cpu().numpy()]
+            for b in range(host[0].shape[0]):
+                lv = [[bytes(leaves[g][b, tt]) for tt in range(leaves[g].shape[1])] for g in range(self.G)]
+                roots = [merkle_root(x) for x in lv]
+                inputs = {}
+                for g in range(1, self.G):
+                    pr = multi_proofs(lv[g - 1], range(len(lv[g - 1])))
+                    inputs[g] = {"rows": host[g - 1][b], "proofs": [[h.hex() for h in pr[tt]] for tt in range(len(pr))]}
+                res.append((roots, pooled(host[-1][b]), inputs))
+        return res
+
     def stage_output(self, batches: list[list[int]], stage: int) -> np.ndarray:
         b, g = divmod(stage, self.G)
         return self.outputs([batches[b]], g)[0][g]
@@ -96,6 +140,11 @@ class Runtime:
         from detrt.fast import run_stages
         from .proto import stage_output_root
         self.bind()
+        if self.gpu:
+            from detgpu.sha import stage_output_roots
+            from detgpu.stages import stage_outputs
+            y = stage_outputs(self.m, None, torch.from_numpy(np.ascontiguousarray(rows))[None], g * self.lpg, (g + 1) * self.lpg)
+            return stage_output_roots(y)[0]
         y = run_stages(self.m, None, [torch.from_numpy(rows)], g * self.lpg, (g + 1) * self.lpg, keep_rows=False)[0]
         return stage_output_root(y)
 

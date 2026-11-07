@@ -85,7 +85,7 @@ class Agent:
             if self._rt is None:
                 from .compute import Runtime
                 sock = os.path.join(self.a.devnet, "pearlgw.sock") if getattr(self.a, "mine", False) else None
-                self._rt = Runtime(self.a.model, self.a.device, mine_socket=sock)
+                self._rt = Runtime(self.a.model, self.a.device, mine_socket=sock, engine=self.a.engine)
             return self._rt
 
     lock = threading.Lock()
@@ -343,11 +343,14 @@ class Provider(Agent):
             import torch
             extra = {"hashed_macs": self.rt.miner.hashed - mined0, "device": self.a.device,
                      "gpu": torch.cuda.get_device_name(torch.device(self.a.device))}
+        total = time.time() - t
+        gpu_s = self.rt.last_gpu_s if self.rt.last_gpu_s is not None else total  # the part where the GEMMs mine
         with self.lock:
             self.st["jobs"].setdefault(jid, {}).update(roots=[r.hex() for r in roots], salts=[x.hex() for x in salts],
-                                                       outputroot=out_root, computed=round(time.time() - t, 1), **extra)
+                                                       outputroot=out_root, computed=round(gpu_s, 3),
+                                                       total=round(total, 2), **extra)
         self.save()
-        log(f"job {jid[:8]}: {len(roots)} stages in {time.time() - t:.0f}s")
+        log(f"job {jid[:8]}: {len(roots)} stages in {gpu_s:.2f}s on the GPU, {total:.1f}s with saving inputs")
 
     def stagein_dir(self, jid: str) -> str:
         return os.path.join(self.a.devnet, "agent", "stagein", jid)
@@ -754,6 +757,8 @@ def main() -> None:
     ap.add_argument("--data", default=DATA_URL)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--poll", type=float, default=5.0)
+    ap.add_argument("--engine", default="detgpu", choices=["detgpu", "detrt"],
+                    help="detgpu: fast engine, bit-identical to the registered runtime detrt")
     ap.add_argument("--weights", default=os.path.join(DEVNET, "weights", "qwen3-1.7b"))
     # provider
     ap.add_argument("--max-jobs", type=int, default=1)
