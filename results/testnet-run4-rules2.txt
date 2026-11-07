@@ -1,0 +1,17 @@
+Testnet run 4: Rules 2 live (2026-11-07 22:50 - 2026-11-08 ~00:30), blocks 1329-1582, nodes on box 71 and the 5090 box.
+Rules 2 active from block 1400 (getjobstate params for block 1400: rules 2, challengebondbp 1000).
+
+Forced error (record v2 with stage key; commitment a9ee7b19..., fecommit 00d87086...):
+  decoy job 8328dcca posted at block 1403, directed to decoy0 (1a79d5ad...), 7 stages, wrong stage 0 = FEStage(key, job, 7)
+  committee sampled stages 2 and 4 (second verifier did not reveal) -> not caught by the committee
+  catch: CHALLENGE on stage 0 with the honest root by curator (d93780d2...), bond 1,000,000 = 10% of the decoy's 10,000,000 bond (getjobopresult: CHALLENGE ok, block 1466)
+  decoy did not defend its wrong stage -> failed at block 1498, caughtstage 0, catchers [curator]
+  FE_REVEAL (getjobopresult: ok, block 1500) -> stats DecoysCaught 2 -> 3, JackpotsPaid 10,000,000 -> 15,000,000
+  curator 5,000,000,000 -> 5,010,000,000 (half the decoy bond 5,000,000 + jackpot 5,000,000; challenge bond returned)
+  decoy0 bond 10,000,000 reimbursed from the reserve (10,039,300,000 before and after)
+
+Lying watcher (watcher1 --lie 1.0, every check posted with a wrong root):
+  22 challenges, each bonded 15,000,000 (10% of the provider's 150,000,000 bond; old minimum 100,000)
+  balance 499,300,000 -> 198,300,000 (3 games still open at the end)
+  disputed 19 -> 3 by block 1582; failed jobs 8 before and after: no honest provider lost a game
+Agents: 0 tracebacks; all alive until stopped.

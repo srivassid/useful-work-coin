@@ -147,4 +147,10 @@ bug fixed after run 3), and a few late or duplicate moves.
 
 Agents: watchers bond `challenge_bond(j)`; `agent.fe commit` writes v2 records and the stage key
 (`decoy.json`, keyholders only); decoys post directed jobs and take the wrong stage from the key
-once Rules 2 is active. Not yet exercised live.
+once Rules 2 is active.
+
+**Live (testnet run 4, blocks 1329-1582, `results/testnet-run4-rules2.txt`):** a decoy job directed to
+the decoy account (wrong stage 0 from the stage key); a challenge on stage 0 bonded 10% of the decoy's
+bond; the silent decoy failed with `caughtstage 0`; the reveal paid the 5M jackpot to the catcher and
+reimbursed the decoy bond. A watcher lying on every check bonded 0.15 coin per lie on 3-coin jobs and
+lost 3 coins over 22 lies, while no honest provider lost a game. `getjobopresult` reported each op.
