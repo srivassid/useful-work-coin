@@ -67,9 +67,9 @@ def main():
         return best
 
     modes = {"old: job_outputs, one job per pass": lambda: sum(rt.job_outputs(b) and rt.last_gpu_s for b in jobs),
-             "one job per pass": lambda: sum(rt.jobs_roots([b], chunk=a.batches) and rt.last_gpu_s for b in jobs)}
+             "one job per pass": lambda: sum(rt.jobs_roots([b], tokens=a.batches * a.seq) and rt.last_gpu_s for b in jobs)}
     for c in [int(x) for x in a.chunks.split(",")]:
-        modes[f"batched, {c} sequences per pass"] = lambda c=c: rt.jobs_roots(jobs, chunk=c) and rt.last_gpu_s
+        modes[f"batched, {c} sequences per pass"] = lambda c=c: rt.jobs_roots(jobs, tokens=c * a.seq) and rt.last_gpu_s
     noise = (a.noise_rate * 1e12) if a.noise_rate else noise_rate(a.device)
     res = {"gpu": torch.cuda.get_device_name(), "jobs": a.jobs, "batches": a.batches, "seq": a.seq,
            "noise_tmac_s": noise / 1e12, "modes": {}}

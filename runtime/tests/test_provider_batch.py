@@ -35,8 +35,8 @@ def test_main():
     units = json.load(open(T + "/pool/wiki8x128.units.json"))["units"]
     jobs = [units[3]["batches"], units[4]["batches"][:3], units[5]["batches"][:5]]
     alone = [rt.job_outputs(b) for b in jobs]
-    for chunk in (4, 32):  # chunks that split jobs, and one pass holding all of them
-        got = rt.jobs_roots(jobs, chunk=chunk)
+    for chunk in (4, 32):  # passes that split jobs, and one pass holding all of them
+        got = rt.jobs_roots(jobs, tokens=chunk * 128)
         for i, (per, (roots, embs)) in enumerate(zip(alone, got)):
             assert roots == [r for rs, _, _ in per for r in rs], (chunk, i)
             assert all(np.array_equal(e.view(np.uint32), p[1].view(np.uint32)) for e, p in zip(embs, per)), (chunk, i)

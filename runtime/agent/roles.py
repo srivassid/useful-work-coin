@@ -250,7 +250,7 @@ class Provider(Agent):
 
     def launch(self):
         """Start the GPU on every accepted job not yet computed (advance collects them in
-        self.ready), oldest first, up to --batch-seqs sequences in one pass: small jobs alone
+        self.ready), oldest first, up to --batch-tokens tokens in one pass: small jobs alone
         leave the mined GEMMs short, so a pass of several jobs keeps more of the hash rate."""
         if not self.ready or (self.busy is not None and not self.busy.done()):
             return
@@ -262,10 +262,11 @@ class Provider(Agent):
         items, n = [], 0
         for jid in order:
             b = self.ready[jid]
-            if items and n + len(b) > self.a.batch_seqs:
+            tok = sum(len(x) for x in b)
+            if items and n + tok > self.a.batch_tokens:
                 break
             items.append((jid, b))
-            n += len(b)
+            n += tok
         self.busy = self.worker.submit(self.compute_jobs, items)
 
     def claim(self, s: dict):
@@ -356,7 +357,7 @@ class Provider(Agent):
         t = time.time()
         mined0 = self.rt.miner.hashed if self.rt.miner else 0
         torch_sync()
-        res = self.rt.jobs_roots([b for _, b in items], chunk=self.a.batch_seqs)
+        res = self.rt.jobs_roots([b for _, b in items], tokens=self.a.batch_tokens)
         gpu_s = self.rt.last_gpu_s
         hashed = (self.rt.miner.hashed - mined0) if self.rt.miner else 0
         tokens = [sum(len(x) for x in b) for _, b in items]
@@ -809,7 +810,7 @@ def main() -> None:
     # provider
     ap.add_argument("--max-jobs", type=int, default=None,
                     help="provider: jobs accepted or claimed but not yet committed (default 4); decoy: active decoys (default 1)")
-    ap.add_argument("--batch-seqs", type=int, default=64, help="provider: sequences per GPU pass (jobs share passes)")
+    ap.add_argument("--batch-tokens", type=int, default=8192, help="provider: tokens per GPU pass (jobs share passes)")
     ap.add_argument("--pool", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--prefer", default="", help="provider: claim from categories with this id prefix first")
     ap.add_argument("--mine", action="store_true", help="provider: mine on every job GEMM (needs this box's gateway)")

@@ -132,9 +132,9 @@ class Runtime:
                 res.append((roots, pooled(host[-1][b]), inputs))
         return res
 
-    def jobs_roots(self, jobs: list[list[list[int]]], chunk: int = 32):
+    def jobs_roots(self, jobs: list[list[list[int]]], tokens: int = 8192):
         """Several jobs through the GPU together: per job (stage output roots in stage order,
-        pooled outputs). Sequences of all jobs share forward passes of up to `chunk` sequences
+        pooled outputs). Sequences of all jobs share forward passes of up to `tokens` tokens
         (rows are independent, so each job's roots are what it would get alone; one pass per
         sequence length). Stage roots and pooled outputs are computed on the GPU, so only
         32 bytes per stage and one row per sequence leave it: a verifier's stage input is recomputed when asked for
@@ -158,7 +158,8 @@ class Runtime:
         torch.cuda.synchronize()
         t = time.time()
         done = []  # (items, stage roots (G, B, 8) words, pooled outputs (B, D)), all still on the GPU
-        for items in by_len.values():
+        for L, items in by_len.items():
+            chunk = max(1, tokens // L)
             for c0 in range(0, len(items), chunk):
                 part = items[c0:c0 + chunk]
                 outs = job_outputs(self.m, torch.tensor([x[2] for x in part], dtype=torch.long), self.G)

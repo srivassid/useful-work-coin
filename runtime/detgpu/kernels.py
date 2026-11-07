@@ -492,6 +492,141 @@ attention_tile(const signed char* __restrict__ qq, const float* __restrict__ qs,
   }
 }
 
+// attention_tile on int8 tensor cores (mma.sync m16n8k32): the same per-element float ops and
+// the same exact integer sums. Scores q.k are int8 dots (exact in int32). P.V splits each 14-bit
+// level into 7-bit limbs, p = 128 hi + lo with hi, lo in [0, 127], so both products are int8
+// mma's exact in int32 (T * 127 * 128 < 2^31 for T < 132k), and 128 acc_hi + acc_lo in int64 is
+// the exact sum. One block = QT (16 or 32) query rows of one (b, h); K/V chunks of 64 keys.
+// smem: scores QT*T floats | hi, lo levels QT x PS bytes each | q tile QT x QS | K chunk 64 x QS
+// or V chunk transposed 128 x VS. Row strides are padded so fragment loads are conflict-free.
+__device__ __forceinline__ void mma_s8(int* d, const unsigned* a, const unsigned* b) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+               : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+#define LD32(p) (*(const unsigned*)(p))
+extern "C" __global__ void __launch_bounds__(256)
+attention_mma(const signed char* __restrict__ qq, const float* __restrict__ qs, const signed char* __restrict__ kq,
+              const float* __restrict__ ks, const signed char* __restrict__ vq, const float* __restrict__ vs,
+              int B, int T, int H, int Hkv, float INV_SQRT_HD, int QT, float* __restrict__ out) {
+  constexpr int HD = 128, KC = 64, QS = HD + 16, VS = KC + 16;
+  extern __shared__ float smem[];
+  const int TP = (T + KC - 1) / KC * KC, PS = TP + 16;
+  float* sc = smem;
+  signed char* ph = (signed char*)(smem + QT * T);
+  signed char* pl = ph + QT * PS;
+  signed char* qt = pl + QT * PS;
+  signed char* kv = qt + QT * QS;
+  __shared__ float rsp[32];
+  const int bh = blockIdx.x, b = bh / H, h = bh % H, hk = h / (H / Hkv);
+  const int t0 = blockIdx.y * QT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tg = lane & 3;
+  const int nrows = min(QT, T - t0), kmax = t0 + nrows - 1, MT = QT / 16;
+  for (int i = tid; i < QT * HD; i += 256) {
+    int r = i / HD, d = i % HD;
+    qt[r * QS + d] = r < nrows ? qq[((long long)(b * T + t0 + r) * H + h) * HD + d] : 0;
+  }
+  // phase 1: scores, warp w takes key n-tile w (8 keys) of each chunk for every m-tile
+  for (int kc = 0; kc <= kmax; kc += KC) {
+    __syncthreads();
+    const int nk = min(KC, kmax + 1 - kc);
+    for (int i = tid; i < KC * HD; i += 256) {
+      int jj = i / HD, d = i % HD;
+      kv[jj * QS + d] = jj < nk ? kq[((long long)(b * T + kc + jj) * Hkv + hk) * HD + d] : 0;
+    }
+    __syncthreads();
+    const int nt = warp;
+    if (nt * 8 < nk) {
+      for (int mt = 0; mt < MT; mt++) {
+        int acc[4] = {0, 0, 0, 0};
+        for (int kk = 0; kk < HD / 32; kk++) {
+          const signed char* qa = qt + (mt * 16 + g) * QS + kk * 32 + tg * 4;
+          const signed char* kb = kv + (nt * 8 + g) * QS + kk * 32 + tg * 4;
+          unsigned a[4] = {LD32(qa), LD32(qa + 8 * QS), LD32(qa + 16), LD32(qa + 8 * QS + 16)};
+          unsigned bb[2] = {LD32(kb), LD32(kb + 16)};
+          mma_s8(acc, a, bb);
+        }
+        for (int e = 0; e < 4; e++) {
+          const int r = mt * 16 + g + (e >= 2 ? 8 : 0), jj = nt * 8 + tg * 2 + (e & 1), j = kc + jj, t = t0 + r;
+          if (r >= nrows || jj >= nk) continue;
+          float v = NEG_INF;
+          if (j <= t)
+            v = __fmul_rn(__fmul_rn(__fmul_rn((float)acc[e], qs[(long long)(b * T + t) * H + h]),
+                                    ks[(long long)(b * T + j) * Hkv + hk]), INV_SQRT_HD);
+          sc[r * T + j] = v;
+        }
+      }
+    }
+  }
+  __syncthreads();
+  // phase 2 (as attention_tile): one warp per row; writes the levels as hi and lo limbs
+  const int kpad = (kmax / KC + 1) * KC;
+  for (int r = warp; r < nrows; r += 8) {
+    const int t = t0 + r;
+    float* row = sc + r * T;
+    float mx = NEG_INF;
+    for (int j = lane; j <= t; j += 32) mx = fmaxf(mx, row[j]);
+    mx = warp_max(mx);
+    float emx = 0.f;
+    for (int j = lane; j <= t; j += 32) { float e = det_exp_f(__fsub_rn(row[j], mx)); row[j] = e; emx = fmaxf(emx, fabsf(e)); }
+    emx = warp_max(emx);
+    int e2; frexpf(emx, &e2);
+    int sh = (62 - 20) - e2;
+    sh = sh < -1000 ? -1000 : (sh > 1000 ? 1000 : sh);
+    const double p2 = __longlong_as_double((long long)(sh + 1023) << 52);
+    long long acc = 0;
+    for (int j = lane; j <= t; j += 32) acc += __double2ll_rn((double)row[j] * p2);
+    acc = warp_sum_ll(acc);
+    const float den = __double2float_rn(__ll2double_rn(acc) * __longlong_as_double((long long)(-sh + 1023) << 52));
+    float pm = t < T - 1 ? 0.0f : NEG_INF;
+    for (int j = lane; j <= t; j += 32) {
+      float pv = __fmul_rn(__fdiv_rn(row[j], den), vs[(long long)(b * T + j) * Hkv + hk]);
+      row[j] = pv;
+      pm = fmaxf(pm, pv);
+    }
+    pm = warp_max(pm);
+    const float sp = __fdiv_rn(fmaxf(pm, TINY), PLEVELS);
+    for (int j = lane; j < kpad; j += 32) {
+      const int p = j <= t ? (int)fminf(fmaxf(rintf(__fdiv_rn(row[j], sp)), 0.0f), PLEVELS) : 0;
+      ph[r * PS + j] = (signed char)(p >> 7);
+      pl[r * PS + j] = (signed char)(p & 127);
+    }
+    if (lane == 0) rsp[r] = sp;
+  }
+  // phase 3: o = P.V; warp w owns head-dim n-tiles 2w and 2w + 1 for every m-tile
+  int ah_[2][2][4], al_[2][2][4];
+  for (int x = 0; x < 2; x++) for (int y = 0; y < 2; y++) for (int e = 0; e < 4; e++) ah_[x][y][e] = al_[x][y][e] = 0;
+  for (int kc = 0; kc <= kmax; kc += KC) {
+    __syncthreads();
+    const int nk = min(KC, kmax + 1 - kc);
+    for (int i = tid; i < KC * HD; i += 256) {
+      int jj = i / HD, d = i % HD;
+      kv[d * VS + jj] = jj < nk ? vq[((long long)(b * T + kc + jj) * Hkv + hk) * HD + d] : 0;
+    }
+    __syncthreads();
+    for (int kk = 0; kk < KC / 32; kk++) {
+      for (int mt = 0; mt < MT; mt++) {
+        const int o = (mt * 16 + g) * PS + kc + kk * 32 + tg * 4;
+        unsigned ha[4] = {LD32(ph + o), LD32(ph + o + 8 * PS), LD32(ph + o + 16), LD32(ph + o + 8 * PS + 16)};
+        unsigned la[4] = {LD32(pl + o), LD32(pl + o + 8 * PS), LD32(pl + o + 16), LD32(pl + o + 8 * PS + 16)};
+        for (int n2 = 0; n2 < 2; n2++) {
+          const signed char* vb = kv + ((warp * 2 + n2) * 8 + g) * VS + kk * 32 + tg * 4;
+          unsigned bb[2] = {LD32(vb), LD32(vb + 16)};
+          mma_s8(ah_[mt][n2], ha, bb);
+          mma_s8(al_[mt][n2], la, bb);
+        }
+      }
+    }
+  }
+  for (int mt = 0; mt < MT; mt++)
+    for (int n2 = 0; n2 < 2; n2++)
+      for (int e = 0; e < 4; e++) {
+        const int r = mt * 16 + g + (e >= 2 ? 8 : 0), d = (warp * 2 + n2) * 8 + tg * 2 + (e & 1);
+        if (r >= nrows) continue;
+        const long long o = 128LL * ah_[mt][n2][e] + al_[mt][n2][e];
+        out[(long long)(b * T + t0 + r) * (H * HD) + h * HD + d] = __fmul_rn(__ll2float_rn(o), rsp[r]);
+      }
+}
+
 // agent.proto.pooled: per (sequence, column) the mean over tokens, accumulated in float64 in
 // token order (as numpy sums axis 0 of a (T, D) array), divided by T, rounded once to float32
 extern "C" __global__ void pooled_f32(const float* __restrict__ x, int T, int D, long long BD, float* __restrict__ out) {
@@ -585,11 +720,21 @@ def attention(qq, qs, kq, ks, vq, vs, B: int, T: int, H: int, Hkv: int, inv_sqrt
     f = lambda z: z.contiguous().to(torch.float32)
     out = torch.empty((N, H * 128), dtype=torch.float32, device=qq.device)
     args = [i8(qq), f(qs), i8(kq), f(ks), i8(vq), f(vs)]
-    QT = 32
-    while QT > 1 and QT * T * 4 > 32 * 1024:
-        QT //= 2
-    smem = QT * T * 4 + QT * 128 + 64 * 128
     with cp.cuda.Device(qq.device.index):
+        mq = _mma_qt(T, qq.device.index) if MMA else 0
+        if mq:
+            tp = -(-T // 64) * 64
+            smem = mq * T * 4 + 2 * mq * (tp + 16) + mq * 144 + max(64 * 144, 128 * 80)
+            f = _fn("attention_mma")
+            f.max_dynamic_shared_size_bytes = max(smem, 48 * 1024)
+            f((B * H, -(-T // mq)), (256,), tuple(np.uint64(a.data_ptr()) for a in args) +
+              (np.int32(B), np.int32(T), np.int32(H), np.int32(Hkv), np.float32(inv_sqrt_hd_f32), np.int32(mq),
+               np.uint64(out.data_ptr())), stream=_stream(), shared_mem=smem)
+            return out
+        QT = 32
+        while QT > 1 and QT * T * 4 > 32 * 1024:
+            QT //= 2
+        smem = QT * T * 4 + QT * 128 + 64 * 128
         if TILED:
             f = _fn("attention_tile")
             f.max_dynamic_shared_size_bytes = max(smem, 48 * 1024)
@@ -602,6 +747,21 @@ def attention(qq, qs, kq, ks, vq, vs, B: int, T: int, H: int, Hkv: int, inv_sqrt
                                   np.uint64(out.data_ptr())),
                                  stream=_stream(), shared_mem=8 * T)
     return out
+
+
+MMA = True
+_SMEM_OPTIN: dict = {}
+
+
+def _mma_qt(T: int, dev: int) -> int:
+    """Query rows per block for attention_mma (32 or 16), or 0 if its shared memory does not fit."""
+    if dev not in _SMEM_OPTIN:
+        _SMEM_OPTIN[dev] = cp.cuda.Device(dev).attributes["MaxSharedMemoryPerBlockOptin"]
+    tp = -(-T // 64) * 64
+    for qt in (32, 16):
+        if qt * T * 4 + 2 * qt * (tp + 16) + qt * 144 + max(64 * 144, 128 * 80) <= _SMEM_OPTIN[dev]:
+            return qt
+    return 0
 
 
 def _ptr(t):

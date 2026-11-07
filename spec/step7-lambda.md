@@ -70,15 +70,40 @@ box, 16 × 128-token client jobs; `results/testnet-run2-lambda.txt`):
 
 The lowest values are each provider's first job, which includes compiling the kernels.
 
+## Round 2: batching, GPU-side commitments, tensor-core attention (2026-11-07 evening)
+
+| Change | Effect |
+|---|---|
+| Mined GEMM at small m: projections as int8 GEMMs, 64-wide tiles, per-shape autotuner (`miner/ampere`, all opt-in) | ~1% at 1,024-token calls; off by default. A layer call is a chain of 6-7 small kernels whose fixed costs dominate, so single-kernel tuning barely moves it |
+| **Jobs share GPU passes** (`Runtime.jobs_roots`, `--batch-tokens`, default 8,192): accepted jobs waiting for the GPU run in one forward pass | rows are independent, so each job commits to what it would alone |
+| **Stage roots and pooled outputs on the GPU** (`detgpu.sha.stage_roots_gpu`, `detgpu.kernels.pooled`) | 32 B per stage leave the GPU instead of every stage's rows |
+| **Stage inputs recomputed on demand** (`Runtime.stage_input`) instead of copied and saved as JSON for every job | removes 0.29 s (riser copy) + 0.55 s (JSON) per 16-sequence job on the 3080 box |
+| **Attention on int8 tensor cores** (`attention_mma`): scores as int8 mma; the 14-bit levels split into 7-bit limbs (P_LEVELS = 16383 = 128·127 + 127) so P·V is two exact int8 mma's | 2.2-2.4x faster attention; dp4a kernel kept as fallback for T > ~900 |
+
+All bit-identical: `tests/test_attention_mma.py` (12 shapes), `tests/test_provider_batch.py`, `tests/test_detgpu.py` (digests equal on 3080 and 5090), miner suite 28/28.
+
+Provider end to end, 8 jobs of 8 × 128 (`bench/provider_batch.py`, `results/provider-batch-*.json`), wall-clock λ including the host side:
+
+| GPU | Before (one job per pass, rows copied; JSON save not counted) | One job per pass now | Jobs batched (64 sequences per pass) |
+|---|---|---|---|
+| RTX 3080 (×1 riser) | 0.082 | 0.312 | **0.400** |
+| RTX 5090 | 0.133 | 0.217 | **0.352** |
+
+Single jobs (`bench/lambda_det.py --engine detgpu-roots`):
+
+| | 16 × 128 | 64 × 128 | 16 × 512 |
+|---|---|---|---|
+| 3080 | 0.312 → **0.357** | 0.346 → **0.398** | 0.203 → **0.299** |
+| 5090 | 0.249 → **0.293** | 0.305 → **0.351** | 0.187 → **0.265** |
+
+Not yet confirmed on the live testnet (run 2 measured 0.254 and 0.227 before these changes).
+
 ## What's left
 
-1. **The mined GEMM at small m.** At 1,024 rows it runs at 56% of the noise rate on a 3080 and 31%
-   on a 5090. Fixes: larger stages, or a GEMM tile configuration for small m and for Blackwell.
-2. **Attention at long sequences** dominates at T = 512 (about half the job). It needs a better
-   kernel before stages move to longer sequences.
-3. **Saving stage inputs** takes about 1 s per job on the 3080 box, outside the measured GPU time.
-   Serving them on demand from GPU memory or pinned host buffers would let a busy provider keep
-   its GPU full.
-4. **The client price on the testnet** is set by the test client's fee, so it isn't a market
+1. ~~The mined GEMM at small m~~: addressed by batching jobs (round 2).
+2. ~~Attention at long sequences~~: tensor-core kernel (round 2); still the largest kernel at T = 512.
+3. ~~Saving stage inputs~~: recomputed on demand (round 2).
+4. **Confirm round 2 live** on the testnet (batched passes need providers with several queued jobs).
+5. **The client price on the testnet** is set by the test client's fee, so it isn't a market
    measurement. With λ ≈ 0.25, a client pays about 0.75 of the GPU's mining income per GPU-second,
    against 0.99 at λ = 0.012.
