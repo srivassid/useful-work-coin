@@ -27,6 +27,10 @@ exactly as on unmodified Pearl.
 | 0010 | `uwcctl ops` (any op as JSON); devnet windows |
 | 0011 | one-step proofs for providers (`BuildOneStep`, `uwcctl onestep`); pool bonds capped at the reference unit cost |
 | 0012 | devnet: 20-block challenge window |
+| 0013 | scheduled job-module upgrades (`Params.Upgrades`, `Rules`), `--uwctestnet`, mempool persistence |
+| 0014 | stages committed by their output roots; full traces only in disputes |
+| 0015 | testnet genesis timestamp in the past |
+| 0016 | **Rules 2** (testnet run 1 findings, active on the testnet from height 1400): forced-error jackpots only for a catch on the decoy's wrong stage (record v2 with a stage key; jobs record the stage they were caught on), directed jobs, challenge bonds of `ChallengeBondBP` of the provider's bond; node: `getjobopresult`, failed job ops logged, catchers / directed / caught stage in `getjob` |
 
 Design: `spec/job-module.md`, `spec/stage-program.md`, `spec/pool-and-watchers.md`. Results:
 `spec/step3-results.md`, `spec/step4-results.md`, `spec/step5-results.md`, `spec/step6-results.md`.

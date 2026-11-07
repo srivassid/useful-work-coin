@@ -106,14 +106,35 @@ def _uvarint(v: int) -> bytes:
             return bytes(out)
 
 
-def encode_record(decoys: list[bytes]) -> bytes:
+def encode_record(decoys: list[bytes], stage_key: bytes | None = None) -> bytes:
+    """jobstate.EncodeFERecord (version 1) or EncodeFERecordV2 (version 2, with the stage key
+    that fixes each decoy job's wrong stage; needed from Rules 2)."""
     assert all(len(a) == 32 for a in decoys)
-    return b"\x01" + _uvarint(len(decoys)) + b"".join(decoys)
+    if stage_key is None:
+        return b"\x01" + _uvarint(len(decoys)) + b"".join(decoys)
+    assert len(stage_key) == 32
+    return b"\x02" + _uvarint(len(decoys)) + b"".join(decoys) + stage_key
+
+
+def fe_stage(stage_key: bytes, job: bytes, stages: int) -> int:
+    """jobstate.FEStage: the stage a decoy job carries its wrong root at (record version 2)."""
+    x = tag_hash("fe-stage", stage_key, job)
+    return int.from_bytes(x[:8], "big") % stages
 
 
 def decode_record(b: bytes) -> list[bytes]:
-    if not b or b[0] != 1:
+    return decode_record_full(b)[0]
+
+
+def decode_record_full(b: bytes) -> tuple[list[bytes], bytes | None]:
+    """(decoy accounts, stage key or None for a version-1 record)."""
+    if not b or b[0] not in (1, 2):
         raise ValueError("bad record version")
+    key = None
+    if b[0] == 2:
+        if len(b) < 33:
+            raise ValueError("bad record length")
+        b, key = b"\x01" + b[1:-32], b[-32:]
     n, shift, i = 0, 0, 1
     while True:
         c = b[i]
@@ -125,7 +146,7 @@ def decode_record(b: bytes) -> list[bytes]:
     body = b[i:]
     if len(body) != 32 * n:
         raise ValueError("bad record length")
-    return [body[k * 32:(k + 1) * 32] for k in range(n)]
+    return [body[k * 32:(k + 1) * 32] for k in range(n)], key
 
 
 def fe_commitment(record: bytes, salt: bytes) -> bytes:

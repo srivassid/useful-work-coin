@@ -107,6 +107,16 @@ class Agent:
             log(f"{what}: {e}")
             return None
 
+    def challenge_bond(self, j: dict) -> int:
+        """The bond a CHALLENGE on j needs (jobstate.ChallengeBond, from the next block's rules)."""
+        p = self.chain.state().get("params") or {}
+        need = p.get("challengebondmin", 0)
+        bp = p.get("challengebondbp", 0)
+        if p.get("rules", 0) >= 2 and bp:
+            b = j["bond"]
+            need = max(need, b // 10_000 * bp + (b % 10_000) * bp // 10_000)
+        return max(self.a.bond, need)
+
     def batches(self, j: dict) -> list[list[int]] | None:
         """The job's token batches: a pool unit from the public work list, a client job from the
         data service (checked against input_root)."""
@@ -219,6 +229,7 @@ class Provider(Agent):
         # the GPU is busy only until a job is committed: limit jobs not yet committed, counting
         # claims and accepts sent but not yet in a block
         computing = [jid for jid in active if mine[jid]["status"] == "accepted"]
+        self.pending_bonds = 0  # bonds of claims and accepts sent but not yet mined
         for jid, js in self.st["jobs"].items():
             sent = js.get("claimed", js.get("accepted"))
             if jid not in mine and sent is not None and h - sent < 20:
@@ -227,6 +238,7 @@ class Provider(Agent):
                         continue  # left the mempool without making the job ours: another provider won it
                 computing.append(jid)
                 active.append(jid)
+                self.pending_bonds += js.get("bond", 0)
         # new work: client jobs first, then pool units, up to max_jobs not yet committed (jobs
         # accepted while the GPU is busy run together in its next pass)
         if len(computing) < (self.a.max_jobs or 4):
@@ -235,9 +247,11 @@ class Provider(Agent):
                     j = self.chain.job(jid)
                     if j and j["model"] == self.model_id and j["deadline"] > h + 5 and self.batches(j) is not None:
                         bond = (j["fee"] * 5000 + 9999) // 10000
+                        if not self.can_bond(bond, h):
+                            break
                         r = self.send([{"kind": "JOB_ACCEPT", "job": jid, "amount": bond}], f"accept {jid[:8]}")
                         if r:
-                            self.st["jobs"][jid] = {"accepted": h, "tx": r["txid"]}
+                            self.st["jobs"][jid] = {"accepted": h, "tx": r["txid"], "bond": bond}
                             self.save()
                             return
             if self.units and self.a.pool:
@@ -247,6 +261,20 @@ class Provider(Agent):
         for jid in sorted(active, key=lambda x: urgent.get(mine.get(x, {}).get("status"), 2)):
             self.advance(jid)
         self.launch()
+
+    def can_bond(self, bond: int, h: int) -> bool:
+        """A bond the free balance can cover after the bonds already in flight; a claim or accept
+        without it would fail inside its block and leave no trace (testnet run 1: 100 such ops)."""
+        try:
+            free = self.chain.account(self.account).get("balance", 0) - getattr(self, "pending_bonds", 0)
+        except Exception:
+            return True
+        if free >= bond:
+            return True
+        if self.st.get("low_balance_h") != h:
+            self.st["low_balance_h"] = h
+            log(f"free balance {free} cannot bond {bond}: waiting for bonds to return")
+        return False
 
     def launch(self):
         """Start the GPU on every accepted job not yet computed (advance collects them in
@@ -285,12 +313,14 @@ class Provider(Agent):
                 continue
             i = free[0]
             bond = (c.get("bondbasis", c["price"]) * 5000 + 9999) // 10000
+            if not self.can_bond(bond, s["height"]):
+                return
             op = {"kind": "POOL_CLAIM", "job": cid, "u1": i, "h1": doc["units"][i]["input_root"],
                   "proof": unit_proof(doc, i), "amount": bond}
             r = self.send([op], f"claim unit {i} of {cid[:8]}")
             tried[str(i)] = s["height"]
             if r:
-                self.st["jobs"][r["job"]] = {"claimed": s["height"], "tx": r["txid"]}
+                self.st["jobs"][r["job"]] = {"claimed": s["height"], "tx": r["txid"], "bond": bond}
             self.save()
             return
 
@@ -578,7 +608,7 @@ class Watcher(Agent):
                 js["agreed_open"] = True  # already open and correct: nothing to post
                 log(f"check {jid[:8]} stage {stage}: matches the opened root")
             else:
-                if self.send([{"kind": "CHALLENGE", "job": jid, "u1": stage, "h1": root, "amount": self.a.bond}],
+                if self.send([{"kind": "CHALLENGE", "job": jid, "u1": stage, "h1": root, "amount": self.challenge_bond(j)}],
                              f"check {jid[:8]} stage {stage}"):
                     js["challenged"] = True
             self.save()
@@ -760,6 +790,19 @@ class Decoy(Provider):
                 js["last_reveal"] = key
                 self.save()
 
+    def stage_key(self) -> bytes | None:
+        """The stage key of the newest unrevealed forced-error commitment (agent.fe writes it for
+        the keyholders' decoy runner): from Rules 2 it fixes each decoy's wrong stage."""
+        from .fe import FE_DIR
+        best = None
+        for d in os.listdir(FE_DIR) if os.path.isdir(FE_DIR) else []:
+            info_p, key_p = os.path.join(FE_DIR, d, "commit.json"), os.path.join(FE_DIR, d, "decoy.json")
+            if os.path.exists(info_p) and os.path.exists(key_p) and not json.load(open(info_p)).get("revealed"):
+                m = os.path.getmtime(key_p)
+                if best is None or m > best[0]:
+                    best = (m, bytes.fromhex(json.load(open(key_p))["stage_key"]))
+        return best[1] if best else None
+
     def post_decoy(self, h: int):
         n = len(self.st["jobs"])
         seqs = wikitext_sequences(self.a.dataset, self.model["model_dir"], self.a.seq_len, self.a.batches,
@@ -768,24 +811,38 @@ class Decoy(Provider):
             log("decoy: no text left at this offset")
             self.st["last_post"] = h
             return
-        roots, embs = [], []
-        for toks in seqs:
-            r, e = self.rt.batch(toks)
-            roots += r
-            embs.append(e)
-        wrong = random.randrange(len(roots))
-        roots[wrong] = secrets.token_bytes(32)  # the forced error
-        salts = [secrets.token_bytes(32) for _ in roots]
+        rules2 = (self.chain.state().get("params") or {}).get("rules", 0) >= 2
+        key = self.stage_key() if rules2 else None
+        if rules2 and key is None:
+            log("decoy: Rules 2 needs the commitment's stage key (agent.fe commit writes decoy.json)")
+            self.st["last_post"] = h
+            return
         root = input_root(seqs).hex()
         self.data.put(f"/inputs/{root}.json", json.dumps({"batches": seqs}).encode())
+        # Rules 2: the job is directed to the decoy account (no accept race), and its wrong stage
+        # follows from the job id and the stage key, so a catch elsewhere earns no jackpot
+        directed = [self.account] if rules2 else []
         try:
             r = self.chain.run("jobpost", os.path.expanduser(self.a.client_key), self.model_id, root,
                                str(len(seqs) * self.G), str(self.a.fee), str(self.a.deadline), str(self.a.k),
-                               str(self.a.n), str(self.a.seq_len))
+                               str(self.a.n), str(self.a.seq_len), *directed)
         except ChainError as e:
             log(f"decoy post: {e}")
             return
         jid = r["job"]
+        roots, embs = [], []
+        for toks in seqs:
+            rr, e = self.rt.batch(toks)
+            roots += rr
+            embs.append(e)
+        if key is not None:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "verifier"))
+            import forced_errors as fe
+            wrong = fe.fe_stage(key, bytes.fromhex(jid), len(roots))
+        else:
+            wrong = random.randrange(len(roots))
+        roots[wrong] = secrets.token_bytes(32)  # the forced error
+        salts = [secrets.token_bytes(32) for _ in roots]
         buf = io.BytesIO()
         np.save(buf, np.stack(embs))
         self.data.put(f"/outputs/{jid}.npy", buf.getvalue())

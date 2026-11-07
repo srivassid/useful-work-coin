@@ -47,7 +47,9 @@ def main() -> None:
     chain = Chain(a.devnet)
     if a.cmd == "commit":
         accts = [bytes.fromhex(chain.key_info(os.path.join(KEYS, k + ".json"))["account"]) for k in a.decoys]
-        record, salt = fe.encode_record(accts), secrets.token_bytes(32)
+        # version 2: the stage key fixes each decoy job's wrong stage (needed from Rules 2)
+        stage_key = secrets.token_bytes(32)
+        record, salt = fe.encode_record(accts, stage_key), secrets.token_bytes(32)
         c = fe.fe_commitment(record, salt)
         d = os.path.join(FE_DIR, c.hex()[:16])
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -55,6 +57,9 @@ def main() -> None:
             p = os.path.join(d, f"share-{x}.json")
             json.dump({"x": x, "t": 2, "m": 3, "share": y.hex(), "commitment": c.hex()}, open(p, "w"))
             os.chmod(p, 0o600)
+        p = os.path.join(d, "decoy.json")  # for the keyholders' decoy runner only
+        json.dump({"stage_key": stage_key.hex(), "commitment": c.hex()}, open(p, "w"))
+        os.chmod(p, 0o600)
         r = chain.run("propose-fe", os.path.join(KEYS, "council0.json"), c.hex(), str(a.reserve))
         wait_mempool(chain)
         chain.run("approve", os.path.join(KEYS, "council1.json"), r["proposal"])

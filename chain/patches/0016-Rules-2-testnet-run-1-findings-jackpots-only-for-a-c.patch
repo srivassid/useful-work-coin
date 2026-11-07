@@ -1,0 +1,833 @@
+From 6b63c3a4b5dbe7596166728e4816c826c050083e Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Sat, 7 Nov 2026 22:30:00 +0530
+Subject: [PATCH] Rules 2 (testnet run 1 findings): jackpots only for a catch
+ on the decoy's wrong stage, directed jobs, challenge bonds scaled to the
+ provider's bond, job-op results
+
+- Forced-error record v2 carries a stage key; FEStage(key, job, stages) fixes each decoy's wrong
+  stage. Jobs record the stage they failed on (Caught/CaughtStage: games, unserved inputs), and
+  FE_REVEAL pays the jackpot (and reimburses the decoy bond) only for a catch on that stage.
+- JOB_POST may name the only provider allowed to accept (Job.Directed), so decoys cannot be raced.
+- CHALLENGE bonds at least ChallengeBondBP of the provider's bond (testnet: 10%).
+- Rules 2 job fields are encoded only when set: replaying the testnet (1329 blocks) gives the
+  same state roots. Testnet adopts Rules 2 at height 1400.
+- Node: outcomes of recent job ops kept in memory, failures logged, getjobopresult RPC;
+  getjob shows catchers, directed provider and caught stage; getjobstate shows the next
+  block's rule parameters. uwcctl jobpost takes an optional provider account.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NvNdLwU8j8WLX4mWzr
+---
+ node/blockchain/jobops_log.go |  93 +++++++++++++++++
+ node/blockchain/jobs.go       |   1 +
+ node/btcjson/uwccmds.go       |   6 ++
+ node/chaincfg/uwc_testnet.go  |   9 ++
+ node/cmd/uwcctl/main.go       |  10 +-
+ node/jobstate/apply.go        |  28 ++++-
+ node/jobstate/dispute.go      |   4 +
+ node/jobstate/ops.go          |  12 ++-
+ node/jobstate/pool.go         |  61 +++++++++--
+ node/jobstate/rules2_test.go  | 185 ++++++++++++++++++++++++++++++++++
+ node/jobstate/state.go        |   3 +
+ node/jobstate/types.go        |  13 +++
+ node/rpcjobs.go               |  74 ++++++++++----
+ 13 files changed, 464 insertions(+), 35 deletions(-)
+ create mode 100644 node/blockchain/jobops_log.go
+ create mode 100644 node/jobstate/rules2_test.go
+
+diff --git a/node/blockchain/jobops_log.go b/node/blockchain/jobops_log.go
+new file mode 100644
+index 00000000..6b2d1a50
+--- /dev/null
++++ b/node/blockchain/jobops_log.go
+@@ -0,0 +1,93 @@
++package blockchain
++
++import (
++	"bytes"
++	"strings"
++	"sync"
++
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++)
++
++// Job operations that fail inside a mined transaction change nothing and leave no trace in
++// the chain (testnet run 1 finding). The node keeps the outcome of the job ops of recently
++// validated blocks in memory, logs failures, and serves them by txid (getjobopresult).
++
++// JobOpResult is the outcome of one job op output.
++type JobOpResult struct {
++	Output int
++	Kind   string
++	Error  string // empty when the op was applied
++	Height int32
++	Block  chainhash.Hash
++}
++
++const jobOpLogSize = 50_000 // transactions remembered
++
++var jobOpLog = struct {
++	sync.Mutex
++	byTx  map[chainhash.Hash][]JobOpResult
++	order []chainhash.Hash
++}{byTx: map[chainhash.Hash][]JobOpResult{}}
++
++// JobOpResults returns the outcomes of the job ops in transaction txid, as last validated
++// (nil if the node has not validated a block with it since it started).
++func JobOpResults(txid chainhash.Hash) []JobOpResult {
++	jobOpLog.Lock()
++	defer jobOpLog.Unlock()
++	return append([]JobOpResult(nil), jobOpLog.byTx[txid]...)
++}
++
++func recordJobOps(node *blockNode, block *btcutil.Block, ops []*jobstate.Op, res *jobstate.BlockResult) {
++	if len(ops) == 0 {
++		return
++	}
++	byRef := make(map[jobstate.Hash]int, len(ops))
++	for i, op := range ops {
++		byRef[op.Ref] = i
++	}
++	got := map[chainhash.Hash][]JobOpResult{}
++	var txs []chainhash.Hash
++	for _, tx := range block.Transactions()[1:] {
++		for oi, out := range tx.MsgTx().TxOut {
++			if tag, _ := ParseJobOutput(out.PkScript); !bytes.Equal(tag, JobOpTag) {
++				continue
++			}
++			var ref [36]byte
++			copy(ref[:32], tx.Hash()[:])
++			ref[32], ref[33], ref[34], ref[35] = byte(oi), byte(oi>>8), byte(oi>>16), byte(oi>>24)
++			r := JobOpResult{Output: oi, Height: node.height, Block: node.hash}
++			i, ok := byRef[jobstate.Hash(chainhash.HashH(ref[:]))]
++			switch {
++			case !ok:
++				r.Kind, r.Error = "?", "not decoded (malformed payload, or no authorizing input)"
++			default:
++				r.Kind = ops[i].Kind.String()
++				if i < len(res.OpErrors) && res.OpErrors[i] != nil {
++					r.Error = strings.TrimPrefix(res.OpErrors[i].Error(), r.Kind+": ")
++				}
++			}
++			if r.Error != "" {
++				log.Infof("Job op failed in block %v (height %d): tx %v output %d %s: %s", node.hash, node.height,
++					tx.Hash(), oi, r.Kind, r.Error)
++			}
++			if _, seen := got[*tx.Hash()]; !seen {
++				txs = append(txs, *tx.Hash())
++			}
++			got[*tx.Hash()] = append(got[*tx.Hash()], r)
++		}
++	}
++	jobOpLog.Lock()
++	defer jobOpLog.Unlock()
++	for _, h := range txs {
++		if _, ok := jobOpLog.byTx[h]; !ok {
++			jobOpLog.order = append(jobOpLog.order, h)
++		}
++		jobOpLog.byTx[h] = got[h]
++	}
++	for len(jobOpLog.order) > jobOpLogSize {
++		delete(jobOpLog.byTx, jobOpLog.order[0])
++		jobOpLog.order = jobOpLog.order[1:]
++	}
++}
+diff --git a/node/blockchain/jobs.go b/node/blockchain/jobs.go
+index fe296d47..616e1cc1 100644
+--- a/node/blockchain/jobs.go
++++ b/node/blockchain/jobs.go
+@@ -249,6 +249,7 @@ func (b *BlockChain) checkJobRules(node *blockNode, block *btcutil.Block, deps [
+ 	subsidy := CalcBlockSubsidy(node.height, b.chainParams)
+ 	res := jobstate.ApplyBlock(st, *jp, jobstate.BlockInput{Height: node.height,
+ 		PrevHash: jobstate.Hash(node.parent.hash), Subsidy: subsidy, Deposits: deps, Ops: ops})
++	recordJobOps(node, block, ops, res)
+ 
+ 	coinbase := block.Transactions()[0].MsgTx()
+ 	var pool int64
+diff --git a/node/btcjson/uwccmds.go b/node/btcjson/uwccmds.go
+index db40ea0d..f5331b0c 100644
+--- a/node/btcjson/uwccmds.go
++++ b/node/btcjson/uwccmds.go
+@@ -25,8 +25,14 @@ type GetCategoryCmd struct {
+ 	CategoryID string
+ }
+ 
++// GetJobOpResultCmd defines the getjobopresult JSON-RPC command.
++type GetJobOpResultCmd struct {
++	TxID string
++}
++
+ func init() {
+ 	flags := UsageFlag(0)
++	MustRegisterCmd("getjobopresult", (*GetJobOpResultCmd)(nil), flags)
+ 	MustRegisterCmd("getjobstate", (*GetJobStateCmd)(nil), flags)
+ 	MustRegisterCmd("getjob", (*GetJobCmd)(nil), flags)
+ 	MustRegisterCmd("listjobs", (*ListJobsCmd)(nil), flags)
+diff --git a/node/chaincfg/uwc_testnet.go b/node/chaincfg/uwc_testnet.go
+index 41b27bbb..f06bd530 100644
+--- a/node/chaincfg/uwc_testnet.go
++++ b/node/chaincfg/uwc_testnet.go
+@@ -39,9 +39,18 @@ func uwcTestNetJobParams() *jobstate.Params {
+ 	p.ChallengeWindow = 240 // about 4 hours: time for watchers to check
+ 	p.UnbondDelay = 1440
+ 	p.Rules = 1
++	// Testnet run 1 findings (spec/step7-testnet-run1.md): forced-error jackpots only for a catch
++	// on the decoy's wrong stage, directed jobs, challenge bonds of 10% of the provider's bond.
++	r2 := p
++	r2.Rules, r2.ChallengeBondBP = 2, 1000
++	p.Upgrades = []jobstate.Upgrade{{Height: UWCTestNetRules2Height, Params: r2}}
+ 	return &p
+ }
+ 
++// UWCTestNetRules2Height is where the testnet adopts Rules 2 (it stood at block 1329 when this
++// was scheduled; every node must run a Rules-2 binary before then).
++const UWCTestNetRules2Height = 1400
++
+ var uwcTestNetGenesisBlock = func() wire.MsgBlock {
+ 	b := wire.MsgBlock{
+ 		MsgHeader: wire.MsgHeader{
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index 2f69caf3..df3a4540 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -39,7 +39,7 @@ jobs
+   ops <key> <ops.json|->               any job operations (JSON object or array, hex fields), one transaction
+   onestep <key> <request.json>        a provider's one-step proof for a game in its last round
+   modelreg <key> <model.json>         register a model (weights_root, runtime_hash, layer_groups, block, cfg)
+-  jobpost <key> <model> <input_root> <stages> <fee> <deadline_blocks> <k> <n> <seq_len>
++  jobpost <key> <model> <input_root> <stages> <fee> <deadline_blocks> <k> <n> <seq_len> [provider_account]
+ 
+ council (actions are proposed by one member and approved by others)
+   propose-category <key> <category.json>
+@@ -265,9 +265,13 @@ func main() {
+ 			die(err)
+ 		}
+ 		k, n := amount(args[6]), amount(args[7])
+-		submit(key(args[0]), nil, &jobstate.Op{Kind: jobstate.OpJobPost, Model: hash32(args[1]), H1: hash32(args[2]),
++		op := &jobstate.Op{Kind: jobstate.OpJobPost, Model: hash32(args[1]), H1: hash32(args[2]),
+ 			U1: uint32(amount(args[3])), Amount: amount(args[4]), Deadline: int32(h + amount(args[5]) + 1),
+-			K: uint8(k), N: uint8(n), U2: uint32(amount(args[8]))})
++			K: uint8(k), N: uint8(n), U2: uint32(amount(args[8]))}
++		if len(args) > 9 { // a directed job (Rules 2): only this provider account may accept
++			op.Provider = jobstate.AccountID(hash32(args[9]))
++		}
++		submit(key(args[0]), nil, op)
+ 	case "propose-category":
+ 		need(args, 2)
+ 		var sp struct {
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+index 09b7f195..ea4628de 100644
+--- a/node/jobstate/apply.go
++++ b/node/jobstate/apply.go
+@@ -191,6 +191,9 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		if h >= j.Deadline || o.Actor == j.Client {
+ 			return errors.New("too late or self-dealing on the same account")
+ 		}
++		if j.Directed != (AccountID{}) && o.Actor != j.Directed {
++			return errors.New("the job is directed to another provider")
++		}
+ 		if o.Amount < minBond(p, j.Fee) {
+ 			return errors.New("bond below minimum")
+ 		}
+@@ -278,7 +281,7 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		if j == nil || !(j.Status == StatusChallenge || (j.Status == StatusDisputed && h < j.ChallengeEnd)) {
+ 			return errors.New("job is not open to challenges")
+ 		}
+-		if o.Actor == j.Provider || o.Actor == (AccountID{}) || o.U1 >= j.Stages || o.Amount < p.ChallengeBondMin {
++		if o.Actor == j.Provider || o.Actor == (AccountID{}) || o.U1 >= j.Stages || o.Amount < ChallengeBond(p, j) {
+ 			return errors.New("bad challenge")
+ 		}
+ 		if err := s.debit(o.Actor, o.Amount); err != nil {
+@@ -357,6 +360,8 @@ func (s *State) jobPost(p Params, h int32, o *Op) error {
+ 		return errors.New("bad fee")
+ 	case o.U2 == 0 || int(o.U2) > m.Cfg.MaxPos:
+ 		return errors.New("bad sequence length")
++	case o.Provider != (AccountID{}) && (p.Rules < 2 || o.Provider == o.Actor):
++		return errors.New("directed jobs need Rules 2 and another account")
+ 	}
+ 	if s.reward > 0 && p.LargeJobRewards > 0 && o.Amount/p.LargeJobRewards >= s.reward && int(o.K) < p.MinKLarge {
+ 		return fmt.Errorf("a fee of %d block rewards or more needs k >= %d", p.LargeJobRewards, p.MinKLarge)
+@@ -374,7 +379,7 @@ func (s *State) jobPost(p Params, h int32, o *Op) error {
+ 	}
+ 	s.Jobs[id] = &Job{ID: id, Client: o.Actor, Model: o.Model, InputRoot: o.H1, Stages: o.U1, K: o.K, N: o.N,
+ 		Fee: o.Amount, VerifierPay: vp, TreasuryCut: tc, Deadline: o.Deadline, Status: StatusPosted, PostHeight: h,
+-		SeqLen: o.U2}
++		SeqLen: o.U2, Directed: o.Provider}
+ 	return nil
+ }
+ 
+@@ -504,6 +509,9 @@ func (s *State) applyVerdict(p Params, h int32, v Verdict) {
+ 			s.credit(d.Challenger, d.Bond) // honest challengers get their bond back
+ 			catchers = append(catchers, d.Challenger)
+ 		}
++		if len(j.Disputes) > 0 {
++			caughtAt(p, j, j.Disputes[0].Stage)
++		}
+ 		s.failProvider(j, catchers)
+ 		return
+ 	}
+@@ -520,6 +528,22 @@ func (s *State) applyVerdict(p Params, h int32, v Verdict) {
+ 	s.settle(j)
+ }
+ 
++// ChallengeBond is the smallest bond a CHALLENGE on job j must carry.
++func ChallengeBond(p Params, j *Job) Amount {
++	b := p.ChallengeBondMin
++	if p.Rules >= 2 && p.ChallengeBondBP > 0 {
++		b = max(b, j.Bond/10_000*p.ChallengeBondBP+(j.Bond%10_000)*p.ChallengeBondBP/10_000)
++	}
++	return b
++}
++
++// caughtAt records (Rules >= 2) the stage a failing provider was caught on.
++func caughtAt(p Params, j *Job, stage uint32) {
++	if p.Rules >= 2 {
++		j.Caught, j.CaughtStage = true, stage
++	}
++}
++
+ // failProvider: fee back to the client; bond half to catchers (equal split), half (plus remainder) to treasury.
+ func (s *State) failProvider(j *Job, catchers []AccountID) {
+ 	s.refundClient(j, j.Fee)
+diff --git a/node/jobstate/dispute.go b/node/jobstate/dispute.go
+index 289c9510..a32dc284 100644
+--- a/node/jobstate/dispute.go
++++ b/node/jobstate/dispute.go
+@@ -459,6 +459,7 @@ func (s *State) endGame(p Params, h int32, j *Job, providerWrong, challengerWron
+ 			s.credit(other.Challenger, other.Bond)
+ 		}
+ 		j.Disputes = nil
++		caughtAt(p, j, d.Stage)
+ 		s.failProvider(j, catchers)
+ 		return
+ 	}
+@@ -576,6 +577,9 @@ func (s *State) dataHold(p Params, h int32, j *Job) (hold, failed bool) {
+ 			continue
+ 		}
+ 		if h >= r.Due {
++			if r.Stage > 0 { // the input of stage s is stage s-1's output: that root opened no real rows
++				caughtAt(p, j, r.Stage-1)
++			}
+ 			s.failProvider(j, []AccountID{r.Requester})
+ 			return false, true
+ 		}
+diff --git a/node/jobstate/ops.go b/node/jobstate/ops.go
+index f5272d79..82cff17e 100644
+--- a/node/jobstate/ops.go
++++ b/node/jobstate/ops.go
+@@ -59,7 +59,7 @@ func (k OpKind) String() string { return opNames[k] }
+ //	WITHDRAW       Amount, PkScript
+ //	STAKE/UNSTAKE  Amount
+ //	MODEL_REG      H1 weights_root, H2 runtime_hash, U1 layer_groups, U2 rotation_block
+-//	JOB_POST       Model, H1 input_root, U1 stages, Amount fee, Deadline, K, N
++//	JOB_POST       Model, H1 input_root, U1 stages, Amount fee, Deadline, K, N, optional Provider (directed job, Rules >= 2)
+ //	JOB_ACCEPT     Job, Amount bond
+ //	TRACE_COMMIT   Job, H1 stage_root, H2 output_root
+ //	VERIFY_COMMIT  Job, H1 H(salt), H2 H(roots || account || salt)
+@@ -98,6 +98,7 @@ type Op struct {
+ 	Inputs   []ProvenRow
+ 	Cat      CategorySpec
+ 	Proof    []Hash
++	Provider AccountID // JOB_POST: directed provider (zero: open job; encoded only when set)
+ }
+ 
+ // ProvenRow is an input row for the referee or a served stage input, with its Merkle proof.
+@@ -177,6 +178,9 @@ func (o *Op) Encode() []byte {
+ 		b.WriteByte(o.K)
+ 		b.WriteByte(o.N)
+ 		w(o.U2)
++		if o.Provider != (AccountID{}) {
++			b.Write(o.Provider[:])
++		}
+ 	case OpJobAccept:
+ 		b.Write(o.Job[:])
+ 		w(o.Amount)
+@@ -370,6 +374,12 @@ func DecodeOp(p []byte) (*Op, error) {
+ 		o.Deadline = r.i32()
+ 		o.K, o.N = r.u8(), r.u8()
+ 		o.U2 = r.u32()
++		if len(r.b) == 32 {
++			copy(o.Provider[:], r.take(32))
++			if o.Provider == (AccountID{}) {
++				return nil, errors.New("jobstate: zero directed provider")
++			}
++		}
+ 	case OpJobAccept:
+ 		o.Job = r.hash()
+ 		o.Amount = r.i64()
+diff --git a/node/jobstate/pool.go b/node/jobstate/pool.go
+index cc0f7c35..6e428884 100644
+--- a/node/jobstate/pool.go
++++ b/node/jobstate/pool.go
+@@ -57,33 +57,70 @@ func CanaryLeaf(unit uint32, expected Hash, salt Hash) Hash {
+ // FECommitment binds a forced-error record (decoy provider accounts) to a secret salt.
+ func FECommitment(record []byte, salt Hash) Hash { return tagHash("fe-record", record, salt[:]) }
+ 
+-// EncodeFERecord / DecodeFERecord: version byte, count, accounts.
+-func EncodeFERecord(decoys []AccountID) []byte {
++// FERecord is an opened forced-error record: the decoy provider accounts and, from version 2,
++// the stage key that fixes each decoy job's wrong stage (FEStage).
++type FERecord struct {
++	Version  uint8
++	Decoys   []AccountID
++	StageKey Hash
++}
++
++// FEStage is the stage a decoy job carries its wrong root at (record version 2): the keyholders
++// derive it once the job id is known, and only a catch on this stage earns the jackpot.
++func FEStage(key Hash, job Hash, stages uint32) uint32 {
++	x := tagHash("fe-stage", key[:], job[:])
++	return uint32(binary.BigEndian.Uint64(x[:8]) % uint64(stages))
++}
++
++// EncodeFERecord / DecodeFERecord: version byte, count, accounts (version 2: then the stage key).
++func EncodeFERecord(decoys []AccountID) []byte { return EncodeFERecordV2(decoys, nil) }
++
++// EncodeFERecordV2 writes a version-2 record when key is non-nil.
++func EncodeFERecordV2(decoys []AccountID, key *Hash) []byte {
+ 	var e enc
+-	e.WriteByte(1)
++	if key == nil {
++		e.WriteByte(1)
++	} else {
++		e.WriteByte(2)
++	}
+ 	e.u(uint64(len(decoys)))
+ 	for _, a := range decoys {
+ 		e.Write(a[:])
+ 	}
++	if key != nil {
++		e.Write(key[:])
++	}
+ 	return e.Bytes()
+ }
+ 
+ func DecodeFERecord(b []byte) ([]AccountID, error) {
++	rec, err := DecodeFERecordFull(b)
++	if err != nil {
++		return nil, err
++	}
++	return rec.Decoys, nil
++}
++
++func DecodeFERecordFull(b []byte) (*FERecord, error) {
+ 	r := &reader{b: b}
+-	if r.u8() != 1 {
++	v := r.u8()
++	if v != 1 && v != 2 {
+ 		return nil, errors.New("bad forced-error record version")
+ 	}
+ 	n := r.uvar(1024)
+-	var out []AccountID
++	rec := &FERecord{Version: v}
+ 	for i := 0; i < n && r.err == nil; i++ {
+ 		var a AccountID
+ 		copy(a[:], r.take(32))
+-		out = append(out, a)
++		rec.Decoys = append(rec.Decoys, a)
++	}
++	if v == 2 {
++		copy(rec.StageKey[:], r.take(32))
+ 	}
+ 	if r.err != nil || len(r.b) != 0 {
+ 		return nil, errors.New("malformed forced-error record")
+ 	}
+-	return out, nil
++	return rec, nil
+ }
+ 
+ // UnitState is a unit that is in flight (Job set) or delivered (Done).
+@@ -402,12 +439,15 @@ func (s *State) feReveal(p Params, o *Op) error {
+ 	if FECommitment(o.Data, o.H1) != fc.Commitment {
+ 		return errors.New("record and salt do not open the commitment")
+ 	}
+-	decoys, err := DecodeFERecord(o.Data)
++	rec, err := DecodeFERecordFull(o.Data)
+ 	if err != nil {
+ 		return err
+ 	}
++	if p.Rules >= 2 && rec.Version < 2 {
++		return errors.New("Rules 2 needs a version-2 forced-error record (with the stage key)")
++	}
+ 	set := map[AccountID]bool{}
+-	for _, a := range decoys {
++	for _, a := range rec.Decoys {
+ 		set[a] = true
+ 	}
+ 	var jobs []*Job
+@@ -424,7 +464,8 @@ func (s *State) feReveal(p Params, o *Op) error {
+ 	for _, j := range jobs {
+ 		j.Decoy = true
+ 		switch {
+-		case j.Status == StatusFailed && len(j.Catchers) > 0:
++		case j.Status == StatusFailed && len(j.Catchers) > 0 &&
++			(rec.Version < 2 || p.Rules < 2 || (j.Caught && j.CaughtStage == FEStage(rec.StageKey, j.ID, j.Stages))):
+ 			s.Stats.DecoysCaught++
+ 			jp := min(p.Jackpot, reserve)
+ 			each := jp / Amount(len(j.Catchers))
+diff --git a/node/jobstate/rules2_test.go b/node/jobstate/rules2_test.go
+new file mode 100644
+index 00000000..1f38284b
+--- /dev/null
++++ b/node/jobstate/rules2_test.go
+@@ -0,0 +1,185 @@
++package jobstate
++
++import (
++	"crypto/sha256"
++	"testing"
++)
++
++// Rules 2 (testnet run 1 findings): directed jobs, challenge bonds that scale with the provider's
++// bond, and forced-error jackpots only for a catch on the decoy's wrong stage.
++
++func TestRules2DirectedJobs(t *testing.T) {
++	w := newPoolWorld(t, 601, 3)
++	cl, named, other := acct(310), acct(311), acct(312)
++	w.block([]Deposit{{cl, 1e9}, {named, 1e9}, {other, 1e9}}, nil, nil)
++	fee := Amount(8_000_000)
++	post := func(prov AccountID) *Op {
++		return &Op{Kind: OpJobPost, Actor: cl, Model: w.model, H1: w.randHash(), U1: 8, Amount: fee, Deadline: w.h + 60,
++			K: 2, N: 2, U2: 4, Provider: prov}
++	}
++	if r := w.block(nil, []*Op{post(named)}, nil); r.OpErrors[0] == nil {
++		t.Fatal("directed job accepted before Rules 2")
++	}
++	w.p.Rules = 2
++	if r := w.block(nil, []*Op{post(cl)}, nil); r.OpErrors[0] == nil {
++		t.Fatal("job directed to its own client accepted")
++	}
++	p := post(named)
++	mustOK(t, w.block(nil, []*Op{p}, nil))
++	id := tagHash("job", p.Ref[:])
++	if w.st.Jobs[id].Directed != named {
++		t.Fatal("directed provider not recorded")
++	}
++	if r := w.block(nil, []*Op{{Kind: OpJobAccept, Actor: other, Job: id, Amount: minBond(w.p, fee)}}, nil); r.OpErrors[0] == nil {
++		t.Fatal("another provider accepted a directed job")
++	}
++	mustOK(t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: named, Job: id, Amount: minBond(w.p, fee)}}, nil))
++	if j := w.st.Jobs[id]; j.Status != StatusAccepted || j.Provider != named {
++		t.Fatalf("directed accept: %v %v", j.Status, j.Provider)
++	}
++	// an open job still takes anyone
++	open := post(AccountID{})
++	mustOK(t, w.block(nil, []*Op{open}, nil))
++	mustOK(t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: other, Job: tagHash("job", open.Ref[:]), Amount: minBond(w.p, fee)}}, nil))
++
++	// wire format: the provider is appended only when set; a zero provider on the wire is rejected
++	for _, o := range []*Op{post(named), post(AccountID{})} {
++		d, err := DecodeOp(o.Encode())
++		if err != nil || d.Provider != o.Provider {
++			t.Fatalf("round trip: %v %x", err, d.Provider[:4])
++		}
++	}
++	z := post(AccountID{}).Encode()
++	if _, err := DecodeOp(append(z, make([]byte, 32)...)); err == nil {
++		t.Fatal("zero directed provider decoded")
++	}
++	if _, err := DecodeOp(append(z, 1)); err == nil {
++		t.Fatal("trailing byte decoded")
++	}
++}
++
++// decoyJob posts and accepts a job, commits tr and lets the committee agree with it; returns
++// the job id with the job in its challenge window.
++func decoyJob(w *poolWorld, client, prov AccountID, fee Amount) (Hash, *trace) {
++	t := w.t
++	post := &Op{Kind: OpJobPost, Actor: client, Model: w.model, H1: w.randHash(), U1: 8, Amount: fee, Deadline: w.h + 60,
++		K: 2, N: 2, U2: 4, Provider: prov}
++	mustOK(t, w.block(nil, []*Op{post}, nil))
++	id := tagHash("job", post.Ref[:])
++	mustOK(t, w.block(nil, []*Op{{Kind: OpJobAccept, Actor: prov, Job: id, Amount: minBond(w.p, fee)}}, nil))
++	tr := w.newTrace(8)
++	w.commitAndVerify(id, prov, tr, tr)
++	return id, tr
++}
++
++func TestRules2ChallengeBondScales(t *testing.T) {
++	w := newPoolWorld(t, 602, 3)
++	w.p.Rules, w.p.ChallengeBondBP = 2, 1000
++	cl, prov, watcher := acct(320), acct(321), acct(322)
++	w.block([]Deposit{{cl, 1e9}, {prov, 1e9}, {watcher, 1e9}}, nil, nil)
++	id, _ := decoyJob(w, cl, prov, 80_000_000)
++	j := w.st.Jobs[id]
++	need := ChallengeBond(w.p, j)
++	if need != j.Bond/10 || need <= w.p.ChallengeBondMin {
++		t.Fatalf("challenge bond %d for provider bond %d", need, j.Bond)
++	}
++	if r := w.block(nil, []*Op{{Kind: OpChallenge, Actor: watcher, Job: id, U1: 3, H1: w.randHash(), Amount: need - 1}}, nil); r.OpErrors[0] == nil {
++		t.Fatal("challenge below the scaled bond accepted")
++	}
++	mustOK(t, w.block(nil, []*Op{{Kind: OpChallenge, Actor: watcher, Job: id, U1: 3, H1: w.randHash(), Amount: need}}, nil))
++	// before Rules 2 the fixed minimum applies
++	w2 := newPoolWorld(t, 603, 3)
++	w2.p.ChallengeBondBP = 1000
++	if ChallengeBond(w2.p, j) != w2.p.ChallengeBondMin {
++		t.Fatal("scaled bond applied before Rules 2")
++	}
++}
++
++func TestRules2JackpotNeedsTheWrongStage(t *testing.T) {
++	w := newPoolWorld(t, 604, 3)
++	w.p.Rules = 2
++	w.block([]Deposit{{TreasuryAccount, 100_000_000}}, nil, nil)
++	decoyClient, decoyA, decoyB, watcher, liar := acct(330), acct(331), acct(332), acct(333), acct(334)
++	w.block([]Deposit{{decoyClient, 1e9}, {decoyA, 1e9}, {decoyB, 1e9}, {watcher, 1e9}, {liar, 1e9}}, nil, nil)
++
++	key := w.randHash()
++	record := EncodeFERecordV2([]AccountID{decoyA, decoyB}, &key)
++	salt := w.randHash()
++	pid, res := w.councilDo(&Op{Kind: OpFECommit, H1: FECommitment(record, salt), Amount: 30_000_000})
++	mustOK(t, res)
++	fe := tagHash("fe", pid[:])
++
++	fee := Amount(8_000_000)
++	idA, trA := decoyJob(w, decoyClient, decoyA, fee)
++	idB, trB := decoyJob(w, decoyClient, decoyB, fee)
++	wrongA, wrongB := FEStage(key, idA, 8), FEStage(key, idB, 8)
++	_ = trA
++	_ = trB
++	// A: the watcher challenges the decoy's wrong stage. B: a liar challenges an honest stage
++	// and the (silent) decoy loses the game anyway.
++	bond := ChallengeBond(w.p, w.st.Jobs[idA])
++	mustOK(t, w.block(nil, []*Op{
++		{Kind: OpChallenge, Actor: watcher, Job: idA, U1: wrongA, H1: w.randHash(), Amount: bond},
++		{Kind: OpChallenge, Actor: liar, Job: idB, U1: (wrongB + 1) % 8, H1: w.randHash(), Amount: bond}}, nil))
++	w.block(nil, nil, []Verdict{{Job: idA, ProviderAtFault: true}, {Job: idB, ProviderAtFault: true}})
++	ja, jb := w.st.Jobs[idA], w.st.Jobs[idB]
++	if ja.Status != StatusFailed || jb.Status != StatusFailed || !ja.Caught || ja.CaughtStage != wrongA || jb.CaughtStage == wrongB {
++		t.Fatalf("A %v caught %v at %d (wrong %d); B %v at %d (wrong %d)", ja.Status, ja.Caught, ja.CaughtStage, wrongA,
++			jb.Status, jb.CaughtStage, wrongB)
++	}
++
++	// a version-1 record (no stage key) is refused under Rules 2
++	v1 := EncodeFERecord([]AccountID{acct(399)})
++	s1 := w.randHash()
++	pid1, res1 := w.councilDo(&Op{Kind: OpFECommit, H1: FECommitment(v1, s1), Amount: 1_000_000})
++	mustOK(t, res1)
++	if r := w.block(nil, []*Op{{Kind: OpFEReveal, Actor: acct(5), Job: tagHash("fe", pid1[:]), H1: s1, Data: v1}}, nil); r.OpErrors[0] == nil {
++		t.Fatal("version-1 record revealed under Rules 2")
++	}
++
++	wb, lb, ab, bb := w.bal(watcher), w.bal(liar), w.bal(decoyA), w.bal(decoyB)
++	mustOK(t, w.block(nil, []*Op{{Kind: OpFEReveal, Actor: acct(5), Job: fe, H1: salt, Data: record}}, nil))
++	if w.bal(watcher)-wb != w.p.Jackpot {
++		t.Fatalf("catch on the wrong stage paid %d, want the jackpot %d", w.bal(watcher)-wb, w.p.Jackpot)
++	}
++	if w.bal(liar) != lb {
++		t.Fatalf("the liar was paid %d at the reveal", w.bal(liar)-lb)
++	}
++	if w.bal(decoyA)-ab != ja.Bond || w.bal(decoyB) != bb {
++		t.Fatal("decoy bonds: only the decoy caught on its wrong stage is reimbursed")
++	}
++	if st := w.st.Stats; st.DecoysCaught != 1 || st.JackpotsPaid != w.p.Jackpot {
++		t.Fatalf("stats %+v", st)
++	}
++}
++
++// TestRules2FieldsLeaveOldRootsUnchanged: a job without the Rules 2 fields encodes exactly as
++// before, so replaying an existing chain gives the same state roots.
++func TestRules2FieldsLeaveOldRootsUnchanged(t *testing.T) {
++	j := &Job{ID: Hash{1}, Stages: 8, Catchers: []AccountID{acct(1)}}
++	base := encodeJob(j)
++	j.Directed = acct(2)
++	if got := encodeJob(j); len(got) != len(base)+1+32+1+4 || string(got[:len(base)]) != string(base) {
++		t.Fatal("Rules 2 fields are not a pure suffix")
++	}
++}
++
++// TestFERecordV2AndStageVector: the version-2 record round-trips, and FEStage matches the
++// keyholders' Python (verifier/forced_errors.py fe_stage) on a fixed vector.
++func TestFERecordV2AndStageVector(t *testing.T) {
++	key := Hash(sha256.Sum256([]byte("fe-key")))
++	b := EncodeFERecordV2([]AccountID{acct(1), acct(2)}, &key)
++	rec, err := DecodeFERecordFull(b)
++	if err != nil || rec.Version != 2 || len(rec.Decoys) != 2 || rec.StageKey != key {
++		t.Fatalf("v2 round trip: %v %+v", err, rec)
++	}
++	if _, err := DecodeFERecordFull(b[:len(b)-1]); err == nil {
++		t.Fatal("truncated v2 record accepted")
++	}
++	job := Hash(sha256.Sum256([]byte("job")))
++	for n, want := range map[uint32]uint32{8: 7, 112: 111, 1000: 831} {
++		if got := FEStage(key, job, n); got != want {
++			t.Fatalf("FEStage(.., %d) = %d, Python gives %d", n, got, want)
++		}
++	}
++}
+diff --git a/node/jobstate/state.go b/node/jobstate/state.go
+index 764e523d..8c040260 100644
+--- a/node/jobstate/state.go
++++ b/node/jobstate/state.go
+@@ -239,6 +239,9 @@ func encodeJob(j *Job) []byte {
+ 	for _, h := range j.Canary {
+ 		e.w(h)
+ 	}
++	if j.Directed != (AccountID{}) || j.Caught { // Rules 2 fields: absent before, so old roots are unchanged
++		e.w(uint8(2), j.Directed, j.Caught, j.CaughtStage)
++	}
+ 	return e.Bytes()
+ }
+ 
+diff --git a/node/jobstate/types.go b/node/jobstate/types.go
+index f41a8823..d5f38218 100644
+--- a/node/jobstate/types.go
++++ b/node/jobstate/types.go
+@@ -87,8 +87,16 @@ type Params struct {
+ 
+ 	// Rules is the version of rule changes that live in code rather than in parameter values:
+ 	//   1: pool claims are bonded against min(last payout, InitPrice) (devnet finding, step 7)
++	//   2: testnet run 1 findings: forced-error jackpots only for a catch on the decoy's wrong
++	//      stage (FE record v2 carries the key that fixes it); directed jobs (JOB_POST names the
++	//      only provider that may accept); challenge bonds scale with the provider's bond
+ 	Rules int
+ 
++	// ChallengeBondBP (Rules >= 2): a CHALLENGE must bond at least this share of the provider's
++	// bond (and at least ChallengeBondMin). An honest challenger gets the bond back (minus
++	// WatchFee when it agrees), so only a liar pays it; half goes to the provider it made play.
++	ChallengeBondBP int64
++
+ 	// Upgrades change the parameters (and Rules) from a block height on, so a node replaying the
+ 	// chain from genesis applies each rule set exactly where the network adopted it. Heights
+ 	// strictly increase; each entry is a complete parameter set (its own Upgrades are ignored).
+@@ -257,6 +265,11 @@ type Job struct {
+ 	CanaryBy     AccountID
+ 	CanaryBond   Amount
+ 	Decoy        bool // revealed as a forced-error decoy
++
++	// Rules >= 2 (encoded only when set, so earlier state roots are unchanged)
++	Directed    AccountID // the only provider that may accept (zero: any)
++	Caught      bool      // failed with a known stage: a game or an unserved stage input
++	CaughtStage uint32    // the stage the provider was caught on (forced-error jackpots need the decoy's wrong stage)
+ }
+ 
+ // IsPool reports whether the job is a public-good pool unit.
+diff --git a/node/rpcjobs.go b/node/rpcjobs.go
+index cbff7f66..bd712069 100644
+--- a/node/rpcjobs.go
++++ b/node/rpcjobs.go
+@@ -5,7 +5,9 @@ import (
+ 	"encoding/hex"
+ 	"sort"
+ 
++	"github.com/pearl-research-labs/pearl/node/blockchain"
+ 	"github.com/pearl-research-labs/pearl/node/btcjson"
++	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+ 	"github.com/pearl-research-labs/pearl/node/jobstate"
+ )
+ 
+@@ -13,11 +15,12 @@ import (
+ 
+ func init() {
+ 	h := map[string]commandHandler{
+-		"getjobstate":   handleGetJobState,
+-		"getjob":        handleGetJob,
+-		"listjobs":      handleListJobs,
+-		"getjobaccount": handleGetJobAccount,
+-		"getcategory":   handleGetCategory,
++		"getjobstate":    handleGetJobState,
++		"getjob":         handleGetJob,
++		"listjobs":       handleListJobs,
++		"getjobaccount":  handleGetJobAccount,
++		"getcategory":    handleGetCategory,
++		"getjobopresult": handleGetJobOpResult,
+ 	}
+ 	for k, v := range h {
+ 		rpcHandlersBeforeInit[k] = v
+@@ -25,20 +28,23 @@ func init() {
+ 		rpcResultTypes[k] = []interface{}{(*map[string]interface{})(nil)}
+ 	}
+ 	for k, v := range map[string]string{
+-		"getjobstate--synopsis":   "Returns a summary of the job module after the best block: state root, statistics, system balances, categories, proposals and forced-error commitments.",
+-		"getjobstate--result0":    "Job-module summary",
+-		"getjob--synopsis":        "Returns one job of the job module.",
+-		"getjob-jobid":            "The hex-encoded job id",
+-		"getjob--result0":         "The job",
+-		"listjobs--synopsis":      "Lists jobs (id, status, provider, fee), optionally only those with one status.",
+-		"listjobs-status":         "Only jobs with this status (posted, accepted, committed, verify-commit, verify-reveal, provider-reveal, challenge, disputed, settled, expired, failed, aborted)",
+-		"listjobs--result0":       "Jobs keyed by id",
+-		"getjobaccount--synopsis": "Returns a job-module account: free balance, verifier stake, unbonding stake and pending withdrawals.",
+-		"getjobaccount-account":   "The hex-encoded account (sha256 of the controlling pkScript)",
+-		"getjobaccount--result0":  "The account",
+-		"getcategory--synopsis":   "Returns a public-good pool category.",
+-		"getcategory-categoryid":  "The hex-encoded category id",
+-		"getcategory--result0":    "The category",
++		"getjobstate--synopsis":    "Returns a summary of the job module after the best block: state root, statistics, system balances, categories, proposals and forced-error commitments.",
++		"getjobstate--result0":     "Job-module summary",
++		"getjob--synopsis":         "Returns one job of the job module.",
++		"getjob-jobid":             "The hex-encoded job id",
++		"getjob--result0":          "The job",
++		"listjobs--synopsis":       "Lists jobs (id, status, provider, fee), optionally only those with one status.",
++		"listjobs-status":          "Only jobs with this status (posted, accepted, committed, verify-commit, verify-reveal, provider-reveal, challenge, disputed, settled, expired, failed, aborted)",
++		"listjobs--result0":        "Jobs keyed by id",
++		"getjobaccount--synopsis":  "Returns a job-module account: free balance, verifier stake, unbonding stake and pending withdrawals.",
++		"getjobaccount-account":    "The hex-encoded account (sha256 of the controlling pkScript)",
++		"getjobaccount--result0":   "The account",
++		"getcategory--synopsis":    "Returns a public-good pool category.",
++		"getcategory-categoryid":   "The hex-encoded category id",
++		"getcategory--result0":     "The category",
++		"getjobopresult--synopsis": "Returns the outcome of each job operation in a transaction, as this node last validated it: kind, error (empty when applied), height and block. Kept in memory for recent blocks since the node started.",
++		"getjobopresult-txid":      "The hex-encoded transaction id",
++		"getjobopresult--result0":  "The outcomes",
+ 	} {
+ 		helpDescsEnUS[k] = v
+ 	}
+@@ -103,7 +109,10 @@ func handleGetJobState(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
+ 	}
+ 	root := st.Root()
+ 	best := s.cfg.Chain.BestSnapshot()
++	np := s.cfg.ChainParams.JobModule.At(best.Height + 1) // rules for the next block
+ 	return map[string]interface{}{
++		"params": map[string]interface{}{"rules": np.Rules, "challengebondmin": np.ChallengeBondMin,
++			"challengebondbp": np.ChallengeBondBP, "watchfee": np.WatchFee, "minbondbp": np.MinBondBP},
+ 		"height":     best.Height,
+ 		"root":       hx(root[:]),
+ 		"stats":      st.Stats,
+@@ -155,6 +164,19 @@ func jobJSON(j *jobstate.Job) map[string]interface{} {
+ 		"challengeend": j.ChallengeEnd, "committee": committee, "revealed": revealed, "disputes": disputes,
+ 		"decoy": j.Decoy,
+ 	}
++	if len(j.Catchers) > 0 {
++		var cs []string
++		for _, c := range j.Catchers {
++			cs = append(cs, hx(c[:]))
++		}
++		out["catchers"] = cs
++	}
++	if j.Directed != (jobstate.AccountID{}) {
++		out["directed"] = hx(j.Directed[:])
++	}
++	if j.Caught {
++		out["caughtstage"] = j.CaughtStage
++	}
+ 	if j.IsPool() {
+ 		out["pool"] = hx(j.Pool[:])
+ 		out["unit"] = j.Unit
+@@ -183,6 +205,20 @@ func jobJSON(j *jobstate.Job) map[string]interface{} {
+ 	return out
+ }
+ 
++func handleGetJobOpResult(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
++	c := cmd.(*btcjson.GetJobOpResultCmd)
++	h, err := chainhash.NewHashFromStr(c.TxID)
++	if err != nil {
++		return nil, &btcjson.RPCError{Code: btcjson.ErrRPCInvalidParameter, Message: "bad txid: " + err.Error()}
++	}
++	var ops []interface{}
++	for _, r := range blockchain.JobOpResults(*h) {
++		ops = append(ops, map[string]interface{}{"output": r.Output, "kind": r.Kind, "ok": r.Error == "",
++			"error": r.Error, "height": r.Height, "block": r.Block.String()})
++	}
++	return map[string]interface{}{"txid": h.String(), "known": ops != nil, "ops": ops}, nil
++}
++
+ func handleGetJob(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
+ 	c := cmd.(*btcjson.GetJobCmd)
+ 	id, err := parseHash(c.JobID)
+-- 
+2.30.2
+

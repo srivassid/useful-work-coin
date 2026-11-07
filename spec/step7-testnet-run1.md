@@ -120,3 +120,31 @@ used was `daac3556`, opened at block 460 and revealed at block 1209.
 4. Cross-GPU checks on the 5090 when that box is back.
 5. Milestone 5 (public testnet) still needs the user's decision on exposure, hosting and outside
    clients.
+
+## Consensus fix: Rules 2 (2026-11-07, patch 0016)
+
+The findings above as one rule set, scheduled on the testnet at height **1400** (the chain stood at
+1329). Earlier blocks replay unchanged: a Rules-2 node synced the testnet's 1,329 blocks from
+scratch and reached the same state root (`f9e0a0bd…`), because the new job fields are encoded only
+when set.
+
+| Finding | Rule |
+|---|---|
+| 1. A liar can win a jackpot from a silent decoy | The forced-error record (v2) carries a stage key; a decoy job's wrong stage is `FEStage(key, job id, stages)`. A failing job records the stage it was caught on (the game's stage, or s-1 for an unserved input of stage s). `FE_REVEAL` pays the jackpot and reimburses the decoy bond only for a catch on the wrong stage; a version-1 record is refused. |
+| 2. Honest providers race decoys | `JOB_POST` may name the only provider allowed to accept (directed job). Decoys post directed jobs, so they cannot be raced and look like any other directed job. |
+| 3. Failed ops leave no trace | The node logs every failed job op and serves recent outcomes by txid (`getjobopresult`). Providers check their free balance before bonding. |
+| 4. The challenge bond is too small | A CHALLENGE must bond at least `ChallengeBondBP` of the provider's bond (testnet 10%; for a 3-coin job, 0.15 coin). Honest challengers get it back; a liar's bond goes half to the provider it made play. |
+| Catchers not visible | `getjob` shows `catchers`, `directed` and `caughtstage`; `getjobstate` shows the next block's rule parameters. |
+
+Tests: `jobstate/rules2_test.go` (directed jobs and their wire format, scaled bond, jackpot only on
+the wrong stage, v1 record refused, old encodings unchanged, FEStage equal to the keyholders'
+Python); full jobstate, chaincfg, btcjson and node suites pass.
+
+The replay also showed what the testnet's failed ops were (146 over 1,329 blocks): 90 pool claims
+and 11 other ops for insufficient balance (bonds still locked; run 1's inference confirmed), 26
+accepts that lost the race, 7 commits or reveals by a provider whose accept had lost (the agent
+bug fixed after run 3), and a few late or duplicate moves.
+
+Agents: watchers bond `challenge_bond(j)`; `agent.fe commit` writes v2 records and the stage key
+(`decoy.json`, keyholders only); decoys post directed jobs and take the wrong stage from the key
+once Rules 2 is active. Not yet exercised live.
