@@ -131,6 +131,24 @@ extern "C" __global__ void sout_leaves(const u32* __restrict__ leaves, int nblk,
   for (int i = 0; i < 8; i++) for (int k = 0; k < 4; k++) msg[8 + 4*i + k] = (u8)(lv[0][i] >> (24 - 8*k));
   sha_prefixed(0, msg, 40, out + r * 8);
 }
+
+// one block per tree of n leaves (words as sout_leaves writes them): the Merkle root, bottom-up
+// pairing neighbours and promoting an odd last node (= merkle_root's split), ping-ponging
+// between the leaf buffer and a scratch buffer of the same size
+extern "C" __global__ void tree_roots(u32* __restrict__ a, u32* __restrict__ b, int n0, u32* __restrict__ roots) {
+  u32* src = a + (long long)blockIdx.x * n0 * 8;
+  u32* dst = b + (long long)blockIdx.x * n0 * 8;
+  int n = n0;
+  while (n > 1) {
+    const int half = n >> 1;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) sha_node(src + 16 * i, src + 16 * i + 8, dst + 8 * i);
+    if ((n & 1) && threadIdx.x == 0) for (int k = 0; k < 8; k++) dst[8 * half + k] = src[8 * (n - 1) + k];
+    __syncthreads();
+    u32* t = src; src = dst; dst = t;
+    n = half + (n & 1);
+  }
+  if (threadIdx.x < 8) roots[blockIdx.x * 8 + threadIdx.x] = src[threadIdx.x];
+}
 """
 
 MAXBLK = 32
@@ -171,6 +189,45 @@ def sout_leaves(out: torch.Tensor) -> np.ndarray:
                                                        np.int32(T), np.uint64(res.data_ptr())), stream=_stream())
     words = res.cpu().numpy().view(np.uint32)
     return words.byteswap().view(np.uint8).reshape(B, T, 32)  # big-endian words -> digest bytes
+
+
+def _leaf_words(out: torch.Tensor) -> torch.Tensor:
+    """(B * T, 8) int32 on the GPU: the stage-output leaves as sha256 state words."""
+    out = out.contiguous()
+    B, T, D = out.shape
+    nrows, row_bytes = B * T, D * 4
+    nblk = max(1, -(-row_bytes // BLOCK))
+    assert nblk <= MAXBLK
+    leaves = torch.empty((nrows * nblk, 8), dtype=torch.int32, device=out.device)
+    res = torch.empty((nrows, 8), dtype=torch.int32, device=out.device)
+    with cp.cuda.Device(out.device.index):
+        n = nrows * nblk
+        _fn("block_leaves")((-(-n // 128),), (128,), (np.uint64(out.data_ptr()), np.int32(row_bytes), np.int32(nblk),
+                                                      np.int64(nrows), np.uint64(leaves.data_ptr())), stream=_stream())
+        _fn("sout_leaves")((-(-nrows // 64),), (64,), (np.uint64(leaves.data_ptr()), np.int32(nblk), np.int64(nrows),
+                                                       np.int32(T), np.uint64(res.data_ptr())), stream=_stream())
+    return res
+
+
+def stage_roots_gpu(out: torch.Tensor) -> torch.Tensor:
+    """stage_output_root of each of the B stages in out (B, T, D), computed entirely on the GPU:
+    (B, 8) int32 state words on the GPU (digest_bytes turns them into bytes)."""
+    B, T, _ = out.shape
+    words = _leaf_words(out)
+    scratch = torch.empty_like(words)
+    roots = torch.empty((B, 8), dtype=torch.int32, device=out.device)
+    with cp.cuda.Device(out.device.index):
+        _fn("tree_roots")((B,), (min(128, max(32, T // 2)),), (np.uint64(words.data_ptr()), np.uint64(scratch.data_ptr()),
+                                                              np.int32(T), np.uint64(roots.data_ptr())), stream=_stream())
+    return roots
+
+
+def digest_bytes(words) -> np.ndarray:
+    """(..., 8) sha256 state words (torch or numpy) -> (..., 32) digest bytes."""
+    if isinstance(words, torch.Tensor):
+        words = words.cpu().numpy()
+    w = np.ascontiguousarray(words).view(np.uint32)
+    return w.byteswap().view(np.uint8).reshape(*w.shape[:-1], 32)
 
 
 def stage_output_roots(out: torch.Tensor) -> list[bytes]:

@@ -15,7 +15,8 @@ from .proto import pooled
 
 
 class Runtime:
-    def __init__(self, model_json: str, device: str, mine_socket: str | None = None, engine: str = "detgpu"):
+    def __init__(self, model_json: str, device: str, mine_socket: str | None = None, engine: str = "detgpu",
+                 mine: bool | None = None):
         info = json.load(open(model_json))
         self.info = info
         self.device = torch.device(device)
@@ -25,7 +26,7 @@ class Runtime:
         self.last_gpu_s = None
         self.G = info["layer_groups"]
         t = time.time()
-        self.m = load(info["model_dir"], device, info["rotation_block"], info["cfg"]["MaxPos"], mine=bool(mine_socket))
+        self.m = load(info["model_dir"], device, info["rotation_block"], info["cfg"]["MaxPos"], mine=bool(mine_socket) if mine is None else mine)
         self.miner = None
         if mine_socket:
             from .mining import JobMiner
@@ -130,6 +131,58 @@ class Runtime:
                     inputs[g] = {"rows": host[g - 1][b], "proofs": [[h.hex() for h in pr[tt]] for tt in range(len(pr))]}
                 res.append((roots, pooled(host[-1][b]), inputs))
         return res
+
+    def jobs_roots(self, jobs: list[list[list[int]]], chunk: int = 32):
+        """Several jobs through the GPU together: per job (stage output roots in stage order,
+        pooled outputs). Sequences of all jobs share forward passes of up to `chunk` sequences
+        (rows are independent, so each job's roots are what it would get alone; one pass per
+        sequence length). Stage roots and pooled outputs are computed on the GPU, so only
+        32 bytes per stage and one row per sequence leave it: a verifier's stage input is recomputed when asked for
+        (stage_input). last_gpu_s is the forward pass + hashing, where the GEMMs mine."""
+        if not self.gpu:
+            res = []
+            for bs in jobs:
+                per = self.job_outputs(bs)
+                res.append(([x for roots, _, _ in per for x in roots], [e for _, e, _ in per]))
+            return res
+        from detgpu.kernels import pooled as pooled_gpu
+        from detgpu.sha import digest_bytes, stage_roots_gpu
+        from detgpu.stages import job_outputs
+        flat = [(i, b, seq) for i, bs in enumerate(jobs) for b, seq in enumerate(bs)]
+        by_len: dict[int, list] = {}
+        for item in flat:
+            by_len.setdefault(len(item[2]), []).append(item)
+        self.bind()
+        if self.miner is not None:
+            self.miner.refresh()
+        torch.cuda.synchronize()
+        t = time.time()
+        done = []  # (items, stage roots (G, B, 8) words, pooled outputs (B, D)), all still on the GPU
+        for items in by_len.values():
+            for c0 in range(0, len(items), chunk):
+                part = items[c0:c0 + chunk]
+                outs = job_outputs(self.m, torch.tensor([x[2] for x in part], dtype=torch.long), self.G)
+                done.append((part, torch.stack([stage_roots_gpu(o) for o in outs]), pooled_gpu(outs[-1])))
+                del outs
+        torch.cuda.synchronize()
+        self.last_gpu_s = time.time() - t
+        res = [[None] * len(bs) for bs in jobs]
+        for part, roots, emb in done:
+            roots, emb = digest_bytes(roots), emb.cpu().numpy()
+            for r, (i, b, _) in enumerate(part):
+                res[i][b] = ([bytes(roots[g, r]) for g in range(self.G)], emb[r])
+        return [([x for roots, _ in per for x in roots], [e for _, e in per]) for per in res]
+
+    def stage_input(self, batches: list[list[int]], stage: int) -> dict:
+        """What a verifier asks a provider for: stage s's input rows (the previous stage's output,
+        recomputed for that one sequence) and each row's Merkle proof in its output tree."""
+        from .proto import multi_proofs, stage_out_leaves
+        b, g = divmod(stage, self.G)
+        assert g >= 1, "a stage of layer group 0 reads tokens"
+        rows = np.ascontiguousarray(self.outputs([batches[b]], g - 1)[0][g - 1])
+        leaves = stage_out_leaves(rows)
+        pr = multi_proofs(leaves, range(len(leaves)))
+        return {"rows": rows, "proofs": [[h.hex() for h in pr[t]] for t in range(len(pr))]}
 
     def stage_output(self, batches: list[list[int]], stage: int) -> np.ndarray:
         b, g = divmod(stage, self.G)

@@ -491,6 +491,18 @@ attention_tile(const signed char* __restrict__ qq, const float* __restrict__ qs,
     out[(long long)(b * T + t0 + r) * (H * HD) + h * HD + d] = __fmul_rn(__ll2float_rn(acc[i]), rsp[r]);
   }
 }
+
+// agent.proto.pooled: per (sequence, column) the mean over tokens, accumulated in float64 in
+// token order (as numpy sums axis 0 of a (T, D) array), divided by T, rounded once to float32
+extern "C" __global__ void pooled_f32(const float* __restrict__ x, int T, int D, long long BD, float* __restrict__ out) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= BD) return;
+  const long long b = i / D; const int d = (int)(i % D);
+  const float* p = x + b * T * D + d;
+  double s = 0.0;
+  for (int t = 0; t < T; t++) s = __dadd_rn(s, (double)p[(long long)t * D]);
+  out[i] = __double2float_rn(__ddiv_rn(s, (double)T));
+}
 """
 
 _MODS: dict = {}
@@ -634,3 +646,14 @@ def swiglu_quant(acc, s3, sw, bs: int):
         _fn("swiglu_quant")((N,), (256,), (_ptr(acc), _ptr(s3.contiguous()), _ptr(sw.contiguous()), np.int32(I), np.int32(bs),
                                            _ptr(q), _ptr(sc)), stream=_stream(), shared_mem=4 * I)
     return q, sc
+
+
+def pooled(x: torch.Tensor) -> torch.Tensor:
+    """agent.proto.pooled for each sequence of x (B, T, D) float32 on the GPU -> (B, D)."""
+    x = x.contiguous()
+    B, T, D = x.shape
+    out = torch.empty((B, D), dtype=torch.float32, device=x.device)
+    with cp.cuda.Device(x.device.index):
+        _fn("pooled_f32")((-(-B * D // 256),), (256,), (_ptr(x), np.int32(T), np.int32(D), np.int64(B * D), _ptr(out)),
+                          stream=_stream())
+    return out

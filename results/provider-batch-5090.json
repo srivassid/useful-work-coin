@@ -1,0 +1,44 @@
+{
+ "gpu": "NVIDIA GeForce RTX 5090",
+ "jobs": 8,
+ "batches": 8,
+ "seq": 128,
+ "noise_tmac_s": 310.0,
+ "modes": {
+  "old: job_outputs, one job per pass": {
+   "wall_s": 0.38010966799993184,
+   "gpu_s": 0.20004510879516602,
+   "hashed_macs": 11544872091648,
+   "lambda_gpu": 0.18616562584600316,
+   "lambda_wall": 0.09797573177299597
+  },
+  "one job per pass": {
+   "wall_s": 0.1993336290033767,
+   "gpu_s": 0.19875574111938477,
+   "hashed_macs": 11544872091648,
+   "lambda_gpu": 0.18737331896196324,
+   "lambda_wall": 0.1868301051984209
+  },
+  "batched, 16 sequences per pass": {
+   "wall_s": 0.1497738809994189,
+   "gpu_s": 0.14944958686828613,
+   "hashed_macs": 11544872091648,
+   "lambda_gpu": 0.2491912065913291,
+   "lambda_wall": 0.24865165159490232
+  },
+  "batched, 32 sequences per pass": {
+   "wall_s": 0.13261179600158357,
+   "gpu_s": 0.13235807418823242,
+   "hashed_macs": 11544872091648,
+   "lambda_gpu": 0.2813694827813905,
+   "lambda_wall": 0.280831147749776
+  },
+  "batched, 64 sequences per pass": {
+   "wall_s": 0.12166674000036437,
+   "gpu_s": 0.121429443359375,
+   "hashed_macs": 11544872091648,
+   "lambda_gpu": 0.30669269203570493,
+   "lambda_wall": 0.3060945240759499
+  }
+ }
+}

@@ -227,8 +227,9 @@ class Provider(Agent):
                         continue  # left the mempool without making the job ours: another provider won it
                 computing.append(jid)
                 active.append(jid)
-        # new work: client jobs first, then a pool unit if nothing else is computing
-        if len(computing) < self.a.max_jobs:
+        # new work: client jobs first, then pool units, up to max_jobs not yet committed (jobs
+        # accepted while the GPU is busy run together in its next pass)
+        if len(computing) < (self.a.max_jobs or 4):
             for jid, e in self.chain.jobs("posted").items():
                 if e["client"] != self.account and jid not in self.st["jobs"]:
                     j = self.chain.job(jid)
@@ -239,11 +240,33 @@ class Provider(Agent):
                             self.st["jobs"][jid] = {"accepted": h, "tx": r["txid"]}
                             self.save()
                             return
-            if not computing and self.units and self.a.pool:
+            if self.units and self.a.pool:
                 self.claim(s)
         urgent = {"disputed": 0, "provider-reveal": 1, "accepted": 3}
+        self.ready = {}
         for jid in sorted(active, key=lambda x: urgent.get(mine.get(x, {}).get("status"), 2)):
             self.advance(jid)
+        self.launch()
+
+    def launch(self):
+        """Start the GPU on every accepted job not yet computed (advance collects them in
+        self.ready), oldest first, up to --batch-seqs sequences in one pass: small jobs alone
+        leave the mined GEMMs short, so a pass of several jobs keeps more of the hash rate."""
+        if not self.ready or (self.busy is not None and not self.busy.done()):
+            return
+        if self.busy is not None:
+            busy, self.busy = self.busy, None
+            busy.result()  # surface an error from the previous pass once; the next step retries
+        order = sorted(self.ready, key=lambda x: self.st["jobs"].get(x, {}).get("accepted",
+                                                                          self.st["jobs"].get(x, {}).get("claimed", 0)))
+        items, n = [], 0
+        for jid in order:
+            b = self.ready[jid]
+            if items and n + len(b) > self.a.batch_seqs:
+                break
+            items.append((jid, b))
+            n += len(b)
+        self.busy = self.worker.submit(self.compute_jobs, items)
 
     def claim(self, s: dict):
         cats = [(cid, c) for cid, c in s["categories"].items() if not c["retired"] and c["workroot"] in self.lists]
@@ -276,15 +299,9 @@ class Provider(Agent):
             return
         js = self.st["jobs"].setdefault(jid, {})
         if j["status"] == "accepted" and "roots" not in js:
-            if self.busy is not None and not self.busy.done():
-                return  # one job at a time on the GPU; the main loop keeps serving other jobs
-            if self.busy is not None:
-                busy, self.busy = self.busy, None
-                busy.result()  # surface an error from the previous job once; the next step retries
-            b = self.batches(j)
-            if b is None:
-                return
-            self.busy = self.worker.submit(self.compute_job, jid, b)
+            b = self.job_batches(j)
+            if b is not None:
+                self.ready[jid] = b  # launch() starts the GPU on it, with any others waiting
             return
         if j["status"] == "accepted" and js.get("committed") and self.chain.height() - js.get("committed_h", 0) >= 3:
             js["committed"] = False  # the commit never reached a block: send it again
@@ -322,70 +339,99 @@ class Provider(Agent):
                 js["last_reveal"], js["last_reveal_h"] = key, h
                 self.save()
 
-    def compute_job(self, jid: str, b: list[list[int]]):
+    def job_batches(self, j: dict) -> list[list[int]] | None:
+        cache = self.__dict__.setdefault("_batches", {})
+        if j["id"] not in cache:
+            b = self.batches(j)
+            if b is None:
+                return None
+            cache[j["id"]] = b
+            while len(cache) > 64:
+                cache.pop(next(iter(cache)))
+        return cache[j["id"]]
+
+    def compute_jobs(self, items: list[tuple[str, list[list[int]]]]):
+        """One GPU pass over several jobs; each job gets its own salts, commitment and outputs.
+        Its GPU time and hashed MACs are the pass's, split by its share of the tokens."""
         t = time.time()
         mined0 = self.rt.miner.hashed if self.rt.miner else 0
         torch_sync()
-        roots, embs, inputs = [], [], []
-        for r, e, ins in self.rt.job_outputs(b):
-            roots += r
-            embs.append(e)
-            inputs.append(ins)
-        salts = [secrets.token_bytes(32) for _ in roots]
-        out_root = output_root(embs).hex()
-        self.save_stage_inputs(jid, StageCommit(roots, salts), inputs)
-        buf = io.BytesIO()
-        np.save(buf, np.stack(embs))
-        self.data.put(f"/outputs/{jid}.npy", buf.getvalue())
-        torch_sync()
+        res = self.rt.jobs_roots([b for _, b in items], chunk=self.a.batch_seqs)
+        gpu_s = self.rt.last_gpu_s
+        hashed = (self.rt.miner.hashed - mined0) if self.rt.miner else 0
+        tokens = [sum(len(x) for x in b) for _, b in items]
         extra = {}
         if self.rt.miner:
             import torch
-            extra = {"hashed_macs": self.rt.miner.hashed - mined0, "device": self.a.device,
-                     "gpu": torch.cuda.get_device_name(torch.device(self.a.device))}
-        total = time.time() - t
-        gpu_s = self.rt.last_gpu_s if self.rt.last_gpu_s is not None else total  # the part where the GEMMs mine
-        with self.lock:
-            self.st["jobs"].setdefault(jid, {}).update(roots=[r.hex() for r in roots], salts=[x.hex() for x in salts],
-                                                       outputroot=out_root, computed=round(gpu_s, 3),
-                                                       total=round(total, 2), **extra)
+            extra = {"device": self.a.device, "gpu": torch.cuda.get_device_name(torch.device(self.a.device))}
+        for (jid, b), (roots, embs), tok in zip(items, res, tokens):
+            share = tok / sum(tokens)
+            salts = [secrets.token_bytes(32) for _ in roots]
+            buf = io.BytesIO()
+            np.save(buf, np.stack(embs))
+            self.data.put(f"/outputs/{jid}.npy", buf.getvalue())
+            if self.rt.miner:
+                extra["hashed_macs"] = round(hashed * share)
+            with self.lock:
+                self.st["jobs"].setdefault(jid, {}).update(
+                    roots=[r.hex() for r in roots], salts=[x.hex() for x in salts], outputroot=output_root(embs).hex(),
+                    computed=round(gpu_s * share, 4), total=round((time.time() - t) * share, 3),
+                    batch={"jobs": len(items), "tokens": sum(tokens), "gpu_s": round(gpu_s, 4)}, **extra)
         self.save()
-        log(f"job {jid[:8]}: {len(roots)} stages in {gpu_s:.2f}s on the GPU, {total:.1f}s with saving inputs")
+        total = time.time() - t
+        log(f"jobs {' '.join(jid[:8] for jid, _ in items)}: {sum(len(r) for r, _ in res)} stages, {sum(tokens)} tokens "
+            f"in {gpu_s:.2f}s on the GPU, {total:.2f}s in all")
 
     def stagein_dir(self, jid: str) -> str:
         return os.path.join(self.a.devnet, "agent", "stagein", jid)
 
-    def save_stage_inputs(self, jid: str, sc: StageCommit, inputs: list[dict]):
-        """Keep each later stage's input (rows, proofs, previous stage opened) until asked for."""
-        import base64
-        d = self.stagein_dir(jid)
-        os.makedirs(d, exist_ok=True)
-        for b, ins in enumerate(inputs):
-            for g, pk in ins.items():
-                stage = b * self.G + g
-                doc = {"stage": stage, "shape": list(pk["rows"].shape), "proofs": pk["proofs"],
-                       "reveal": sc.reveal(stage - 1),
-                       "rows": base64.b64encode(pk["rows"].astype("<f4").tobytes()).decode()}
-                with open(os.path.join(d, f"{stage}.json"), "w") as f:
-                    json.dump(doc, f)
-
     def serve_stage_inputs(self, jid: str):
-        """Answer verifiers' requests for stage inputs (off-chain; DATA_REQUEST stays the fallback)."""
+        """Answer verifiers' requests for stage inputs (off-chain; DATA_REQUEST stays the fallback).
+        The input is recomputed for its one sequence on the GPU worker (queued behind at most one
+        pass), so providers keep no rows; inputs saved by older versions are served as they are."""
         try:
             names = json.loads(self.data.get(f"/req/{jid}/") or b"[]")
         except Exception:
             return
         served = self.st["jobs"].setdefault(jid, {}).setdefault("served", [])
+        queued = self.__dict__.setdefault("_serving", set())
         for name in names:
-            if name in served:
+            if name in served or name in queued:
                 continue
             stage = int(name.split("-")[0])
             path = os.path.join(self.stagein_dir(jid), f"{stage}.json")
             if os.path.exists(path):
                 self.data.put(f"/stagein/{jid}/{name}", open(path, "rb").read())
                 log(f"served stage {stage} input of {jid[:8]}")
-            served.append(name)
+                served.append(name)
+                self.save()
+                continue
+            j = self.chain.job(jid)
+            b = self.job_batches(j) if j else None
+            if b is None or stage % self.G == 0 or stage >= len(b) * self.G:
+                served.append(name)  # nothing to serve: the verifier recomputes the prefix
+                continue
+            queued.add(name)
+            self.worker.submit(self.serve_input, jid, name, stage, b)
+
+    def serve_input(self, jid: str, name: str, stage: int, b: list[list[int]]):
+        import base64
+        try:
+            t = time.time()
+            pk = self.rt.stage_input(b, stage)
+            js = self.st["jobs"][jid]
+            doc = {"stage": stage, "shape": list(pk["rows"].shape), "proofs": pk["proofs"],
+                   "reveal": self.commit_of(js).reveal(stage - 1),
+                   "rows": base64.b64encode(pk["rows"].astype("<f4").tobytes()).decode()}
+            self.data.put(f"/stagein/{jid}/{name}", json.dumps(doc).encode())
+            with self.lock:
+                js.setdefault("served", []).append(name)
             self.save()
+            log(f"served stage {stage} input of {jid[:8]} (recomputed in {time.time() - t:.2f}s)")
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self._serving.discard(name)
 
     @staticmethod
     def commit_of(js: dict) -> StageCommit:
@@ -687,7 +733,7 @@ class Decoy(Provider):
                 self.st["revealed"] = h
                 self.save()
             return
-        if len(active) < self.a.max_jobs and h - self.st.get("last_post", -10**9) >= self.a.every and \
+        if len(active) < (self.a.max_jobs or 1) and h - self.st.get("last_post", -10**9) >= self.a.every and \
                 self.a.post > len(self.st["jobs"]):
             self.post_decoy(h)
 
@@ -761,7 +807,9 @@ def main() -> None:
                     help="detgpu: fast engine, bit-identical to the registered runtime detrt")
     ap.add_argument("--weights", default=os.path.join(DEVNET, "weights", "qwen3-1.7b"))
     # provider
-    ap.add_argument("--max-jobs", type=int, default=1)
+    ap.add_argument("--max-jobs", type=int, default=None,
+                    help="provider: jobs accepted or claimed but not yet committed (default 4); decoy: active decoys (default 1)")
+    ap.add_argument("--batch-seqs", type=int, default=64, help="provider: sequences per GPU pass (jobs share passes)")
     ap.add_argument("--pool", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--prefer", default="", help="provider: claim from categories with this id prefix first")
     ap.add_argument("--mine", action="store_true", help="provider: mine on every job GEMM (needs this box's gateway)")
