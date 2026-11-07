@@ -211,6 +211,9 @@ class Provider(Agent):
     def step(self):
         s = self.chain.state()
         h = s["height"]
+        # read the mempool before the jobs: a claim that leaves it in between is then already ours
+        pending = self.chain.mempool() if any(js.get("tx") and 0 < h - js.get("claimed", js.get("accepted", h)) < 20
+                                              for js in self.st["jobs"].values()) else set()
         mine = {jid: e for jid, e in self.chain.jobs().items() if e["provider"] == self.account}
         active = [jid for jid, e in mine.items() if e["status"] not in ("settled", "expired", "failed", "aborted")]
         # the GPU is busy only until a job is committed: limit jobs not yet committed, counting
@@ -219,6 +222,9 @@ class Provider(Agent):
         for jid, js in self.st["jobs"].items():
             sent = js.get("claimed", js.get("accepted"))
             if jid not in mine and sent is not None and h - sent < 20:
+                if js.get("tx") and h > sent:
+                    if js["tx"] not in pending:
+                        continue  # left the mempool without making the job ours: another provider won it
                 computing.append(jid)
                 active.append(jid)
         # new work: client jobs first, then a pool unit if nothing else is computing
@@ -228,8 +234,9 @@ class Provider(Agent):
                     j = self.chain.job(jid)
                     if j and j["model"] == self.model_id and j["deadline"] > h + 5 and self.batches(j) is not None:
                         bond = (j["fee"] * 5000 + 9999) // 10000
-                        if self.send([{"kind": "JOB_ACCEPT", "job": jid, "amount": bond}], f"accept {jid[:8]}"):
-                            self.st["jobs"][jid] = {"accepted": h}
+                        r = self.send([{"kind": "JOB_ACCEPT", "job": jid, "amount": bond}], f"accept {jid[:8]}")
+                        if r:
+                            self.st["jobs"][jid] = {"accepted": h, "tx": r["txid"]}
                             self.save()
                             return
             if not computing and self.units and self.a.pool:
@@ -259,7 +266,7 @@ class Provider(Agent):
             r = self.send([op], f"claim unit {i} of {cid[:8]}")
             tried[str(i)] = s["height"]
             if r:
-                self.st["jobs"][r["job"]] = {"claimed": s["height"]}
+                self.st["jobs"][r["job"]] = {"claimed": s["height"], "tx": r["txid"]}
             self.save()
             return
 
@@ -272,8 +279,8 @@ class Provider(Agent):
             if self.busy is not None and not self.busy.done():
                 return  # one job at a time on the GPU; the main loop keeps serving other jobs
             if self.busy is not None:
-                self.busy.result()  # surface errors from the previous job
-                self.busy = None
+                busy, self.busy = self.busy, None
+                busy.result()  # surface an error from the previous job once; the next step retries
             b = self.batches(j)
             if b is None:
                 return
@@ -620,8 +627,8 @@ class Curator(Agent):
 class Decoy(Provider):
     """The keyholders' decoy runner: posts a job from a fresh client account, accepts it at once
     with a decoy provider account listed in the council's forced-error record, commits honest
-    roots except one deliberately wrong stage, reveals whatever is asked, and never defends
-    itself in a game. Whoever catches it wins a jackpot once the record is revealed."""
+    roots except one deliberately wrong stage, reveals whatever is asked, and defends
+    games over its honest stages but never the wrong one. Whoever catches it wins a jackpot once the record is revealed."""
     role = "decoy"
 
     def step(self):
@@ -634,6 +641,12 @@ class Decoy(Provider):
             if j is None:
                 if h - js["posted"] > 20:
                     js["final"] = "lost"
+                continue
+            if j["provider"] not in ("0" * 64, self.account):
+                # another provider's accept was mined first: an ordinary job now, not a decoy sample
+                js["final"] = "lost"
+                log(f"decoy {jid[:8]} (wrong stage {js['wrong']}): lost, accepted by {j['provider'][:12]}")
+                self.save()
                 continue
             if j["status"] in ("settled", "expired", "failed", "aborted"):
                 js["final"] = j["status"]
@@ -655,6 +668,11 @@ class Decoy(Provider):
                     self.save()
             elif j["status"] in ("provider-reveal", "disputed"):
                 self.reveals_only(j, js)
+                g = j.get("game")
+                # Defend every honest stage: a silent provider loses any game, so a decoy that never
+                # defends would make any challenger, even one lying about a correct stage, a catcher.
+                if j["status"] == "disputed" and g and g["stage"] != js["wrong"]:
+                    self.play(j, as_provider=True)
         active = [js for js in self.st["jobs"].values() if not js.get("final")]
         # every decoy has ended: the keyholders reveal the record so catchers get their jackpots
         if not active and len(self.st["jobs"]) >= self.a.post and not self.st.get("revealed"):
@@ -763,6 +781,9 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=2)
     ap.add_argument("--dataset", default=os.path.expanduser("~/Documents/useful-work-coin/models/wikitext2"))
     a = ap.parse_args()
+    # Resolve transformers' lazy attributes before the worker thread loads the model: a first
+    # `from transformers import AutoTokenizer` racing that load fails with ImportError.
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: F401
     {"provider": Provider, "verifier": Verifier, "watcher": Watcher, "client": Client, "decoy": Decoy,
      "curator": Curator}[a.role](a).run()
 

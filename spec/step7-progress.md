@@ -318,3 +318,8 @@ Not done yet:
    with `--lie`), client (`--batches 16`), curator, decoy.
 6. Check live: mempool persistence (restart a node with pending moves), served inputs, the new
    game rounds, and the forced-error reveal.
+
+## Testnet run 1 (2026-11-06 16:20 to 2026-11-07 13:30), done
+
+Setup steps 1–6 above are done. Results, findings and the agent fixes made during the run:
+`spec/step7-testnet-run1.md`. Metrics: `results/testnet-run1-metrics.json`.

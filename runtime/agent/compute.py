@@ -18,6 +18,7 @@ class Runtime:
     def __init__(self, model_json: str, device: str, mine_socket: str | None = None):
         info = json.load(open(model_json))
         self.info = info
+        self.device = torch.device(device)
         self.G = info["layer_groups"]
         t = time.time()
         self.m = load(info["model_dir"], device, info["rotation_block"], info["cfg"]["MaxPos"], mine=bool(mine_socket))
@@ -29,11 +30,25 @@ class Runtime:
         self.cache: dict[tuple, tuple[list[bytes], np.ndarray]] = {}
         print(f"runtime: {info['model_dir']} on {device} in {time.time() - t:.0f}s", flush=True)
 
+    def bind(self):
+        """Make this runtime's GPU current in the calling thread. Both torch and CuPy (the mining
+        kernels) keep the current device per thread, and a new thread starts on GPU 0, so jobs
+        run on the agent's worker thread must bind before touching a GPU other than 0."""
+        if self.device.type != "cuda":
+            return
+        torch.cuda.set_device(self.device)
+        try:
+            import cupy
+            cupy.cuda.Device(self.device.index or 0).use()
+        except ImportError:
+            pass
+
     def outputs(self, seqs: list[list[int]], upto: int | None = None, chunk: int = 8):
         """Stage outputs (the rows each stage is committed by) for groups 0..upto of each
         sequence: forward pass only, batched over sequences. Returns per sequence a list of
         (T, D) float32 arrays, one per group."""
         from detrt.fast import run_stages
+        self.bind()
         upto = self.G - 1 if upto is None else upto
         if self.miner is not None:
             self.miner.refresh()
@@ -80,6 +95,7 @@ class Runtime:
         """One stage (layer group g >= 1) from its served input rows: its output root."""
         from detrt.fast import run_stages
         from .proto import stage_output_root
+        self.bind()
         y = run_stages(self.m, None, [torch.from_numpy(rows)], g * self.lpg, (g + 1) * self.lpg, keep_rows=False)[0]
         return stage_output_root(y)
 
@@ -89,6 +105,7 @@ class Runtime:
         key = ("trace", tuple(batches[b]), g)
         if key in getattr(self, "traces", {}):
             return self.traces[key]
+        self.bind()
         toks = torch.tensor(batches[b], dtype=torch.long)
         x = torch.from_numpy(self.outputs([batches[b]], g - 1)[0][g - 1]) if g > 0 else None
         st = run_stage(self.m, toks if g == 0 else None, x, g * self.lpg, (g + 1) * self.lpg)

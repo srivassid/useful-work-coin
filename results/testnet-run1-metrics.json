@@ -1,0 +1,2025 @@
+{
+ "height": 1224,
+ "seconds_per_block": 57.6,
+ "network_TMACs": 315.9,
+ "stats": {
+  "Checks": 91,
+  "DecoysCaught": 2,
+  "DecoysMissed": 2,
+  "JackpotsPaid": 10000000,
+  "PoolPaid": 8463908700542,
+  "PoolUnits": 197,
+  "SettledJobs": 209,
+  "SettledStages": 11746
+ },
+ "jobs": {
+  "challenge": 1,
+  "expired": 4,
+  "failed": 2,
+  "settled": 209
+ },
+ "useful_share": 1.3671877726021635e-05,
+ "useful_share_note": "11746 settled stages x 26 GMAC vs 22.3 EMAC hashed",
+ "noise_TMACs_by_gpu": {
+  "testnet:noise-gpu0.jsonl": [
+   "NVIDIA GeForce RTX 3080",
+   65.2
+  ],
+  "testnet:noise-gpu2.jsonl": [
+   "NVIDIA GeForce RTX 3080",
+   66.1
+  ],
+  "extra245:noise-gpu4.jsonl": [
+   "NVIDIA GeForce RTX 3080",
+   56.8
+  ],
+  "extra245:noise-gpu1.jsonl": [
+   "NVIDIA GeForce RTX 3080 Ti",
+   47.7
+  ],
+  "extra245:noise-gpu2.jsonl": [
+   "NVIDIA GeForce RTX 3080",
+   67.3
+  ],
+  "extra245:noise-gpu3.jsonl": [
+   "NVIDIA GeForce RTX 3080",
+   63.1
+  ]
+ },
+ "lambda_live_median": 0.011656211721281869,
+ "lambda_live_jobs": 206,
+ "verification_overhead_median": 6.133333333333333,
+ "verification_overhead_jobs": 207,
+ "false_slashes": 0,
+ "failed_jobs": 2,
+ "client_price_vs_rent_median": 23.041420108936187,
+ "client_jobs_priced": 10,
+ "pool_reserve": 3141361066131,
+ "treasury": 84805636897,
+ "categories": {
+  "4c32e1fb": {
+   "budget": 0,
+   "price": 119750322574,
+   "done": 100,
+   "inflight": 0,
+   "units": 100
+  },
+  "a8884d32": {
+   "budget": 613643090873,
+   "price": 22453185481,
+   "done": 97,
+   "inflight": 0,
+   "units": 100
+  }
+ },
+ "job_table": [
+  {
+   "job": "eaf83ba6",
+   "kind": "client",
+   "status": "settled",
+   "stages": 112,
+   "posted": 78,
+   "fee": 3000000000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "48c91583",
+   "kind": "client",
+   "status": "settled",
+   "stages": 112,
+   "posted": 108,
+   "fee": 3000000000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "38437000",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 117,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "a07286aa",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 121,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "0258b6e8",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 125,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "fdc97ae2",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 129,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "ff37db07",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 133,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "88251437",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 137,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "f4dc47ac",
+   "kind": "client",
+   "status": "settled",
+   "stages": 112,
+   "posted": 138,
+   "fee": 3000000000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "8e73781d",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 139,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "61c4fe1e",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 143,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "c811822a",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 145,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "34292a42",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 147,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "6c300ea4",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 149,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "8526c48f",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 151,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "f06c4ec3",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 153,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "886b21b1",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 155,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "6cc5ce66",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 157,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "9a9d80a0",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 159,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "f58a0543",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 161,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "5d47dd22",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 163,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "6b85c971",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 165,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "61f136fc",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 166,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "6ea50347",
+   "kind": "client",
+   "status": "settled",
+   "stages": 112,
+   "posted": 168,
+   "fee": 3000000000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "6b2c8dbe",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 169,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "2ef8f70e",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 173,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "692133f7",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 174,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "265cd922",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 177,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "a4ebeddc",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 180,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "d6824057",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 184,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "f9943622",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 187,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "22f2c8c1",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 191,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "d6ddf9bd",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 195,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "204195e1",
+   "kind": "client",
+   "status": "settled",
+   "stages": 112,
+   "posted": 198,
+   "fee": 3000000000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "217311dc",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 199,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "00f8073c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 207,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "5c30c0be",
+   "kind": "client",
+   "status": "expired",
+   "stages": 112,
+   "posted": 228,
+   "fee": 3000000000,
+   "provider": "00000000"
+  },
+  {
+   "job": "a5d5ec26",
+   "kind": "client",
+   "status": "expired",
+   "stages": 112,
+   "posted": 258,
+   "fee": 3000000000,
+   "provider": "00000000"
+  },
+  {
+   "job": "623cfa44",
+   "kind": "client",
+   "status": "expired",
+   "stages": 112,
+   "posted": 288,
+   "fee": 3000000000,
+   "provider": "00000000"
+  },
+  {
+   "job": "c4cc9eec",
+   "kind": "client",
+   "status": "expired",
+   "stages": 112,
+   "posted": 318,
+   "fee": 3000000000,
+   "provider": "00000000"
+  },
+  {
+   "job": "96f5920a",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 341,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "a6ac5fa8",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 345,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "489b5250",
+   "kind": "client",
+   "status": "settled",
+   "stages": 112,
+   "posted": 348,
+   "fee": 3000000000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "8702e5d3",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 349,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "e0c13a62",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 377,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "96bb398e",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 381,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "45f60b2c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 385,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "11cc8de1",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 389,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "0c16ede7",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 390,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "27d46280",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 392,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "9980e2b4",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 394,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "de46de7b",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 395,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "3af617d0",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 398,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "66d356b2",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 398,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "81e346dc",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 402,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "e2a4d782",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 402,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "91a5ee0b",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 406,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "a3d16648",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 406,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "26106811",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 410,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "83c81172",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 410,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "943222c2",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 413,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "d32d41c2",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 414,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "eb7e8070",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 417,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "4e624478",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 418,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "8601d241",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 421,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "77f2ce65",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 422,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "b5e1fa64",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 425,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "2793843a",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 426,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "695fce50",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 429,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "e5f8cfda",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 430,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "7cf9e9a3",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 433,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "11810788",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 435,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "128655ae",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 437,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "1185ef9c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 439,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "e92a2bab",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 441,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "aea411f9",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 443,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "d22fb78c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 445,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "5ecbb081",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 447,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "e1de14df",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 449,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "51335b32",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 452,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "94722d5e",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 453,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "95f23468",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 456,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "e57c5cdf",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 457,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "22512e31",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 460,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "7462fced",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 462,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "32edc5ae",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 464,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "67fcd79a",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 466,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "3980b8df",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 468,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "13f72937",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 470,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "8815528c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 472,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "4120f267",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 474,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "29ab4483",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 476,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "1a35b848",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 478,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "112141cd",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 482,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "42020a19",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 483,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "3fef7b8f",
+   "kind": "decoy",
+   "status": "failed",
+   "stages": 7,
+   "posted": 486,
+   "fee": 20000000,
+   "provider": "1a79d5ad"
+  },
+  {
+   "job": "b9b69927",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 487,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "fa04eab6",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 487,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "22071ab2",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 492,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "f09c54df",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 492,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "3f9e6f96",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 496,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "e1ba01a0",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 496,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "1d075c26",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 500,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "b9858a6f",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 500,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "1003d405",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 504,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "278f1f66",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 504,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "61f78073",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 508,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "96fd94a0",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 508,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "6d18ef2d",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 512,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "6e43ede1",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 512,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "d1f9088f",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 516,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "e6c923a9",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 516,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "5befffd6",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 520,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "a735fa05",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 520,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "146012e6",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 524,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "1879d864",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 524,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "4f8c1951",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 528,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "ddee1d00",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 528,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "0801aad3",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 532,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "527cccf7",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 533,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "d4931777",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 536,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "2b02aa19",
+   "kind": "decoy",
+   "status": "failed",
+   "stages": 7,
+   "posted": 537,
+   "fee": 20000000,
+   "provider": "1a79d5ad"
+  },
+  {
+   "job": "7955062c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 538,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "f519a181",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 541,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "058a8c8e",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 543,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "0a13c2af",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 545,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "fbb0f7e5",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 547,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "10a16a5d",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 549,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "1cb9247a",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 552,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "99d39671",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 553,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "77fcb228",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 557,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "e689e3bf",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 557,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "964daef5",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 561,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "b72b9af0",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 561,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "b32f82bc",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 565,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "26a2b76f",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 566,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "c1977d08",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 569,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "0acf4c8c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 570,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "c21e2076",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 572,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "ca7d29d0",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 575,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "2857b290",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 576,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "65662f59",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 580,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "98ba647f",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 582,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "96408e96",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 583,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "60f21890",
+   "kind": "decoy",
+   "status": "settled",
+   "stages": 7,
+   "posted": 585,
+   "fee": 20000000,
+   "provider": "1a79d5ad"
+  },
+  {
+   "job": "ed209fa4",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 589,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "f5f6d310",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 594,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "94b4b4d1",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 598,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "2c040bf1",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 602,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "28ce4c84",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 606,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "1cdc7f72",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 607,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "4c2a22f9",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 610,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "adb9f5cf",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 611,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "6e631bf1",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 614,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "b7e753db",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 614,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "afe48c2d",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 618,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "8fbf0666",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 619,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "bfa00e9c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 622,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "714be25b",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 624,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "dda008db",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 626,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "beb89551",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 629,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "1ea0434e",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 630,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "d7db5f0e",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 634,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "5f4af681",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 635,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "30770d26",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 638,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "bc6d6281",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 638,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "770e3d0b",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 643,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "f721c2e5",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 644,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "01ffa3e3",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 647,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "99784162",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 648,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "d3a7b111",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 651,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "71d02d1e",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 652,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "a7a098c5",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 655,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "1524b944",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 656,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "72c0712d",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 659,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "1ba7a51c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 662,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "7a108a54",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 663,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "9d74d9cf",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 666,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "bfbf4c5a",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 667,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "837aceab",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 670,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "7336e460",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 671,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "90b18516",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 674,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "6cd8e1ce",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 675,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "4709bcf5",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 679,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "4d63328b",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 679,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "3aa59431",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 683,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "ed62d9da",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 683,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "289804ed",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 687,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "67bd5c7b",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 687,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "127ee6ea",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 691,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "37b3b0a2",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 691,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "540e73b3",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 695,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "c012da4c",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 695,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "12ee19b8",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 699,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "5fae9e97",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 699,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "5b2ad2a1",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 703,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "a5b466c0",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 703,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "51afd4af",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 707,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "b87d6355",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 707,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "2d3fb1c5",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 711,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "fd45aaaf",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 711,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "6a75aac9",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 715,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "8af1e311",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 716,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "7bead4c9",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 719,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "9eca8595",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 722,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "816307b2",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 723,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "3b91fdd6",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 728,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "cefb9ed4",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 730,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "e55ec080",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 732,
+   "fee": 4000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "1cda8578",
+   "kind": "pool",
+   "status": "settled",
+   "stages": 56,
+   "posted": 734,
+   "fee": 4000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "1c31184d",
+   "kind": "decoy",
+   "status": "settled",
+   "stages": 7,
+   "posted": 839,
+   "fee": 20000000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "cec55784",
+   "kind": "decoy",
+   "status": "settled",
+   "stages": 7,
+   "posted": 854,
+   "fee": 20000000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "c65c3039",
+   "kind": "decoy",
+   "status": "settled",
+   "stages": 7,
+   "posted": 954,
+   "fee": 20000000,
+   "provider": "f0aef8ba"
+  },
+  {
+   "job": "1ab9d01e",
+   "kind": "decoy",
+   "status": "settled",
+   "stages": 7,
+   "posted": 955,
+   "fee": 20000000,
+   "provider": "1a79d5ad"
+  },
+  {
+   "job": "97c944ca",
+   "kind": "decoy",
+   "status": "settled",
+   "stages": 7,
+   "posted": 960,
+   "fee": 20000000,
+   "provider": "19845da4"
+  },
+  {
+   "job": "1598bd62",
+   "kind": "decoy",
+   "status": "challenge",
+   "stages": 7,
+   "posted": 1208,
+   "fee": 20000000,
+   "provider": "f0aef8ba"
+  }
+ ],
+ "blocks_window": [
+  1104,
+  1224
+ ]
+}

@@ -56,6 +56,16 @@ class Chain:
     def category(self, cid: str) -> dict:
         return self.run("category", cid)
 
+    def mempool(self) -> set[str]:
+        """Txids in the local node's mempool."""
+        p = subprocess.run([os.path.join(self.dir, "bin", "prlctl"), "--configfile=/dev/null",
+                            f"--rpcserver=127.0.0.1:{self.env.get('RPC_PORT', '18671')}", f"--rpcuser={self.env['RPC_USER']}",
+                            f"--rpcpass={self.env['RPC_PASS']}", "--notls", "getrawmempool"],
+                           capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            raise ChainError(p.stderr.strip() or p.stdout.strip())
+        return set(json.loads(p.stdout or "[]"))
+
     def ops(self, key: str, ops: list[dict]) -> dict:
         return self.run("ops", key, "-", stdin=json.dumps(ops))
 

@@ -1,0 +1,665 @@
+From b8b35fa6a85e7909e709cd3e90abc9e4ef7ddc06 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Fri, 6 Nov 2026 15:22:16 +0530
+Subject: [PATCH] Testnet fixes: scheduled job-module upgrades, uwc-testnet,
+ mempool persistence (build step 7)
+
+- jobstate.Params.Upgrades and Params.At(height): rule changes take effect from an activation
+  height, so a node replaying from genesis applies each one where the network adopted it (the
+  devnet could not be synced after unscheduled changes). Params.Rules versions rule changes that
+  live in code; the pool bond basis is Rules >= 1.
+- chaincfg.UWCTestNetParams (--uwctestnet): fresh genesis and magic, 30-block reply windows,
+  240-block challenge window, Rules 1, a new 2-of-3 council; uwcctl selects it with UWC_NET=testnet.
+- pearld saves its mempool to mempool.dat on shutdown and re-admits it on startup (the devnet
+  lost pending dispute moves in a restart).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuWZZGrbS2dbWLqQUj
+---
+ node/blockchain/jobs.go          |   4 +-
+ node/chaincfg/uwc_params_test.go |  26 ++++++
+ node/chaincfg/uwc_testnet.go     |  78 +++++++++++++++++
+ node/cmd/uwcctl/main.go          |   8 +-
+ node/config.go                   |   8 +-
+ node/jobstate/apply.go           |   4 +-
+ node/jobstate/pool.go            |   6 +-
+ node/jobstate/pool_test.go       |  60 +++++++++++++
+ node/jobstate/types.go           |  40 +++++++++
+ node/mempool_persist.go          | 139 +++++++++++++++++++++++++++++++
+ node/mempool_persist_test.go     |  45 ++++++++++
+ node/params.go                   |   6 ++
+ node/server.go                   |   6 ++
+ node/wire/protocol.go            |  18 ++--
+ 14 files changed, 435 insertions(+), 13 deletions(-)
+ create mode 100644 node/chaincfg/uwc_params_test.go
+ create mode 100644 node/chaincfg/uwc_testnet.go
+ create mode 100644 node/mempool_persist.go
+ create mode 100644 node/mempool_persist_test.go
+
+diff --git a/node/blockchain/jobs.go b/node/blockchain/jobs.go
+index 1f0e716d..fe296d47 100644
+--- a/node/blockchain/jobs.go
++++ b/node/blockchain/jobs.go
+@@ -262,7 +262,7 @@ func (b *BlockChain) checkJobRules(node *blockNode, block *btcutil.Block, deps [
+ 			commits = append(commits, data)
+ 		}
+ 	}
+-	if need := jobstate.PoolIssuance(*jp, subsidy); pool < need {
++	if need := jobstate.PoolIssuance(jp.At(node.height), subsidy); pool < need {
+ 		return 0, ruleError(ErrBadCoinbaseValue, fmt.Sprintf("coinbase deposits %d to the pool, needs %d", pool, need))
+ 	}
+ 	if len(commits) != 1 || !bytes.Equal(commits[0], res.Root[:]) {
+@@ -343,7 +343,7 @@ func (b *BlockChain) JobTemplateFor(txs []*btcutil.Tx, extraDeposits []jobstate.
+ 	}
+ 	deps, ops := jobOpsFromBlock(blk, view)
+ 	subsidy := CalcBlockSubsidy(height, b.chainParams)
+-	pool := jobstate.PoolIssuance(*jp, subsidy)
++	pool := jobstate.PoolIssuance(jp.At(height), subsidy)
+ 	deps = append(append([]jobstate.Deposit{{Account: jobstate.PoolAccount, Amount: pool}}, extraDeposits...), deps...)
+ 	st := parentState.Clone()
+ 	res := jobstate.ApplyBlock(st, *jp, jobstate.BlockInput{Height: height, PrevHash: jobstate.Hash(tip.hash),
+diff --git a/node/chaincfg/uwc_params_test.go b/node/chaincfg/uwc_params_test.go
+new file mode 100644
+index 00000000..4a351e14
+--- /dev/null
++++ b/node/chaincfg/uwc_params_test.go
+@@ -0,0 +1,26 @@
++package chaincfg
++
++import "testing"
++
++func TestUWCNetworks(t *testing.T) {
++	for _, p := range []*Params{&UWCDevNetParams, &UWCTestNetParams} {
++		if p.JobModule == nil || !p.JobModule.ValidUpgrades() {
++			t.Fatalf("%s: job module missing or upgrades out of order", p.Name)
++		}
++		if *p.GenesisHash != p.GenesisBlock.BlockHash() {
++			t.Fatalf("%s: genesis hash", p.Name)
++		}
++		if p.JobModule.CouncilThreshold < 1 || p.JobModule.CouncilThreshold > len(p.JobModule.Council) {
++			t.Fatalf("%s: council threshold", p.Name)
++		}
++	}
++	if *UWCTestNetParams.GenesisHash == *UWCDevNetParams.GenesisHash || UWCTestNetParams.Net == UWCDevNetParams.Net {
++		t.Fatal("testnet must not share the devnet's genesis or magic")
++	}
++	tp := UWCTestNetParams.JobModule
++	for _, w := range []int32{tp.VerifyCommitWindow, tp.VerifyRevealWindow, tp.ProviderRevealWindow, tp.GameWindow, tp.ServeWindow} {
++		if w < 30 {
++			t.Fatal("testnet reply windows must be at least 30 blocks")
++		}
++	}
++}
+diff --git a/node/chaincfg/uwc_testnet.go b/node/chaincfg/uwc_testnet.go
+new file mode 100644
+index 00000000..d121bc00
+--- /dev/null
++++ b/node/chaincfg/uwc_testnet.go
+@@ -0,0 +1,78 @@
++package chaincfg
++
++import (
++	"encoding/hex"
++	"time"
++
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++// Useful-Work Coin test network (build step 7, after the devnet). A fresh genesis with the
++// rules the devnet ended with, and reply windows sized from the devnet's lessons:
++//   - every window a party must answer in is 30 blocks (the devnet lost honest providers with
++//     10-block windows when blocks came fast or a node restarted);
++//   - job-module rule changes after launch go in JobModule.Upgrades with an activation height
++//     (the devnet could not be synced from genesis after unscheduled changes).
++
++var uwcTestNetCouncil = []string{
++	"e76e2e5010ac5053eb244c3fcbdb1e05dfa6718a9b9ebdd5209ade4bee133a3b",
++	"09184ca4effd1eb33612b59c72b5d43681b8c34fc1000f316ec0b88bc7176cc4",
++	"37f0708628c5322786f58d239ddd80679faf65ad41d8109f7e9be277b52e9adf",
++}
++
++func uwcTestNetJobParams() *jobstate.Params {
++	p := jobstate.DefaultParams()
++	for _, h := range uwcTestNetCouncil {
++		b, err := hex.DecodeString(h)
++		if err != nil || len(b) != 32 {
++			panic("chaincfg: bad UWC testnet council account " + h)
++		}
++		var a jobstate.AccountID
++		copy(a[:], b)
++		p.Council = append(p.Council, a)
++	}
++	p.CouncilThreshold = 2
++	p.CommitteeDelay = 2
++	p.VerifyCommitWindow, p.VerifyRevealWindow, p.ProviderRevealWindow = 30, 30, 30
++	p.GameWindow, p.ServeWindow = 30, 30
++	p.ChallengeWindow = 240 // about 4 hours: time for watchers to check
++	p.UnbondDelay = 1440
++	p.Rules = 1
++	return &p
++}
++
++var uwcTestNetGenesisBlock = func() wire.MsgBlock {
++	b := wire.MsgBlock{
++		MsgHeader: wire.MsgHeader{
++			BlockHeader: wire.BlockHeader{
++				Version:    1,
++				MerkleRoot: genesisMerkleRoot,
++				Timestamp:  time.Unix(1793966400, 0), // 2026-11-06 12:00:00 UTC
++				Bits:       0x1a020000,               // 2^201: about one block a minute at 550 TMAC/s
++			},
++		},
++		Transactions: []*wire.MsgTx{&genesisCoinbaseTx},
++	}
++	h := b.BlockHash()
++	b.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: &wire.CertificateV1{
++		Hash: h, ProofData: []byte{0x75, 0x77, 0x63, 0x74}, // genesis is not verified
++	}}
++	return b
++}()
++
++var uwcTestNetGenesisHash = uwcTestNetGenesisBlock.BlockHash()
++
++// UWCTestNetParams are the parameters of the Useful-Work Coin test network.
++var UWCTestNetParams = func() Params {
++	p := UWCDevNetParams
++	p.Name = "uwc-testnet"
++	p.Net = wire.UWCTestNet
++	p.DefaultPort = "18690"
++	p.GenesisBlock = &uwcTestNetGenesisBlock
++	p.GenesisHash = &uwcTestNetGenesisHash
++	p.WTEMAHalfLife = 2 * time.Hour
++	p.CoinbaseMaturity = 20
++	p.JobModule = uwcTestNetJobParams()
++	return p
++}()
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index 5f5075ba..2f69caf3 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -51,7 +51,13 @@ council (actions are proposed by one member and approved by others)
+ queries
+   state | jobs [status] | job <id> | account <account|key> | category <id>`
+ 
+-var netParams = &chaincfg.UWCDevNetParams
++// netParams is the devnet's unless UWC_NET=testnet (addresses and coinbase maturity differ).
++var netParams = func() *chaincfg.Params {
++	if os.Getenv("UWC_NET") == "testnet" {
++		return &chaincfg.UWCTestNetParams
++	}
++	return &chaincfg.UWCDevNetParams
++}()
+ 
+ func die(err error) {
+ 	fmt.Fprintln(os.Stderr, "uwcctl:", err)
+diff --git a/node/config.go b/node/config.go
+index b792b394..b253d0ff 100644
+--- a/node/config.go
++++ b/node/config.go
+@@ -176,6 +176,7 @@ type config struct {
+ 	SigCacheMaxSize          uint          `long:"sigcachemaxsize" description:"The maximum number of entries in the signature verification cache"`
+ 	SimNet                   bool          `long:"simnet" description:"Use the simulation test network"`
+ 	UWCDevNet                bool          `long:"uwcdevnet" description:"Use the Useful-Work Coin development network"`
++	UWCTestNet               bool          `long:"uwctestnet" description:"Use the Useful-Work Coin test network"`
+ 	SigNet                   bool          `long:"signet" description:"Use the signet test network"`
+ 	SigNetChallenge          string        `long:"signetchallenge" description:"Connect to a custom signet network defined by this challenge instead of using the global default signet test network -- Can be specified multiple times"`
+ 	SigNetSeedNode           []string      `long:"signetseednode" description:"Specify a seed node for the signet network instead of using the global default signet network seed nodes"`
+@@ -505,7 +506,7 @@ func loadConfig() (*config, []string, error) {
+ 	// Load additional config from file.
+ 	var configFileError error
+ 	parser := newConfigParser(&cfg, &serviceOpts, flags.Default)
+-	if !(preCfg.RegressionTest || preCfg.SimNet || preCfg.SigNet || preCfg.UWCDevNet) ||
++	if !(preCfg.RegressionTest || preCfg.SimNet || preCfg.SigNet || preCfg.UWCDevNet || preCfg.UWCTestNet) ||
+ 		preCfg.ConfigFile != defaultConfigFile {
+ 
+ 		if _, err := os.Stat(preCfg.ConfigFile); os.IsNotExist(err) {
+@@ -589,6 +590,11 @@ func loadConfig() (*config, []string, error) {
+ 		activeNetParams = &uwcDevNetParams
+ 		cfg.DisableDNSSeed = true
+ 	}
++	if cfg.UWCTestNet {
++		numNets++
++		activeNetParams = &uwcTestNetParams
++		cfg.DisableDNSSeed = true
++	}
+ 	if cfg.SigNet {
+ 		numNets++
+ 		activeNetParams = &sigNetParams
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+index 7129b41d..09b7f195 100644
+--- a/node/jobstate/apply.go
++++ b/node/jobstate/apply.go
+@@ -40,12 +40,14 @@ type BlockResult struct {
+ 	OpErrors    []error      // nil for applied ops; failed ops change nothing
+ }
+ 
+-// PoolIssuance is the minimum the coinbase must deposit to PoolAccount.
++// PoolIssuance is the minimum the coinbase must deposit to PoolAccount (p as in force at that
++// height: callers pass p.At(height)).
+ func PoolIssuance(p Params, subsidy Amount) Amount { return subsidy * p.PoolShareBP / 10_000 }
+ 
+ // ApplyBlock applies one block to st in place. It never fails because of an operation: a
+ // failed op is reported in OpErrors and has no effect.
+ func ApplyBlock(st *State, p Params, b BlockInput) *BlockResult {
++	p = p.At(b.Height)
+ 	res := &BlockResult{}
+ 	st.reward = b.Subsidy - PoolIssuance(p, b.Subsidy)
+ 	defer func() { st.reward = 0 }()
+diff --git a/node/jobstate/pool.go b/node/jobstate/pool.go
+index af4c68cd..cc0f7c35 100644
+--- a/node/jobstate/pool.go
++++ b/node/jobstate/pool.go
+@@ -285,7 +285,11 @@ func (s *State) poolClaim(p Params, h int32, o *Op) error {
+ 	if !VerifyMerkleProof(c.Spec.WorkRoot, UnitLeaf(o.U1, o.H1), int(o.U1), int(c.Spec.Units), o.Proof) {
+ 		return errors.New("input root is not this unit of the work list")
+ 	}
+-	if o.Amount < minBond(p, c.BondBasis()) {
++	basis := c.Price
++	if p.Rules >= 1 {
++		basis = c.BondBasis()
++	}
++	if o.Amount < minBond(p, basis) {
+ 		return errors.New("bond below minimum")
+ 	}
+ 	vp := poolVerifierPay(p, &c.Spec)
+diff --git a/node/jobstate/pool_test.go b/node/jobstate/pool_test.go
+index ca24b0d5..4ee69927 100644
+--- a/node/jobstate/pool_test.go
++++ b/node/jobstate/pool_test.go
+@@ -1302,3 +1302,63 @@ func TestPoolBondAfterABigPayout(t *testing.T) {
+ 		t.Fatalf("claim bonded against the reference cost rejected: %v", r.OpErrors[0])
+ 	}
+ }
++
++// TestUpgradesActivateAtHeight: scheduled parameter sets apply exactly from their height, so a
++// node replaying from genesis applies each rule change where the network adopted it.
++func TestUpgradesActivateAtHeight(t *testing.T) {
++	w := newWorld(t, 830, 4)
++	w.subsidy = 10_000_000
++	base := w.p
++	base.LargeJobRewards = 0 // no large-job rule at first
++	up := base
++	up.LargeJobRewards = 5
++	base.Upgrades = []Upgrade{{Height: w.h + 3, Params: up}}
++	if !base.ValidUpgrades() || base.At(w.h+2).LargeJobRewards != 0 || base.At(w.h+3).LargeJobRewards != 5 {
++		t.Fatal("At does not follow the schedule")
++	}
++	w.p = base
++	big := (w.subsidy - PoolIssuance(w.p, w.subsidy)) * 5
++	post := func() *Op {
++		return &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, H1: w.randHash(), U1: 8, Amount: big,
++			Deadline: w.h + 20, K: 2, N: 2, U2: 4}
++	}
++	w.block([]Deposit{{w.client, 10 * big}}, nil, nil) // height start+1
++	if r := w.block(nil, []*Op{post()}, nil); r.OpErrors[0] != nil {
++		t.Fatalf("before the upgrade k = 2 is allowed: %v", r.OpErrors[0])
++	}
++	if r := w.block(nil, []*Op{post()}, nil); r.OpErrors[0] == nil {
++		t.Fatal("from the upgrade height k = 2 must be refused for a large job")
++	}
++	bad := base
++	bad.Upgrades = []Upgrade{{Height: 5, Params: up}, {Height: 5, Params: up}}
++	if bad.ValidUpgrades() {
++		t.Fatal("non-increasing heights accepted")
++	}
++}
++
++// TestRulesVersionGatesBondBasis: the bond-basis fix applies only from Rules 1, so chains
++// that predate it replay as they were validated.
++func TestRulesVersionGatesBondBasis(t *testing.T) {
++	for _, rules := range []int{0, 1} {
++		w := newPoolWorld(t, 831, 3)
++		w.p.Rules = rules
++		w.p.PoolEpoch = 200
++		w.income = 50_000_000_000
++		cat := w.openCategory(w.spec(4))
++		prov := acct(76)
++		w.block([]Deposit{{prov, 1e9}}, nil, nil)
++		tr := w.newTrace(8)
++		id := w.runUnit(cat, prov, 0, tr, tr)
++		for w.st.Jobs[id].Status != StatusSettled {
++			w.block(nil, nil, nil)
++		}
++		w.runTo(w.nextEpochEnd())
++		w.block(nil, nil, nil)
++		o := w.claimOp(cat, prov, 1)
++		o.Amount = minBond(w.p, w.st.Categories[cat].Spec.InitPrice)
++		r := w.block(nil, []*Op{o}, nil)
++		if (r.OpErrors[0] == nil) != (rules >= 1) {
++			t.Fatalf("rules %d: claim bonded against the reference cost: %v", rules, r.OpErrors[0])
++		}
++	}
++}
+diff --git a/node/jobstate/types.go b/node/jobstate/types.go
+index 06cacc9e..f41a8823 100644
+--- a/node/jobstate/types.go
++++ b/node/jobstate/types.go
+@@ -84,6 +84,45 @@ type Params struct {
+ 	// re-roll the committee by discarding seed blocks (spec/step6-results.md, sim.py part H).
+ 	LargeJobRewards int64
+ 	MinKLarge       int
++
++	// Rules is the version of rule changes that live in code rather than in parameter values:
++	//   1: pool claims are bonded against min(last payout, InitPrice) (devnet finding, step 7)
++	Rules int
++
++	// Upgrades change the parameters (and Rules) from a block height on, so a node replaying the
++	// chain from genesis applies each rule set exactly where the network adopted it. Heights
++	// strictly increase; each entry is a complete parameter set (its own Upgrades are ignored).
++	Upgrades []Upgrade
++}
++
++// Upgrade is a scheduled rule change: Params apply from Height on.
++type Upgrade struct {
++	Height int32
++	Params Params
++}
++
++// At returns the parameters in force for the block at height h.
++func (p Params) At(h int32) Params {
++	cur := p
++	for _, u := range p.Upgrades {
++		if h >= u.Height {
++			cur = u.Params
++		}
++	}
++	cur.Upgrades = nil
++	return cur
++}
++
++// ValidUpgrades reports whether the schedule's heights strictly increase and are positive.
++func (p Params) ValidUpgrades() bool {
++	last := int32(0)
++	for _, u := range p.Upgrades {
++		if u.Height <= last {
++			return false
++		}
++		last = u.Height
++	}
++	return true
+ }
+ 
+ // DefaultParams follow the starting values of Design v3 (fee split 98/1/1, bond >= 50% of fee,
+@@ -100,6 +139,7 @@ func DefaultParams() Params {
+ 		PoolEpoch: 60, PoolSpendBP: 10_000,
+ 		WatchFee: 10_000, Jackpot: 5_000_000, FERevealWindow: 20_160, ProposalWindow: 1440,
+ 		LargeJobRewards: 5, MinKLarge: 3,
++		Rules: 1,
+ 	}
+ }
+ 
+diff --git a/node/mempool_persist.go b/node/mempool_persist.go
+new file mode 100644
+index 00000000..41539807
+--- /dev/null
++++ b/node/mempool_persist.go
+@@ -0,0 +1,139 @@
++package main
++
++import (
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"sort"
++
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/mempool"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++// Mempool persistence (Useful-Work Coin, build step 7). Job-module protocols have reply windows:
++// a provider that misses one loses its bond. On the devnet, restarting nodes dropped pending
++// moves from the mempool and three honest providers were slashed. The mempool is now written to
++// mempool.dat on shutdown and re-admitted (validated as new) on startup.
++
++var mempoolFileMagic = [4]byte{'U', 'W', 'C', 'M'}
++
++const mempoolFileName = "mempool.dat"
++
++func mempoolPath() string { return filepath.Join(cfg.DataDir, mempoolFileName) }
++
++// writeMempool serializes txs (parents before children: oldest first).
++func writeMempool(w io.Writer, descs []*mempool.TxDesc) error {
++	sort.Slice(descs, func(i, j int) bool { return descs[i].Added.Before(descs[j].Added) })
++	var b bytes.Buffer
++	b.Write(mempoolFileMagic[:])
++	b.WriteByte(1)
++	_ = binary.Write(&b, binary.LittleEndian, uint32(len(descs)))
++	for _, d := range descs {
++		var tx bytes.Buffer
++		if err := d.Tx.MsgTx().Serialize(&tx); err != nil {
++			return err
++		}
++		_ = binary.Write(&b, binary.LittleEndian, uint32(tx.Len()))
++		b.Write(tx.Bytes())
++	}
++	_, err := w.Write(b.Bytes())
++	return err
++}
++
++// readMempool parses a mempool file.
++func readMempool(r io.Reader) ([]*btcutil.Tx, error) {
++	var magic [4]byte
++	if _, err := io.ReadFull(r, magic[:]); err != nil || magic != mempoolFileMagic {
++		return nil, fmt.Errorf("not a mempool file")
++	}
++	var ver [1]byte
++	if _, err := io.ReadFull(r, ver[:]); err != nil || ver[0] != 1 {
++		return nil, fmt.Errorf("unknown mempool file version")
++	}
++	var n uint32
++	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
++		return nil, err
++	}
++	if n > 1_000_000 {
++		return nil, fmt.Errorf("mempool file claims %d transactions", n)
++	}
++	txs := make([]*btcutil.Tx, 0, n)
++	for i := uint32(0); i < n; i++ {
++		var l uint32
++		if err := binary.Read(r, binary.LittleEndian, &l); err != nil {
++			return nil, err
++		}
++		if l > wire.MaxBlockPayload {
++			return nil, fmt.Errorf("transaction %d too large", i)
++		}
++		raw := make([]byte, l)
++		if _, err := io.ReadFull(r, raw); err != nil {
++			return nil, err
++		}
++		var msg wire.MsgTx
++		if err := msg.Deserialize(bytes.NewReader(raw)); err != nil {
++			return nil, err
++		}
++		txs = append(txs, btcutil.NewTx(&msg))
++	}
++	return txs, nil
++}
++
++// saveMempool writes the mempool to disk (called on shutdown).
++func (s *server) saveMempool() {
++	descs := s.txMemPool.TxDescs()
++	if len(descs) == 0 {
++		_ = os.Remove(mempoolPath())
++		return
++	}
++	tmp := mempoolPath() + ".tmp"
++	f, err := os.Create(tmp)
++	if err != nil {
++		srvrLog.Warnf("Unable to save the mempool: %v", err)
++		return
++	}
++	err = writeMempool(f, descs)
++	if cerr := f.Close(); err == nil {
++		err = cerr
++	}
++	if err == nil {
++		err = os.Rename(tmp, mempoolPath())
++	}
++	if err != nil {
++		srvrLog.Warnf("Unable to save the mempool: %v", err)
++		return
++	}
++	srvrLog.Infof("Saved %d mempool transactions", len(descs))
++}
++
++// loadMempool re-admits the saved transactions (each validated as if just received) and
++// announces the accepted ones to peers.
++func (s *server) loadMempool() {
++	f, err := os.Open(mempoolPath())
++	if err != nil {
++		return
++	}
++	txs, err := readMempool(f)
++	f.Close()
++	_ = os.Remove(mempoolPath())
++	if err != nil {
++		srvrLog.Warnf("Ignoring saved mempool: %v", err)
++		return
++	}
++	var accepted []*mempool.TxDesc
++	for _, tx := range txs {
++		descs, err := s.txMemPool.ProcessTransaction(tx, true, false, 0)
++		if err != nil {
++			continue // mined meanwhile, or no longer valid
++		}
++		accepted = append(accepted, descs...)
++	}
++	if len(accepted) > 0 {
++		s.AnnounceNewTransactions(accepted)
++	}
++	srvrLog.Infof("Restored %d of %d saved mempool transactions", len(accepted), len(txs))
++}
+diff --git a/node/mempool_persist_test.go b/node/mempool_persist_test.go
+new file mode 100644
+index 00000000..b90b461d
+--- /dev/null
++++ b/node/mempool_persist_test.go
+@@ -0,0 +1,45 @@
++package main
++
++import (
++	"bytes"
++	"testing"
++	"time"
++
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
++	"github.com/pearl-research-labs/pearl/node/mempool"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++func TestMempoolFileRoundTrip(t *testing.T) {
++	var descs []*mempool.TxDesc
++	now := time.Now()
++	for i := 0; i < 5; i++ {
++		tx := wire.NewMsgTx(2)
++		tx.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{byte(i)}, Index: uint32(i)}})
++		tx.TxIn[0].SetWitness(wire.TxWitness{bytes.Repeat([]byte{byte(i)}, 64)})
++		tx.AddTxOut(wire.NewTxOut(int64(1000*i), []byte{0x51, 0x20}))
++		// added in reverse order: the file must list the oldest first
++		descs = append(descs, &mempool.TxDesc{Tx: btcutil.NewTx(tx), Added: now.Add(-time.Duration(i) * time.Minute)})
++	}
++	var b bytes.Buffer
++	if err := writeMempool(&b, descs); err != nil {
++		t.Fatal(err)
++	}
++	txs, err := readMempool(bytes.NewReader(b.Bytes()))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(txs) != 5 {
++		t.Fatalf("%d transactions", len(txs))
++	}
++	for i, tx := range txs {
++		want := descs[i].Tx // descs was sorted oldest first by writeMempool
++		if *tx.Hash() != *want.Hash() || *tx.WitnessHash() != *want.WitnessHash() {
++			t.Fatalf("transaction %d differs", i)
++		}
++	}
++	if _, err := readMempool(bytes.NewReader(b.Bytes()[:b.Len()-3])); err == nil {
++		t.Fatal("truncated file accepted")
++	}
++}
+diff --git a/node/params.go b/node/params.go
+index d12506fd..290a5753 100644
+--- a/node/params.go
++++ b/node/params.go
+@@ -65,6 +65,12 @@ var uwcDevNetParams = params{
+ 	rpcPort: "18671",
+ }
+ 
++// uwcTestNetParams contains parameters specific to the Useful-Work Coin test network.
++var uwcTestNetParams = params{
++	Params:  &chaincfg.UWCTestNetParams,
++	rpcPort: "18691",
++}
++
+ // sigNetParams contains parameters specific to the Signet network
+ // (wire.SigNet).
+ var sigNetParams = params{
+diff --git a/node/server.go b/node/server.go
+index 58704d6d..fe61b45b 100644
+--- a/node/server.go
++++ b/node/server.go
+@@ -2721,6 +2721,9 @@ func (s *server) Start() {
+ 	if cfg.Generate {
+ 		s.cpuMiner.Start()
+ 	}
++
++	// Re-admit the transactions saved at the last shutdown.
++	s.loadMempool()
+ }
+ 
+ // Stop gracefully shuts down the server by stopping and disconnecting all
+@@ -2742,6 +2745,9 @@ func (s *server) Stop() error {
+ 		s.rpcServer.Stop()
+ 	}
+ 
++	// Keep pending transactions across the restart.
++	s.saveMempool()
++
+ 	// Save fee estimator state in the database.
+ 	s.db.Update(func(tx database.Tx) error {
+ 		metadata := tx.Metadata()
+diff --git a/node/wire/protocol.go b/node/wire/protocol.go
+index 1b820158..f0b4badb 100644
+--- a/node/wire/protocol.go
++++ b/node/wire/protocol.go
+@@ -152,18 +152,22 @@ const (
+ 
+ 	// UWCDevNet is the Useful-Work Coin development network: real proof of work, job module on.
+ 	UWCDevNet PearlNet = 0x55574344 // "UWCD" in ASCII
++
++	// UWCTestNet is the Useful-Work Coin test network.
++	UWCTestNet PearlNet = 0x55574354 // "UWCT" in ASCII
+ )
+ 
+ // netStrings is a map of networks back to their constant names for
+ // pretty printing.
+ var netStrings = map[PearlNet]string{
+-	MainNet:   "MainNet",
+-	RegTest:   "RegTest",
+-	TestNet:   "TestNet",
+-	TestNet2:  "TestNet2",
+-	SigNet:    "SigNet",
+-	SimNet:    "SimNet",
+-	UWCDevNet: "UWCDevNet",
++	MainNet:    "MainNet",
++	RegTest:    "RegTest",
++	TestNet:    "TestNet",
++	TestNet2:   "TestNet2",
++	SigNet:     "SigNet",
++	SimNet:     "SimNet",
++	UWCDevNet:  "UWCDevNet",
++	UWCTestNet: "UWCTestNet",
+ }
+ 
+ // String returns the PearlNet in human-readable form.
+-- 
+2.30.2
+
