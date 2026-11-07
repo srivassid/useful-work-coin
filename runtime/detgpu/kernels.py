@@ -389,9 +389,112 @@ swiglu_quant(const int* __restrict__ acc, const float* __restrict__ s3, const fl
   for (int i = tid; i < I; i += 256) qr[i] = (signed char)(int)fminf(fmaxf(rintf(__fdiv_rn(rowf[i], sc)), -64.f), 64.f);
   if (tid == 0) scale[r] = bs > 1 ? __fmul_rn(sc, __fdiv_rn(1.0f, __fsqrt_rn((float)bs))) : sc;
 }
+// Tiled version of attention_row: one block = QT query rows of one (b, h); K and V are staged in
+// shared memory 64 keys at a time. Same per-element ops as attention_row; all sums are exact.
+// smem: scores QT*T floats (reused for the 14-bit levels), q tile QT*128 B, K/V chunk 64*128 B.
+extern "C" __global__ void __launch_bounds__(256)
+attention_tile(const signed char* __restrict__ qq, const float* __restrict__ qs, const signed char* __restrict__ kq,
+               const float* __restrict__ ks, const signed char* __restrict__ vq, const float* __restrict__ vs,
+               int B, int T, int H, int Hkv, float INV_SQRT_HD, int QT, float* __restrict__ out) {
+  constexpr int HD = 128, KC = 64;
+  extern __shared__ float smem[];
+  float* sc = smem;                                              // QT x T
+  signed char* qt = (signed char*)(smem + QT * T);               // QT x 128
+  signed char* kv = qt + QT * HD;                                // KC x 128
+  __shared__ float rmx[32], rsp[32];
+  const int bh = blockIdx.x, b = bh / H, h = bh % H, hk = h / (H / Hkv);
+  const int t0 = blockIdx.y * QT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int nrows = min(QT, T - t0), kmax = t0 + nrows - 1;     // keys 0..kmax are needed
+  for (int i = tid; i < nrows * HD; i += 256) {
+    int r = i / HD, d = i % HD;
+    qt[i] = qq[((long long)(b * T + t0 + r) * H + h) * HD + d];
+  }
+  // phase 1: scores
+  for (int kc = 0; kc <= kmax; kc += KC) {
+    __syncthreads();
+    const int nk = min(KC, kmax + 1 - kc);
+    for (int i = tid; i < nk * HD; i += 256) {
+      int jj = i / HD, d = i % HD;
+      kv[i] = kq[((long long)(b * T + kc + jj) * Hkv + hk) * HD + d];
+    }
+    __syncthreads();
+    for (int p = tid; p < nrows * KC; p += 256) {
+      const int r = p / KC, jj = p % KC, j = kc + jj, t = t0 + r;
+      if (jj >= nk) continue;
+      float v = NEG_INF;
+      if (j <= t) {
+        const int* qa = (const int*)(qt + r * HD); const int* kb = (const int*)(kv + jj * HD);
+        int acc = 0;
+        for (int d = 0; d < HD / 4; d++) acc = __dp4a(qa[d], kb[d], acc);   // exact int8 dot, 4 at a time
+        v = __fmul_rn(__fmul_rn(__fmul_rn((float)acc, qs[(long long)(b * T + t) * H + h]),
+                                ks[(long long)(b * T + j) * Hkv + hk]), INV_SQRT_HD);
+      }
+      sc[r * T + j] = v;
+    }
+  }
+  __syncthreads();
+  // phase 2: one warp per row; keys j > t are masked (their e and Pv are 0)
+  for (int r = warp; r < nrows; r += 8) {
+    const int t = t0 + r;
+    float* row = sc + r * T;
+    float mx = NEG_INF;
+    for (int j = lane; j <= t; j += 32) mx = fmaxf(mx, row[j]);
+    mx = warp_max(mx);
+    float emx = 0.f;
+    for (int j = lane; j <= t; j += 32) { float e = det_exp_f(__fsub_rn(row[j], mx)); row[j] = e; emx = fmaxf(emx, fabsf(e)); }
+    emx = warp_max(emx);
+    int e2; frexpf(emx, &e2);
+    int sh = (62 - 20) - e2;
+    sh = sh < -1000 ? -1000 : (sh > 1000 ? 1000 : sh);
+    const double p2 = __longlong_as_double((long long)(sh + 1023) << 52);
+    long long acc = 0;
+    for (int j = lane; j <= t; j += 32) acc += __double2ll_rn((double)row[j] * p2);
+    acc = warp_sum_ll(acc);
+    const float den = __double2float_rn(__ll2double_rn(acc) * __longlong_as_double((long long)(-sh + 1023) << 52));
+    float pm = t < T - 1 ? 0.0f : NEG_INF;   // masked keys contribute Pv = 0 to the row max
+    for (int j = lane; j <= t; j += 32) {
+      float pv = __fmul_rn(__fdiv_rn(row[j], den), vs[(long long)(b * T + j) * Hkv + hk]);
+      row[j] = pv;
+      pm = fmaxf(pm, pv);
+    }
+    pm = warp_max(pm);
+    const float sp = __fdiv_rn(fmaxf(pm, TINY), PLEVELS);
+    int* pi = (int*)row;
+    for (int j = lane; j <= kmax; j += 32)
+      pi[j] = j <= t ? (int)fminf(fmaxf(rintf(__fdiv_rn(row[j], sp)), 0.0f), PLEVELS) : 0;
+    if (lane == 0) rsp[r] = sp;
+  }
+  // phase 3: o[r][d] = (sum_j pi[r][j] * v[j][d]) * sp[r], exact in int64
+  const int d = tid % HD, r0 = tid / HD;        // rows r0, r0 + 2, ...
+  long long acc[16];
+  for (int i = 0; i < 16; i++) acc[i] = 0;
+  for (int kc = 0; kc <= kmax; kc += KC) {
+    __syncthreads();
+    const int nk = min(KC, kmax + 1 - kc);
+    for (int i = tid; i < nk * HD; i += 256) {
+      int jj = i / HD, dd = i % HD;
+      kv[i] = vq[((long long)(b * T + kc + jj) * Hkv + hk) * HD + dd];
+    }
+    __syncthreads();
+    for (int i = 0; i < 16; i++) {
+      const int r = r0 + 2 * i;
+      if (r >= nrows) break;
+      const int* pi = (const int*)(sc + r * T) + kc;
+      int a = 0;   // 64 keys x (14-bit level x int8) < 2^27: exact in int32, then added to int64
+      for (int jj = 0; jj < nk; jj++) a += pi[jj] * (int)kv[jj * HD + d];
+      acc[i] += a;
+    }
+  }
+  for (int i = 0; i < 16; i++) {
+    const int r = r0 + 2 * i;
+    if (r >= nrows) break;
+    out[(long long)(b * T + t0 + r) * (H * HD) + h * HD + d] = __fmul_rn(__ll2float_rn(acc[i]), rsp[r]);
+  }
+}
 """
 
 _MODS: dict = {}
+TILED = True
 
 
 def _constants() -> str:
@@ -470,11 +573,22 @@ def attention(qq, qs, kq, ks, vq, vs, B: int, T: int, H: int, Hkv: int, inv_sqrt
     f = lambda z: z.contiguous().to(torch.float32)
     out = torch.empty((N, H * 128), dtype=torch.float32, device=qq.device)
     args = [i8(qq), f(qs), i8(kq), f(ks), i8(vq), f(vs)]
+    QT = 32
+    while QT > 1 and QT * T * 4 > 32 * 1024:
+        QT //= 2
+    smem = QT * T * 4 + QT * 128 + 64 * 128
     with cp.cuda.Device(qq.device.index):
-        _fn("attention_row")((B * H * T,), (128,), tuple(np.uint64(a.data_ptr()) for a in args) +
-                             (np.int32(B), np.int32(T), np.int32(H), np.int32(Hkv), np.float32(inv_sqrt_hd_f32),
-                              np.uint64(out.data_ptr())),
-                             stream=_stream(), shared_mem=8 * T)
+        if TILED:
+            f = _fn("attention_tile")
+            f.max_dynamic_shared_size_bytes = max(smem, 48 * 1024)
+            f((B * H, -(-T // QT)), (256,), tuple(np.uint64(a.data_ptr()) for a in args) +
+              (np.int32(B), np.int32(T), np.int32(H), np.int32(Hkv), np.float32(inv_sqrt_hd_f32), np.int32(QT),
+               np.uint64(out.data_ptr())), stream=_stream(), shared_mem=smem)
+        else:
+            _fn("attention_row")((B * H * T,), (128,), tuple(np.uint64(a.data_ptr()) for a in args) +
+                                 (np.int32(B), np.int32(T), np.int32(H), np.int32(Hkv), np.float32(inv_sqrt_hd_f32),
+                                  np.uint64(out.data_ptr())),
+                                 stream=_stream(), shared_mem=8 * T)
     return out
 
 
