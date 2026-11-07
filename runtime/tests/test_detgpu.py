@@ -46,5 +46,7 @@ if __name__ == "__main__":
             assert a.shape == b.shape, (name, g, a.shape, b.shape)
             nd = int((a.view(np.uint32) != b.view(np.uint32)).sum())
             assert nd == 0, f"{name}: group {g}: {nd} of {a.size} values differ"
-        print(f"{name}: all {G} groups bit-identical ({dt:.2f}s)")
+        import hashlib
+        dig = hashlib.sha256(b"".join(np.ascontiguousarray(g.cpu().numpy()).tobytes() for g in got)).hexdigest()[:16]
+        print(f"{name}: all {G} groups bit-identical ({dt:.2f}s), outputs sha256 {dig}")
     print("DETGPU MATCHES DETRT")

@@ -77,7 +77,7 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--profile", action="store_true", help="CUPTI kernel breakdown (one extra run)")
     ap.add_argument("--noise-rate", type=float, default=0.0, help="TMAC/s; measured on this GPU if 0")
-    ap.add_argument("--engine", default="detrt", choices=["detrt", "detgpu"])
+    ap.add_argument("--engine", default="detrt", choices=["detrt", "detgpu", "detgpu-roots"])
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
@@ -97,6 +97,13 @@ def main():
 
         def run_job(m, seqs, G):
             return job_outputs(m, toks, G)[-1].cpu()
+    elif a.engine == "detgpu-roots":  # what a provider needs: every stage's output root, hashed on the GPU
+        from detgpu.sha import sout_leaves
+        from detgpu.stages import job_outputs
+        toks = torch.stack(seqs)
+
+        def run_job(m, seqs, G):
+            return [sout_leaves(o) for o in job_outputs(m, toks, G)]
 
     run_job(m, seqs, G)  # warm-up
     torch.cuda.synchronize()
