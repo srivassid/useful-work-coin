@@ -96,14 +96,26 @@ Single jobs (`bench/lambda_det.py --engine detgpu-roots`):
 | 3080 | 0.312 → **0.357** | 0.346 → **0.398** | 0.203 → **0.299** |
 | 5090 | 0.249 → **0.293** | 0.305 → **0.351** | 0.187 → **0.265** |
 
-Not yet confirmed on the live testnet (run 2 measured 0.254 and 0.227 before these changes).
+**Live, testnet run 3** (2026-11-07 21:41-22:03, blocks 1304-1329, nodes on box 71 and the 5090
+box; client posting 16 × 128-token jobs in bursts of 4; `results/testnet-run3-lambda.txt`):
+
+| Provider | Jobs | GPU passes (jobs per pass) | Live λ per pass | Run 2 |
+|---|---|---|---|---|
+| RTX 3080 | 11 | 7 (4, 1, 1, 2, 1, 1, 1) | batched **0.365-0.372**; single 0.21-0.31 | 0.254 |
+| RTX 5090 | 21 | 12 (1, 3, 1, 3, …) | 3 jobs **0.337-0.340**, 2 jobs 0.31, single 0.26 | 0.227 |
+
+Verifiers' stage inputs were recomputed on demand in 0.07-0.21 s and accepted; 22 of 24 client
+outputs were delivered and matched when the run was stopped (the last burst was still in flight).
+The 5090 wins most accept races, so the 3080 batched less often. Found: a provider whose accept
+lost the race still computed the job (wasted GPU time, no consensus effect); fixed in `advance`.
+Model loading took ~13 min on box 71 with five agents loading at once (CPU-bound, start-up only).
 
 ## What's left
 
 1. ~~The mined GEMM at small m~~: addressed by batching jobs (round 2).
 2. ~~Attention at long sequences~~: tensor-core kernel (round 2); still the largest kernel at T = 512.
 3. ~~Saving stage inputs~~: recomputed on demand (round 2).
-4. **Confirm round 2 live** on the testnet (batched passes need providers with several queued jobs).
+4. ~~Confirm round 2 live~~: testnet run 3.
 5. **The client price on the testnet** is set by the test client's fee, so it isn't a market
    measurement. With λ ≈ 0.25, a client pays about 0.75 of the GPU's mining income per GPU-second,
    against 0.99 at λ = 0.012.

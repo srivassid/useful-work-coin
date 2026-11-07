@@ -1,0 +1,113 @@
+## box 71 (RTX 3080)
+agent/provider-f0aef8ba.json: NVIDIA GeForce RTX 3080: 11 jobs in 7 passes; jobs per pass [4, 1, 1, 2, 1, 1, 1]
+  per pass: 8192 tok 0.442s lam 0.365, 2048 tok 0.142s lam 0.285, 2048 tok 0.145s lam 0.279, 4096 tok 0.217s lam 0.372, 2048 tok 0.138s lam 0.292, 2048 tok 0.190s lam 0.213, 2048 tok 0.131s lam 0.308
+  excluding the first (compiling) pass: lambda median 0.288, token-weighted 0.294, mean tokens per pass 2389
+21:42:33 served stage 26 input of 153f67ab
+21:42:33 served stage 95 input of 153f67ab
+21:43:15 served stage 37 input of 153f67ab
+21:55:19 jobs d78b9c87 e6b3be74 f721f09f 2536817e: 448 stages, 8192 tokens in 0.44s on the GPU, 0.75s in all
+21:56:55 jobs 23cb8be4: 112 stages, 2048 tokens in 0.14s on the GPU, 0.20s in all
+21:58:05 served stage 29 input of 2536817e (recomputed in 19.31s)
+21:58:05 served stage 89 input of 2536817e (recomputed in 0.10s)
+21:58:05 jobs 521e1b19: 112 stages, 2048 tokens in 0.14s on the GPU, 0.15s in all
+21:58:08 served stage 108 input of 2536817e (recomputed in 0.16s)
+21:58:32 served stage 6 input of d78b9c87 (recomputed in 7.24s)
+21:58:32 served stage 62 input of d78b9c87 (recomputed in 0.12s)
+21:58:42 served stage 100 input of d78b9c87 (recomputed in 0.14s)
+21:58:42 served stage 39 input of d78b9c87 (recomputed in 0.08s)
+21:58:43 jobs 85f6e33e a1ae7338: 224 stages, 4096 tokens in 0.22s on the GPU, 0.23s in all
+21:59:09 served stage 10 input of e6b3be74 (recomputed in 12.08s)
+21:59:09 served stage 46 input of e6b3be74 (recomputed in 0.09s)
+21:59:20 served stage 92 input of e6b3be74 (recomputed in 0.14s)
+21:59:20 served stage 15 input of f721f09f (recomputed in 0.04s)
+21:59:20 jobs 233e80d9: 112 stages, 2048 tokens in 0.14s on the GPU, 0.15s in all
+21:59:46 served stage 104 input of f721f09f (recomputed in 20.61s)
+21:59:46 served stage 11 input of f721f09f (recomputed in 0.09s)
+22:00:14 served stage 18 input of f721f09f (recomputed in 10.74s)
+22:00:14 jobs 7a44f799: 112 stages, 2048 tokens in 0.19s on the GPU, 0.20s in all
+22:00:37 served stage 27 input of 521e1b19 (recomputed in 0.23s)
+22:00:43 served stage 81 input of 521e1b19 (recomputed in 0.12s)
+22:00:48 served stage 52 input of 521e1b19 (recomputed in 0.08s)
+22:00:53 served stage 97 input of 521e1b19 (recomputed in 0.17s)
+22:01:21 jobs c3e77892: 112 stages, 2048 tokens in 0.13s on the GPU, 0.19s in all
+22:01:44 served stage 90 input of 85f6e33e (recomputed in 17.69s)
+22:01:44 served stage 92 input of 85f6e33e (recomputed in 0.05s)
+22:01:49 served stage 101 input of 85f6e33e (recomputed in 0.15s)
+22:01:49 served stage 110 input of 85f6e33e (recomputed in 0.11s)
+22:01:54 served stage 3 input of a1ae7338 (recomputed in 0.10s)
+22:01:54 served stage 74 input of a1ae7338 (recomputed in 0.09s)
+22:02:00 served stage 93 input of a1ae7338 (recomputed in 0.07s)
+22:02:00 served stage 95 input of a1ae7338 (recomputed in 0.09s)
+## 5090 box
+agent/provider-19845da4.json: NVIDIA GeForce RTX 5090: 21 jobs in 12 passes; jobs per pass [1, 3, 1, 3, 1, 3, 1, 2, 1, 1, 2, 2]
+  per pass: 2048 tok 0.052s lam 0.178, 6144 tok 0.083s lam 0.337, 2048 tok 0.035s lam 0.262, 6144 tok 0.082s lam 0.339, 2048 tok 0.035s lam 0.264, 6144 tok 0.082s lam 0.340, 2048 tok 0.036s lam 0.255, 4096 tok 0.059s lam 0.315, 2048 tok 0.036s lam 0.259, 2048 tok 0.036s lam 0.259, 4096 tok 0.060s lam 0.310, 4096 tok 0.060s lam 0.311
+  excluding the first (compiling) pass: lambda median 0.310, token-weighted 0.307, mean tokens per pass 3724
+21:43:14 jobs d78b9c87: 112 stages, 2048 tokens in 0.05s on the GPU, 0.11s in all
+21:43:35 served stage 51 input of 52f319f8
+21:43:40 served stage 71 input of 52f319f8
+21:45:43 jobs 26d8ed98 e6a779b3 fee0a885: 336 stages, 6144 tokens in 0.08s on the GPU, 0.17s in all
+21:49:23 jobs 1b291dec: 112 stages, 2048 tokens in 0.04s on the GPU, 0.09s in all
+21:51:11 jobs bb15f270 ee258bcd ee97cb04: 336 stages, 6144 tokens in 0.08s on the GPU, 0.17s in all
+21:51:16 served stage 57 input of 26d8ed98 (recomputed in 0.21s)
+21:51:22 served stage 97 input of 26d8ed98 (recomputed in 0.21s)
+21:51:27 served stage 19 input of e6a779b3 (recomputed in 0.22s)
+21:51:32 served stage 3 input of fee0a885 (recomputed in 0.21s)
+21:54:07 jobs 9e490d9e: 112 stages, 2048 tokens in 0.04s on the GPU, 0.09s in all
+21:54:59 jobs bd53dfc4 c7326916 dad2854d: 336 stages, 6144 tokens in 0.08s on the GPU, 0.17s in all
+21:55:04 served stage 80 input of bb15f270 (recomputed in 0.20s)
+21:55:10 served stage 108 input of bb15f270 (recomputed in 0.18s)
+21:55:15 served stage 1 input of ee258bcd (recomputed in 0.20s)
+21:55:20 served stage 58 input of 1b291dec (recomputed in 0.18s)
+21:55:20 served stage 64 input of ee258bcd (recomputed in 0.19s)
+21:55:25 served stage 64 input of 1b291dec (recomputed in 0.17s)
+21:55:26 served stage 48 input of ee97cb04 (recomputed in 0.20s)
+21:55:31 served stage 78 input of 26d8ed98 (recomputed in 0.19s)
+21:55:31 served stage 90 input of ee97cb04 (recomputed in 0.18s)
+21:55:36 served stage 12 input of 52f319f8
+21:55:41 served stage 13 input of bb15f270 (recomputed in 0.18s)
+21:55:47 served stage 110 input of bb15f270 (recomputed in 0.20s)
+21:55:57 served stage 39 input of e6a779b3 (recomputed in 0.23s)
+21:56:02 served stage 62 input of e6a779b3 (recomputed in 0.20s)
+21:56:08 served stage 67 input of ee258bcd (recomputed in 0.18s)
+21:56:13 served stage 78 input of ee258bcd (recomputed in 0.19s)
+21:56:34 served stage 10 input of ee97cb04 (recomputed in 0.19s)
+21:56:39 served stage 19 input of ee97cb04 (recomputed in 0.18s)
+21:56:44 served stage 47 input of fee0a885 (recomputed in 0.21s)
+21:56:49 served stage 109 input of fee0a885 (recomputed in 0.19s)
+21:56:55 served stage 29 input of 9e490d9e (recomputed in 0.19s)
+21:56:55 jobs 23cb8be4: 112 stages, 2048 tokens in 0.04s on the GPU, 0.06s in all
+21:57:00 served stage 20 input of 9e490d9e (recomputed in 0.22s)
+21:57:00 served stage 78 input of 9e490d9e (recomputed in 0.19s)
+21:57:06 served stage 74 input of 9e490d9e (recomputed in 0.20s)
+21:57:27 jobs 2ea8c418 5e28434c: 224 stages, 4096 tokens in 0.06s on the GPU, 0.12s in all
+21:58:15 served stage 26 input of bd53dfc4 (recomputed in 0.21s)
+21:58:15 served stage 47 input of bd53dfc4 (recomputed in 0.41s)
+21:58:20 served stage 10 input of c7326916 (recomputed in 0.18s)
+21:58:20 served stage 107 input of c7326916 (recomputed in 0.18s)
+21:58:25 served stage 74 input of c7326916 (recomputed in 0.20s)
+21:58:46 served stage 17 input of dad2854d (recomputed in 0.25s)
+21:58:47 served stage 75 input of dad2854d (recomputed in 0.23s)
+21:58:47 jobs 64193998: 112 stages, 2048 tokens in 0.04s on the GPU, 0.24s in all
+21:58:51 served stage 50 input of dad2854d (recomputed in 0.17s)
+21:58:52 served stage 94 input of dad2854d (recomputed in 0.17s)
+21:59:12 jobs 233e80d9: 112 stages, 2048 tokens in 0.04s on the GPU, 0.08s in all
+21:59:55 served stage 52 input of 23cb8be4 (recomputed in 0.22s)
+21:59:55 jobs 7a44f799 b725c1cb: 224 stages, 4096 tokens in 0.06s on the GPU, 0.10s in all
+22:00:00 served stage 59 input of 23cb8be4 (recomputed in 0.20s)
+22:00:06 served stage 46 input of 2ea8c418 (recomputed in 0.26s)
+22:00:11 served stage 88 input of 2ea8c418 (recomputed in 0.23s)
+22:00:22 served stage 5 input of 5e28434c (recomputed in 0.21s)
+22:00:27 served stage 58 input of 23cb8be4 (recomputed in 0.21s)
+22:00:28 served stage 101 input of 5e28434c (recomputed in 0.24s)
+22:00:33 served stage 61 input of 23cb8be4 (recomputed in 0.23s)
+22:00:38 served stage 80 input of 2ea8c418 (recomputed in 0.22s)
+22:00:43 served stage 95 input of 2ea8c418 (recomputed in 0.24s)
+22:00:54 served stage 73 input of 5e28434c (recomputed in 0.42s)
+22:00:59 served stage 90 input of 5e28434c (recomputed in 0.22s)
+22:01:20 served stage 104 input of 64193998 (recomputed in 0.20s)
+22:01:21 jobs bf2d0c06 c3e77892: 224 stages, 4096 tokens in 0.06s on the GPU, 0.11s in all
+22:01:26 served stage 81 input of 64193998 (recomputed in 0.21s)
+22:02:09 served stage 32 input of 233e80d9 (recomputed in 0.20s)
+22:02:14 served stage 4 input of 233e80d9 (recomputed in 0.19s)
+22:02:15 served stage 97 input of 233e80d9 (recomputed in 0.19s)
+22:02:20 served stage 102 input of 233e80d9 (recomputed in 0.19s)

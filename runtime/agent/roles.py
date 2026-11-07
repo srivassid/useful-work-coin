@@ -299,6 +299,8 @@ class Provider(Agent):
         if j is None:
             return
         js = self.st["jobs"].setdefault(jid, {})
+        if j["provider"] != self.account:
+            return  # our accept lost the race (or is not mined yet): nothing to compute or commit
         if j["status"] == "accepted" and "roots" not in js:
             b = self.job_batches(j)
             if b is not None:
@@ -605,8 +607,9 @@ class Client(Agent):
 
     def step(self):
         h = self.chain.height()
-        if self.a.post > 0 and len(self.st.get("posted", [])) < self.a.post and \
-                h - self.st.get("last_post", -10**9) >= self.a.every:
+        for _ in range(self.a.burst if h - self.st.get("last_post", -10**9) >= self.a.every else 0):
+            if not (self.a.post > 0 and len(self.st.get("posted", [])) < self.a.post):
+                break
             n = len(self.st.get("posted", []))
             off = self.a.offset + n * self.a.batches
             seqs = wikitext_sequences(self.a.dataset, self.model["model_dir"], self.a.seq_len, self.a.batches, off)
@@ -826,6 +829,7 @@ def main() -> None:
     # client
     ap.add_argument("--post", type=int, default=0, help="jobs to post")
     ap.add_argument("--every", type=int, default=30, help="blocks between posts")
+    ap.add_argument("--burst", type=int, default=1, help="client: jobs posted together each time")
     ap.add_argument("--batches", type=int, default=2)
     ap.add_argument("--seq-len", type=int, default=128)
     ap.add_argument("--offset", type=int, default=1000, help="first WikiText chunk (the pool uses 0-199)")
