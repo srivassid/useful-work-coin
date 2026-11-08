@@ -42,7 +42,7 @@ def row_root(row: np.ndarray) -> bytes:
 
 def input_root(batches: list[list[int]]) -> bytes:
     """JOB_POST input_root: one leaf per batch (one sequence per batch)."""
-    return merkle_root([_leaf_hash(b"tok" + struct.pack("<I", i) + row_root(np.asarray(t, dtype=np.int32)))
+    return merkle_root([_leaf_hash(b"tok" + struct.pack("<I", i) + row_root(np.asarray(t, dtype=np.uint32).view(np.int32)))
                         for i, t in enumerate(batches)])
 
 

@@ -1,0 +1,323 @@
+From 3eacbfa9ae9cde7de38978bbc174cd336f494ad2 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Sun, 8 Nov 2026 16:24:37 +0530
+Subject: [PATCH] uwcctl and RPC for generation jobs: jobgen, modelreg gen,
+ out_proof in JSON reveals, onestep for generation
+
+uwcctl jobgen posts a generation job (temperature in thousandths); modelreg reads "gen" from
+the model json; JSON ops carry gen/temp_milli and reveals' out_proof; onestep builds proofs for
+generation stages (head stages, and layer stage 0 with the batch's head stage opened with its
+output-root path); getjob reports gen and tempmilli. gofmt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NvNdLwU8j8WLX4mWzr
+---
+ node/cmd/uwcctl/main.go      | 19 ++++++++++---
+ node/cmd/uwcctl/onestep.go   | 33 ++++++++++++++++++++--
+ node/cmd/uwcctl/opsjson.go   | 53 ++++++++++++++++++++----------------
+ node/jobstate/gen_test.go    |  7 +++--
+ node/jobstate/ops.go         | 42 ++++++++++++++--------------
+ node/jobstate/program_gen.go |  4 +--
+ node/rpcjobs.go              |  4 +++
+ 7 files changed, 107 insertions(+), 55 deletions(-)
+
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index b931d195..992cf910 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -43,6 +43,8 @@ jobs
+   onestep <key> <request.json>        a provider's one-step proof for a game in its last round
+   modelreg <key> <model.json>         register a model (weights_root, runtime_hash, layer_groups, block, cfg)
+   jobpost <key> <model> <input_root> <stages> <fee> <deadline_blocks> <k> <n> <seq_len> [provider_account]
++  jobgen  <key> <model> <input_root> <stages> <fee> <deadline_blocks> <k> <n> <seq_len> <temp_milli> [provider_account]
++                                      a generation job (Rules 3): stages = batches x (layer groups + 1)
+ 
+ council (actions are proposed by one member and approved by others)
+   propose-category <key> <category.json>
+@@ -268,6 +270,7 @@ func main() {
+ 			LayerGroups uint32            `json:"layer_groups"`
+ 			Block       uint32            `json:"rotation_block"`
+ 			Cfg         jobstate.ModelCfg `json:"cfg"`
++			Gen         bool              `json:"gen"` // a generation model (Rules 3)
+ 		}
+ 		raw, err := os.ReadFile(args[1])
+ 		if err != nil {
+@@ -277,9 +280,12 @@ func main() {
+ 			die(err)
+ 		}
+ 		submit(key(args[0]), nil, &jobstate.Op{Kind: jobstate.OpModelReg, H1: hash32(m.WeightsRoot), H2: hash32(m.RuntimeHash),
+-			U1: m.LayerGroups, U2: m.Block, Cfg: m.Cfg})
+-	case "jobpost":
++			U1: m.LayerGroups, U2: m.Block, Cfg: m.Cfg, Gen: m.Gen})
++	case "jobpost", "jobgen":
+ 		need(args, 9)
++		if cmd == "jobgen" {
++			need(args, 10)
++		}
+ 		c := client()
+ 		var h int64
+ 		if err := c.Query("getblockcount", &h); err != nil {
+@@ -289,8 +295,13 @@ func main() {
+ 		op := &jobstate.Op{Kind: jobstate.OpJobPost, Model: hash32(args[1]), H1: hash32(args[2]),
+ 			U1: uint32(amount(args[3])), Amount: amount(args[4]), Deadline: int32(h + amount(args[5]) + 1),
+ 			K: uint8(k), N: uint8(n), U2: uint32(amount(args[8]))}
+-		if len(args) > 9 { // a directed job (Rules 2): only this provider account may accept
+-			op.Provider = jobstate.AccountID(hash32(args[9]))
++		rest := args[9:]
++		if cmd == "jobgen" { // a generation job (Rules 3): temperature in thousandths
++			op.Gen, op.TempMilli = true, uint32(amount(rest[0]))
++			rest = rest[1:]
++		}
++		if len(rest) > 0 { // a directed job (Rules 2): only this provider account may accept
++			op.Provider = jobstate.AccountID(hash32(rest[0]))
+ 		}
+ 		submit(key(args[0]), nil, op)
+ 	case "propose-category":
+diff --git a/node/cmd/uwcctl/onestep.go b/node/cmd/uwcctl/onestep.go
+index a7597d58..3fc2b436 100644
+--- a/node/cmd/uwcctl/onestep.go
++++ b/node/cmd/uwcctl/onestep.go
+@@ -19,6 +19,11 @@ type oneStepReq struct {
+ 	Batches  [][]uint32 `json:"batches"`      // the job's token batches
+ 	Salts    []string   `json:"salts"`        // the provider's stage salts and roots
+ 	Roots    []string   `json:"roots"`
++	// generation jobs (Rules 3): Batches are the full sequences
++	Gen       bool       `json:"gen"`
++	TempMilli uint32     `json:"temp_milli"`
++	InputRows [][]uint32 `json:"input_rows"`   // the job's input rows (prompt, then the sentinel)
++	HeadRows  string     `json:"head_outputs"` // this batch's head-stage output rows (layer stage 0)
+ }
+ 
+ func readRows(path string) ([][]uint32, error) {
+@@ -97,18 +102,40 @@ func oneStep(keyPath, reqPath string) {
+ 	}
+ 	in := jobstate.OneStepInput{Cfg: mi.Cfg, LayerGroups: mi.LayerGroups, Stage: g.Stage, Leaf: g.Leaf, Elem: g.Elem,
+ 		Rows: rows, Weights: w}
+-	b := int(g.Stage) / mi.LayerGroups
++	per := mi.LayerGroups
++	if req.Gen {
++		per++
++		in.Gen = &jobstate.GenSpec{TempMilli: req.TempMilli, Key: jobstate.GumbelKey(hash32(req.Job))}
++	}
++	b := int(g.Stage) / per
+ 	if b >= len(req.Batches) {
+ 		die(fmt.Errorf("stage %d: no batch %d", g.Stage, b))
+ 	}
+ 	in.Tokens = req.Batches[b]
+-	for i, toks := range req.Batches {
++	inputs := req.Batches
++	if req.Gen {
++		inputs = req.InputRows
++		in.InputRow = req.InputRows[b]
++	}
++	for i, toks := range inputs {
+ 		in.InputLeaves = append(in.InputLeaves, jobstate.TokenLeaf(i, jobstate.RowRoot(toks)))
+ 	}
+ 	for i := range req.Salts {
+ 		in.StageLeaves = append(in.StageLeaves, jobstate.StageLeaf(uint32(i), hash32(req.Salts[i]), hash32(req.Roots[i])))
+ 	}
+-	if int(g.Stage)%mi.LayerGroups > 0 {
++	if req.Gen && int(g.Stage)%per == 0 { // layer stage 0 may read generated tokens: the batch's head stage
++		if in.HeadOutputs, err = readRows(req.HeadRows); err != nil {
++			die(err)
++		}
++		var outLv []jobstate.Hash
++		for i := range req.Batches {
++			outLv = append(outLv, jobstate.GenOutLeaf(i, hash32(req.Roots[i*per+mi.LayerGroups])))
++		}
++		hs := b*per + mi.LayerGroups
++		in.HeadReveal = &jobstate.StageReveal{Stage: uint32(hs), Salt: hash32(req.Salts[hs]), Root: hash32(req.Roots[hs]),
++			Proof: jobstate.MerkleProof(in.StageLeaves, hs), OutProof: jobstate.MerkleProof(outLv, b)}
++	}
++	if int(g.Stage)%per > 0 {
+ 		if in.PrevOutputs, err = readRows(req.PrevRows); err != nil {
+ 			die(err)
+ 		}
+diff --git a/node/cmd/uwcctl/opsjson.go b/node/cmd/uwcctl/opsjson.go
+index 4e1a20a2..2265cfc5 100644
+--- a/node/cmd/uwcctl/opsjson.go
++++ b/node/cmd/uwcctl/opsjson.go
+@@ -11,34 +11,37 @@ import (
+ // opJSON is the generic JSON form of a job operation (hashes and byte strings in hex), used by
+ // `uwcctl ops` so that scripts and the devnet agent can send any operation.
+ type opJSON struct {
+-	Kind     string       `json:"kind"`
+-	Amount   int64        `json:"amount"`
+-	Job      string       `json:"job"`
+-	Model    string       `json:"model"`
+-	H1       string       `json:"h1"`
+-	H2       string       `json:"h2"`
+-	U1       uint32       `json:"u1"`
+-	U2       uint32       `json:"u2"`
+-	Deadline int32        `json:"deadline"`
+-	K        uint8        `json:"k"`
+-	N        uint8        `json:"n"`
+-	Roots    []string     `json:"roots"`
+-	Reveals  []revealJSON `json:"reveals"`
+-	Proof    []string     `json:"proof"`
+-	Data     string       `json:"data"`
+-	PkScript string       `json:"pkscript"`
+-	Inputs   []provenJSON `json:"inputs"`
++	Kind      string       `json:"kind"`
++	Amount    int64        `json:"amount"`
++	Job       string       `json:"job"`
++	Model     string       `json:"model"`
++	H1        string       `json:"h1"`
++	H2        string       `json:"h2"`
++	U1        uint32       `json:"u1"`
++	U2        uint32       `json:"u2"`
++	Deadline  int32        `json:"deadline"`
++	K         uint8        `json:"k"`
++	N         uint8        `json:"n"`
++	Roots     []string     `json:"roots"`
++	Reveals   []revealJSON `json:"reveals"`
++	Proof     []string     `json:"proof"`
++	Data      string       `json:"data"`
++	PkScript  string       `json:"pkscript"`
++	Inputs    []provenJSON `json:"inputs"`
++	Gen       bool         `json:"gen"`        // MODEL_REG / JOB_POST of generation (Rules 3)
++	TempMilli uint32       `json:"temp_milli"` // JOB_POST of a generation job
+ }
+ 
+ type revealJSON struct {
+-	Stage uint32   `json:"stage"`
+-	Salt  string   `json:"salt"`
+-	Root  string   `json:"root"`
+-	Proof []string `json:"proof"`
++	Stage    uint32   `json:"stage"`
++	Salt     string   `json:"salt"`
++	Root     string   `json:"root"`
++	Proof    []string `json:"proof"`
++	OutProof []string `json:"out_proof"` // a generation job's head stage: its path in the output root
+ }
+ 
+ type provenJSON struct {
+-	Kind  uint8    `json:"kind"` // 1 leaf, 2 weight, 3 stage input row, 4 tokens
++	Kind  uint8    `json:"kind"` // 1 leaf, 2 weight, 3 stage input row, 4 tokens, 5 generated token
+ 	Op    uint8    `json:"op"`
+ 	Layer int      `json:"layer"`
+ 	T     int      `json:"t"`
+@@ -89,7 +92,8 @@ func (j *opJSON) op() (*jobstate.Op, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	o := &jobstate.Op{Kind: kind, Amount: j.Amount, U1: j.U1, U2: j.U2, Deadline: j.Deadline, K: j.K, N: j.N}
++	o := &jobstate.Op{Kind: kind, Amount: j.Amount, U1: j.U1, U2: j.U2, Deadline: j.Deadline, K: j.K, N: j.N,
++		Gen: j.Gen, TempMilli: j.TempMilli}
+ 	for _, f := range []struct {
+ 		s   string
+ 		dst *jobstate.Hash
+@@ -115,6 +119,9 @@ func (j *opJSON) op() (*jobstate.Op, error) {
+ 		if sr.Proof, err = hashes(r.Proof); err != nil {
+ 			return nil, err
+ 		}
++		if sr.OutProof, err = hashes(r.OutProof); err != nil {
++			return nil, err
++		}
+ 		o.Reveals = append(o.Reveals, sr)
+ 	}
+ 	for _, in := range j.Inputs {
+diff --git a/node/jobstate/gen_test.go b/node/jobstate/gen_test.go
+index b33452bc..28bf5bd4 100644
+--- a/node/jobstate/gen_test.go
++++ b/node/jobstate/gen_test.go
+@@ -25,8 +25,11 @@ type genFixture struct {
+ 		HeadRows       []string `json:"head_rows"`
+ 		HeadOutputRoot string   `json:"head_output_root"`
+ 		Key            string
+-		Gumbel         []struct{ T, V int; U, G uint32 }
+-		Log            []struct{ X, Y uint32 }
++		Gumbel         []struct {
++			T, V int
++			U, G uint32
++		}
++		Log []struct{ X, Y uint32 }
+ 	}
+ }
+ 
+diff --git a/node/jobstate/ops.go b/node/jobstate/ops.go
+index 7bd2df90..422fdbd0 100644
+--- a/node/jobstate/ops.go
++++ b/node/jobstate/ops.go
+@@ -80,27 +80,27 @@ func (k OpKind) String() string { return opNames[k] }
+ //	CANARY_REVEAL  Job, U1 leaf index, H1 salt, Roots (expected stage roots), Proof (in the canary tree)
+ //	FE_REVEAL      Job (commitment id), H1 salt, Data (record)
+ type Op struct {
+-	Kind     OpKind
+-	Actor    AccountID
+-	Ref      Hash
+-	Amount   Amount
+-	PkScript []byte
+-	Job      Hash
+-	Model    Hash
+-	H1, H2   Hash
+-	U1, U2   uint32
+-	Deadline int32
+-	K, N     uint8
+-	Roots    []Hash
+-	Reveals  []StageReveal
+-	Cfg      ModelCfg
+-	Data     []byte
+-	Inputs   []ProvenRow
+-	Cat      CategorySpec
+-	Proof    []Hash
+-	Provider AccountID // JOB_POST: directed provider (zero: open job; encoded only when set)
+-	Gen      bool      // MODEL_REG: a generation model; JOB_POST: a generation job (Rules >= 3, encoded only when set)
+-	TempMilli uint32   // JOB_POST of a generation job: temperature in thousandths
++	Kind      OpKind
++	Actor     AccountID
++	Ref       Hash
++	Amount    Amount
++	PkScript  []byte
++	Job       Hash
++	Model     Hash
++	H1, H2    Hash
++	U1, U2    uint32
++	Deadline  int32
++	K, N      uint8
++	Roots     []Hash
++	Reveals   []StageReveal
++	Cfg       ModelCfg
++	Data      []byte
++	Inputs    []ProvenRow
++	Cat       CategorySpec
++	Proof     []Hash
++	Provider  AccountID // JOB_POST: directed provider (zero: open job; encoded only when set)
++	Gen       bool      // MODEL_REG: a generation model; JOB_POST: a generation job (Rules >= 3, encoded only when set)
++	TempMilli uint32    // JOB_POST of a generation job: temperature in thousandths
+ }
+ 
+ // ProvenRow is an input row for the referee or a served stage input, with its Merkle proof.
+diff --git a/node/jobstate/program_gen.go b/node/jobstate/program_gen.go
+index 01acaab0..b74cbcd8 100644
+--- a/node/jobstate/program_gen.go
++++ b/node/jobstate/program_gen.go
+@@ -26,8 +26,8 @@ const (
+ )
+ 
+ const (
+-	VChunk      = 1024       // vocabulary chunk of an HL / HC leaf
+-	GenSentinel = 0xFFFFFFFF // input-row marker of a generated position
++	VChunk       = 1024       // vocabulary chunk of an HL / HC leaf
++	GenSentinel  = 0xFFFFFFFF // input-row marker of a generated position
+ 	MaxTempMilli = 4000
+ )
+ 
+diff --git a/node/rpcjobs.go b/node/rpcjobs.go
+index bd712069..32577062 100644
+--- a/node/rpcjobs.go
++++ b/node/rpcjobs.go
+@@ -177,6 +177,10 @@ func jobJSON(j *jobstate.Job) map[string]interface{} {
+ 	if j.Caught {
+ 		out["caughtstage"] = j.CaughtStage
+ 	}
++	if j.Gen {
++		out["gen"] = true
++		out["tempmilli"] = j.TempMilli
++	}
+ 	if j.IsPool() {
+ 		out["pool"] = hx(j.Pool[:])
+ 		out["unit"] = j.Unit
+-- 
+2.30.2
+

@@ -14,6 +14,26 @@ from .model_info import load
 from .proto import pooled
 
 
+class GenJob:
+    """A generation job's sampling: temperature in thousandths, seed = the job id."""
+
+    def __init__(self, temp_milli: int, job_id: str):
+        self.temp_milli, self.job_id = int(temp_milli), job_id
+
+    def sampling(self):
+        from detgen.head import Sampling
+        return Sampling(self.temp_milli, bytes.fromhex(self.job_id))
+
+
+def gen_of(j: dict) -> GenJob | None:
+    return GenJob(j.get("tempmilli", 0), j["id"]) if j.get("gen") else None
+
+
+def prompt_of(row: list[int]) -> list[int]:
+    from detgen.head import SENTINEL
+    return row[:row.index(SENTINEL)] if SENTINEL in row else list(row)
+
+
 class Runtime:
     def __init__(self, model_json: str, device: str, mine_socket: str | None = None, engine: str = "detgpu",
                  mine: bool | None = None):
@@ -174,25 +194,89 @@ class Runtime:
                 res[i][b] = ([bytes(roots[g, r]) for g in range(self.G)], emb[r])
         return [([x for roots, _ in per for x in roots], [e for _, e in per]) for per in res]
 
-    def stage_input(self, batches: list[list[int]], stage: int) -> dict:
+    # ------------------------------------------------------------ generation jobs (Rules 3)
+    def split(self, stage: int, gen: GenJob | None = None) -> tuple[int, int]:
+        """(batch, group) of a stage; group G is a generation batch's head stage."""
+        return divmod(stage, self.G + (1 if gen else 0))
+
+    def head_out(self, r2: np.ndarray, gen: GenJob) -> np.ndarray:
+        """Head-stage output rows (T-1, 2) int32 from the last layer's R2 rows (T, D)."""
+        if self.gpu:
+            from detgen.fast import head_outputs
+            self.bind()
+            return head_outputs(self.m, torch.from_numpy(np.ascontiguousarray(r2)).to(self.device)[None], gen.sampling())[0]
+        from detgen.head import run_head_stage
+        return run_head_stage(self.m, torch.from_numpy(r2), gen.sampling(), rows=False).output
+
+    def generate(self, prompts: list[list[int]], T: int, gen: GenJob) -> list[list[int]]:
+        """The full sequences of a generation job (deterministic: anyone gets the same)."""
+        self.bind()
+        if self.miner is not None:
+            self.miner.refresh()
+        if self.gpu and self.m.hd == 128:
+            from detgen import fast
+            return fast.generate(self.m, prompts, T, gen.sampling())
+        from detgen.generate import generate
+        return [generate(self.m, p, T, gen.sampling()) for p in prompts]
+
+    def gen_job(self, rows: list[list[int]], gen: GenJob):
+        """A provider's generation job: (sequences, stage roots in stage order, head outputs per
+        batch, the job's output root). last_gpu_s covers generation, layer stages and heads."""
+        from detgen.head import gen_output_root, head_output_root
+        from .proto import stage_output_root
+        torch_sync = torch.cuda.synchronize if self.gpu else (lambda: None)
+        torch_sync()
+        t = time.time()
+        T = len(rows[0])
+        seqs = self.generate([prompt_of(r) for r in rows], T, gen)
+        roots, heads = [], []
+        if self.gpu:
+            from detgpu.sha import digest_bytes, stage_roots_gpu
+            from detgpu.stages import job_outputs
+            from detgen.fast import head_outputs
+            for c0 in range(0, len(seqs), 16):
+                part = seqs[c0:c0 + 16]
+                outs = job_outputs(self.m, torch.tensor(part, dtype=torch.long), self.G)
+                rr = digest_bytes(torch.stack([stage_roots_gpu(o) for o in outs]))
+                hs = head_outputs(self.m, outs[-1], gen.sampling())
+                for b in range(len(part)):
+                    heads.append(hs[b])
+                    roots += [bytes(rr[g, b]) for g in range(self.G)] + [head_output_root(hs[b])]
+                del outs
+        else:
+            for seq, outs in zip(seqs, self.outputs(seqs)):
+                h = self.head_out(outs[-1], gen)
+                heads.append(h)
+                roots += [stage_output_root(o) for o in outs] + [head_output_root(h)]
+        torch_sync()
+        self.last_gpu_s = time.time() - t
+        out_root = gen_output_root([roots[b * (self.G + 1) + self.G] for b in range(len(seqs))])
+        return seqs, roots, heads, out_root
+
+    def stage_input(self, batches: list[list[int]], stage: int, gen: GenJob | None = None) -> dict:
         """What a verifier asks a provider for: stage s's input rows (the previous stage's output,
         recomputed for that one sequence) and each row's Merkle proof in its output tree."""
         from .proto import multi_proofs, stage_out_leaves
-        b, g = divmod(stage, self.G)
+        b, g = self.split(stage, gen)
         assert g >= 1, "a stage of layer group 0 reads tokens"
         rows = np.ascontiguousarray(self.outputs([batches[b]], g - 1)[0][g - 1])
         leaves = stage_out_leaves(rows)
         pr = multi_proofs(leaves, range(len(leaves)))
         return {"rows": rows, "proofs": [[h.hex() for h in pr[t]] for t in range(len(pr))]}
 
-    def stage_output(self, batches: list[list[int]], stage: int) -> np.ndarray:
-        b, g = divmod(stage, self.G)
+    def stage_output(self, batches: list[list[int]], stage: int, gen: GenJob | None = None) -> np.ndarray:
+        b, g = self.split(stage, gen)
+        if g == self.G:  # a head stage's outputs: the samples
+            return self.head_out(self.outputs([batches[b]])[0][-1], gen)
         return self.outputs([batches[b]], g)[0][g]
 
-    def stage_root_from_input(self, rows: np.ndarray, g: int) -> bytes:
-        """One stage (layer group g >= 1) from its served input rows: its output root."""
+    def stage_root_from_input(self, rows: np.ndarray, g: int, gen: GenJob | None = None) -> bytes:
+        """One stage (layer group g >= 1, or the head stage g == G) from its served input rows: its output root."""
         from detrt.fast import run_stages
         from .proto import stage_output_root
+        if gen is not None and g == self.G:
+            from detgen.head import head_output_root
+            return head_output_root(self.head_out(rows, gen))
         self.bind()
         if self.gpu:
             from detgpu.sha import stage_output_roots
@@ -202,16 +286,20 @@ class Runtime:
         y = run_stages(self.m, None, [torch.from_numpy(rows)], g * self.lpg, (g + 1) * self.lpg, keep_rows=False)[0]
         return stage_output_root(y)
 
-    def trace(self, batches: list[list[int]], stage: int):
+    def trace(self, batches: list[list[int]], stage: int, gen: GenJob | None = None):
         """The full trace of one stage (for dispute games): recompute the batch up to it."""
-        b, g = divmod(stage, self.G)
-        key = ("trace", tuple(batches[b]), g)
+        b, g = self.split(stage, gen)
+        key = ("trace", tuple(batches[b]), g, gen.temp_milli if gen else None, gen.job_id if gen else None)
         if key in getattr(self, "traces", {}):
             return self.traces[key]
         self.bind()
         toks = torch.tensor(batches[b], dtype=torch.long)
         x = torch.from_numpy(self.outputs([batches[b]], g - 1)[0][g - 1]) if g > 0 else None
-        st = run_stage(self.m, toks if g == 0 else None, x, g * self.lpg, (g + 1) * self.lpg)
+        if gen is not None and g == self.G:
+            from detgen.head import run_head_stage
+            st = run_head_stage(self.m, x, gen.sampling())
+        else:
+            st = run_stage(self.m, toks if g == 0 else None, x, g * self.lpg, (g + 1) * self.lpg)
         traces = getattr(self, "traces", {})
         traces[key] = st
         while len(traces) > 3:  # traces are large: keep the last few (one per running game)
@@ -219,6 +307,9 @@ class Runtime:
         self.traces = traces
         return st
 
-    def stage_root(self, batches: list[list[int]], stage: int) -> bytes:
-        b, g = divmod(stage, self.G)
+    def stage_root(self, batches: list[list[int]], stage: int, gen: GenJob | None = None) -> bytes:
+        b, g = self.split(stage, gen)
+        if g == self.G:
+            from detgen.head import head_output_root
+            return head_output_root(self.stage_output(batches, stage, gen))
         return self.batch(batches[b], g)[0][g]

@@ -23,9 +23,14 @@ def split(tr: StageTrace):
     """(body program indices, output program indices by token, body leaves, output leaves) of a
     trace, as jobstate.TraceCommit; cached on the trace."""
     if getattr(tr, "_split", None) is None:
-        l1 = max(lf.layer for lf in tr.leaves) + 1
-        body_at = [i for i, lf in enumerate(tr.leaves) if not (lf.op == R2 and lf.layer == l1 - 1)]
-        out_at = [i for _, i in sorted((lf.t, i) for i, lf in enumerate(tr.leaves) if lf.op == R2 and lf.layer == l1 - 1)]
+        from detgen.head import HS
+        if any(lf.op == HS for lf in tr.leaves):  # a generation batch's head stage: the samples are its outputs
+            is_out = lambda lf: lf.op == HS
+        else:
+            l1 = max(lf.layer for lf in tr.leaves) + 1
+            is_out = lambda lf: lf.op == R2 and lf.layer == l1 - 1
+        body_at = [i for i, lf in enumerate(tr.leaves) if not is_out(lf)]
+        out_at = [i for _, i in sorted((lf.t, i) for i, lf in enumerate(tr.leaves) if is_out(lf))]
         body = [leaf_hash(bi, row_root(tr.rows[pi])) for bi, pi in enumerate(body_at)]
         out = [_leaf_hash(b"sout" + struct.pack("<I", t) + row_root(tr.rows[pi])) for t, pi in enumerate(out_at)]
         tr._split = (body_at, out_at, body, out)

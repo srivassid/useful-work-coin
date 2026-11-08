@@ -176,9 +176,13 @@ def head_output_root(out: np.ndarray) -> bytes:
                         for t, r in enumerate(out)])
 
 
+def gen_out_leaves(head_roots: list[bytes]) -> list[bytes]:
+    return [_leaf_hash(b"gout" + struct.pack("<I", b) + r) for b, r in enumerate(head_roots)]
+
+
 def gen_output_root(head_roots: list[bytes]) -> bytes:
     """A generation job's output root over its batches' head output roots."""
-    return merkle_root([_leaf_hash(b"gout" + struct.pack("<I", b) + r) for b, r in enumerate(head_roots)])
+    return merkle_root(gen_out_leaves(head_roots))
 
 
 def input_row(prompt: list[int], T: int) -> list[int]:

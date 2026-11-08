@@ -22,14 +22,18 @@ from detrt.stage import _leaf_hash, merkle_root, row_root, weight_rows
 
 from .model_info import load
 
-LINEAR = ("qkv", "o", "gu", "down")
+LINEAR = ("qkv", "o", "gu", "down", "lm_head")
 
 
-def export(m, out: str) -> dict:
+def export(m, out: str, gen: bool = False) -> dict:
     os.makedirs(out, exist_ok=True)
     offs, leaves = [0], []
     with open(os.path.join(out, "rows.bin"), "wb") as f:
-        for i, (name, row) in enumerate(weight_rows(m)):
+        rows = weight_rows(m)
+        if gen:  # a generation model's tree continues with the final norm and lm_head
+            from detgen.weights import gen_weight_rows
+            rows = gen_weight_rows(m)
+        for i, (name, row) in enumerate(rows):
             leaves.append(_leaf_hash(b"w" + struct.pack("<I", i) + row_root(row)))
             if name.split(".")[-1] in LINEAR:
                 b = row[:-1].astype(np.int8).tobytes() + row[-1:].astype("<i4").tobytes()
@@ -53,7 +57,7 @@ def main() -> None:
     info = json.load(open(a.model))
     t = time.time()
     m = load(info["model_dir"], "cpu", info["rotation_block"], info["cfg"]["MaxPos"])
-    meta = export(m, a.out)
+    meta = export(m, a.out, gen=info.get("gen", False))
     ok = meta["weights_root"] == info["weights_root"]
     print(json.dumps(meta), "matches MODEL_REG" if ok else "DOES NOT MATCH MODEL_REG", f"{time.time() - t:.0f}s")
 

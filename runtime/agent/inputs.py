@@ -11,7 +11,8 @@ from detrt.stage import _leaf_hash, merkle_root, merkle_proof, row_root
 
 
 def token_leaf(batch: int, tokens: list[int]) -> bytes:
-    return _leaf_hash(b"tok" + struct.pack("<I", batch) + row_root(np.asarray(tokens, dtype=np.int32)))
+    # uint32 words (a generation row's sentinel is 0xFFFFFFFF), hashed as their int32 bit patterns
+    return _leaf_hash(b"tok" + struct.pack("<I", batch) + row_root(np.asarray(tokens, dtype=np.uint32).view(np.int32)))
 
 
 def input_root(batches: list[list[int]]) -> bytes:

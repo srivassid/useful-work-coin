@@ -138,8 +138,40 @@ class Agent:
             need = max(need, b // 10_000 * bp + (b % 10_000) * bp // 10_000)
         return max(self.a.bond, need)
 
+    @staticmethod
+    def gen(j: dict):
+        """A generation job's sampling (agent.compute.GenJob), or None."""
+        if not j.get("gen"):
+            return None
+        from .compute import GenJob
+        return GenJob(j.get("tempmilli", 0), j["id"])
+
+    def per_batch(self, j: dict) -> int:
+        """Stages per batch: the layer groups, plus a generation batch's head stage."""
+        return self.G + (1 if j.get("gen") else 0)
+
     def batches(self, j: dict) -> list[list[int]] | None:
-        """The job's token batches: a pool unit from the public work list, a client job from the
+        """The token sequences the job's stages run over: the input batches, or for a generation
+        job the full sequences (the provider's own, or regenerated here: generation is
+        deterministic, so a verifier needs nothing from the provider)."""
+        rows = self.input_batches(j)
+        if rows is None or not j.get("gen"):
+            return rows
+        js = self.st["jobs"].get(j["id"], {})
+        if js.get("seqs"):
+            return js["seqs"]
+        cache = self.__dict__.setdefault("_gen_seqs", {})
+        if j["id"] not in cache:
+            from .compute import prompt_of
+            t = time.time()
+            cache[j["id"]] = self.rt.generate([prompt_of(r) for r in rows], j["seqlen"], self.gen(j))
+            log(f"job {j['id'][:8]}: regenerated {len(rows)} sequences in {time.time() - t:.1f}s")
+            while len(cache) > 16:
+                cache.pop(next(iter(cache)))
+        return cache[j["id"]]
+
+    def input_batches(self, j: dict) -> list[list[int]] | None:
+        """The job's input rows: a pool unit from the public work list, a client job from the
         data service (checked against input_root)."""
         if j.get("pool"):
             doc = self.work_list(self.work_root(j["pool"]))
@@ -183,19 +215,26 @@ class Agent:
             self.save()
 
     def game_trace(self, j: dict, b, stage: int, as_provider: bool):
-        return self.rt.trace(b, stage)
+        return self.rt.trace(b, stage, self.gen(j))
 
     def one_step(self, j: dict, b: list[list[int]], js: dict, tag: str):
         """Last round as provider: every row the referee reads, with proofs (uwcctl onestep)."""
         g = j["game"]
         d = os.path.join(self.a.devnet, "agent", "onestep", j["id"][:16])
         os.makedirs(d, exist_ok=True)
+        gen = self.gen(j)
+        per = self.per_batch(j)
         req = {"job": j["id"], "model": self.a.model, "weights": self.a.weights, "rows": os.path.join(d, "rows.bin"),
                "prev_outputs": "", "batches": b, "salts": js["salts"], "roots": js["roots"]}
-        if g["stage"] % self.G:
-            write_rows(os.path.join(d, "prev.bin"), list(self.rt.stage_output(b, g["stage"] - 1)))
+        if g["stage"] % per:
+            write_rows(os.path.join(d, "prev.bin"), list(self.rt.stage_output(b, g["stage"] - 1, gen)))
             req["prev_outputs"] = os.path.join(d, "prev.bin")
-        write_rows(req["rows"], self.rt.trace(b, g["stage"]).rows)
+        if gen is not None:
+            req.update(gen=True, temp_milli=gen.temp_milli, input_rows=self.input_batches(j),
+                       head_outputs=os.path.join(d, "head.bin"))
+            hs = (g["stage"] // per) * per + self.G
+            write_rows(req["head_outputs"], list(self.rt.stage_output(b, hs, gen)))
+        write_rows(req["rows"], self.rt.trace(b, g["stage"], gen).rows)
         json.dump(req, open(os.path.join(d, "req.json"), "w"))
         try:
             r = self.chain.run("onestep", self.key, os.path.join(d, "req.json"))
@@ -306,7 +345,7 @@ class Provider(Agent):
             if self.a.pool:
                 self.claim(s)
         urgent = {"disputed": 0, "provider-reveal": 1, "accepted": 3}
-        self.ready = {}
+        self.ready, self.gen_ready = {}, {}
         for jid in sorted(active, key=lambda x: urgent.get(mine.get(x, {}).get("status"), 2)):
             self.advance(jid)
         self.launch()
@@ -336,6 +375,11 @@ class Provider(Agent):
             busy.result()  # surface an error from the previous pass once; the next step retries
         order = sorted(self.ready, key=lambda x: self.st["jobs"].get(x, {}).get("accepted",
                                                                           self.st["jobs"].get(x, {}).get("claimed", 0)))
+        if order and order[0] in self.gen_ready:  # a generation job runs alone in its pass
+            jid = order[0]
+            self.busy = self.worker.submit(self.compute_gen, jid, self.ready[jid], self.gen_ready[jid])
+            return
+        order = [x for x in order if x not in self.gen_ready]
         items, n = [], 0
         for jid in order:
             b = self.ready[jid]
@@ -382,9 +426,11 @@ class Provider(Agent):
         if j["provider"] != self.account:
             return  # our accept lost the race (or is not mined yet): nothing to compute or commit
         if j["status"] == "accepted" and "roots" not in js:
-            b = self.job_batches(j)
+            b = self.input_batches(j) if j.get("gen") else self.job_batches(j)
             if b is not None:
                 self.ready[jid] = b  # launch() starts the GPU on it, with any others waiting
+                if j.get("gen"):
+                    self.gen_ready[jid] = self.gen(j)
             return
         if j["status"] == "accepted" and js.get("committed") and self.chain.height() - js.get("committed_h", 0) >= 3:
             js["committed"] = False  # the commit never reached a block: send it again
@@ -417,10 +463,21 @@ class Provider(Agent):
         key = f"{j['status']}:{sorted(want)}"
         h = self.chain.height()
         if want and (js.get("last_reveal") != key or h - js.get("last_reveal_h", h) >= 3):
-            if self.send([{"kind": "TRACE_REVEAL", "job": jid, "reveals": [sc.reveal(x) for x in sorted(want)]}],
+            if self.send([{"kind": "TRACE_REVEAL", "job": jid, "reveals": [self.reveal_of(j, js, sc, x) for x in sorted(want)]}],
                          f"reveal {jid[:8]} stages {sorted(want)}"):
                 js["last_reveal"], js["last_reveal_h"] = key, h
                 self.save()
+
+    def reveal_of(self, j: dict, js: dict, sc: StageCommit, stage: int) -> dict:
+        """A stage reveal; a generation job's head stage also carries its path in the output root."""
+        r = sc.reveal(stage)
+        per = self.per_batch(j)
+        if j.get("gen") and stage % per == self.G:
+            from detgen.head import gen_out_leaves
+            from detrt.stage import merkle_proof
+            heads = [bytes.fromhex(js["roots"][b * per + self.G]) for b in range(len(js["roots"]) // per)]
+            r["out_proof"] = [h.hex() for h in merkle_proof(gen_out_leaves(heads), stage // per)]
+        return r
 
     def job_batches(self, j: dict) -> list[list[int]] | None:
         cache = self.__dict__.setdefault("_batches", {})
@@ -432,6 +489,30 @@ class Provider(Agent):
             while len(cache) > 64:
                 cache.pop(next(iter(cache)))
         return cache[j["id"]]
+
+    def compute_gen(self, jid: str, rows: list[list[int]], gen):
+        """A generation job: generate, run every stage, commit salted stage roots and the output
+        root; the head-stage outputs (samples) go to the data service for the client."""
+        rt = self.rt
+        t = time.time()
+        mined0 = rt.miner.hashed if rt.miner else 0
+        with self.gpu_pass():
+            seqs, roots, heads, out_root = rt.gen_job(rows, gen)
+        hashed = (rt.miner.hashed - mined0) if rt.miner else 0
+        buf = io.BytesIO()
+        np.save(buf, np.stack(heads).astype(np.int32))
+        self.data.put(f"/outputs/{jid}.npy", buf.getvalue())
+        salts = [secrets.token_bytes(32) for _ in roots]
+        from .compute import prompt_of
+        new = sum(len(sq) - len(prompt_of(r)) for sq, r in zip(seqs, rows))
+        with self.lock:
+            self.st["jobs"].setdefault(jid, {}).update(
+                roots=[r.hex() for r in roots], salts=[x.hex() for x in salts], outputroot=out_root.hex(), seqs=seqs,
+                gen=True, computed=round(rt.last_gpu_s, 4), total=round(time.time() - t, 3), hashed_macs=hashed,
+                generated=new)
+        self.save()
+        log(f"generation job {jid[:8]}: {len(seqs)} sequences, {new} tokens generated, {len(roots)} stages in "
+            f"{rt.last_gpu_s:.2f}s on the GPU")
 
     def compute_jobs(self, items: list[tuple[str, list[list[int]]]]):
         """One GPU pass over several jobs; each job gets its own salts, commitment and outputs.
@@ -492,20 +573,21 @@ class Provider(Agent):
                 self.save()
                 continue
             j = self.chain.job(jid)
-            b = self.job_batches(j) if j else None
-            if b is None or stage % self.G == 0 or stage >= len(b) * self.G:
+            b = self.batches(j) if j else None
+            per = self.per_batch(j) if j else self.G
+            if b is None or stage % per == 0 or stage >= len(b) * per:
                 served.append(name)  # nothing to serve: the verifier recomputes the prefix
                 continue
             queued.add(name)
-            self.worker.submit(self.serve_input, jid, name, stage, b)
+            self.worker.submit(self.serve_input, jid, name, stage, b, self.gen(j))
 
-    def serve_input(self, jid: str, name: str, stage: int, b: list[list[int]]):
+    def serve_input(self, jid: str, name: str, stage: int, b: list[list[int]], gen=None):
         import base64
         try:
             rt = self.rt
             t = time.time()
             with self.gpu_pass():
-                pk = rt.stage_input(b, stage)
+                pk = rt.stage_input(b, stage, gen)
             js = self.st["jobs"][jid]
             doc = {"stage": stage, "shape": list(pk["rows"].shape), "proofs": pk["proofs"],
                    "reveal": self.commit_of(js).reveal(stage - 1),
@@ -573,7 +655,7 @@ class Verifier(Agent):
                     for p in pos:
                         r = self.served_stage_root(j, p)
                         served += r is not None
-                        roots.append(r if r is not None else self.rt.stage_root(b, p))
+                        roots.append(r if r is not None else self.rt.stage_root(b, p, self.gen(j)))
                     js.update(salt=salt.hex(), positions=pos, roots=[r.hex() for r in roots],
                               computed=round(time.time() - t, 1), served_inputs=served)
                     rh = result_hash(roots, bytes.fromhex(self.account), salt)
@@ -592,7 +674,7 @@ class Verifier(Agent):
     def served_stage_root(self, j: dict, stage: int) -> bytes | None:
         """Recompute one stage from its served input, checked against the commitment; None (so
         the caller recomputes the prefix) when the stage reads tokens or nothing valid arrives."""
-        g = stage % self.G
+        g = stage % self.per_batch(j)
         if g == 0 or not self.a.fetch_inputs:
             return None
         nonce = secrets.token_hex(16)
@@ -612,7 +694,7 @@ class Verifier(Agent):
                 except Exception as e:
                     log(f"{j['id'][:8]} stage {stage}: served input rejected ({e}); recomputing the prefix")
                     return None
-                return self.rt.stage_root_from_input(rows, g)
+                return self.rt.stage_root_from_input(rows, g, self.gen(j))
             time.sleep(3)
         log(f"{j['id'][:8]} stage {stage}: no input served in {self.a.input_wait:.0f}s; recomputing the prefix")
         return None
@@ -644,11 +726,11 @@ class Watcher(Agent):
                 continue
             stage = rng.randrange(j["stages"])
             t = time.time()
-            root = self.rt.stage_root(b, stage).hex()
+            root = self.rt.stage_root(b, stage, self.gen(j)).hex()
             if rng.random() < self.a.lie:  # fault injection: claim an output root with one element flipped
                 from .game import split
                 from .proto import stage_output_root
-                tr = self.rt.trace(b, stage)
+                tr = self.rt.trace(b, stage, self.gen(j))
                 _, out_at, _, _ = split(tr)
                 t = rng.randrange(len(out_at))
                 leaf, elem = out_at[t], rng.randrange(len(tr.rows[out_at[t]]))
@@ -680,7 +762,7 @@ class Watcher(Agent):
         return StageTrace(leaves=tr.leaves, rows=rows, output=tr.output).finalize()
 
     def game_trace(self, j: dict, b, stage: int, as_provider: bool):
-        tr = self.rt.trace(b, stage)
+        tr = self.rt.trace(b, stage, self.gen(j))
         lie = self.st["jobs"].get(j["id"], {}).get("lie")
         return self.corrupted(tr, *lie) if lie and not as_provider else tr
 
@@ -696,13 +778,23 @@ class Client(Agent):
                 break
             n = len(self.st.get("posted", []))
             off = self.a.offset + n * self.a.batches
-            seqs = wikitext_sequences(self.a.dataset, self.model["model_dir"], self.a.seq_len, self.a.batches, off)
+            if self.a.gen:  # prompts of --prompt-len tokens, generated up to --seq-len
+                from detgen.head import input_row
+                prompts = wikitext_sequences(self.a.dataset, self.model["model_dir"], self.a.prompt_len, self.a.batches, off)
+                seqs = [input_row(p, self.a.seq_len) for p in prompts]
+                stages = len(seqs) * (self.G + 1)
+                cmd = ["jobgen", self.key, self.model_id, input_root(seqs).hex(), str(stages), str(self.a.fee),
+                       str(self.a.deadline), str(self.a.k), str(self.a.n), str(self.a.seq_len), str(self.a.temp_milli)]
+            else:
+                seqs = wikitext_sequences(self.a.dataset, self.model["model_dir"], self.a.seq_len, self.a.batches, off)
+                stages = len(seqs) * self.G
+                cmd = ["jobpost", self.key, self.model_id, input_root(seqs).hex(), str(stages), str(self.a.fee),
+                       str(self.a.deadline), str(self.a.k), str(self.a.n), str(self.a.seq_len)]
             root = input_root(seqs).hex()
             self.data.put(f"/inputs/{root}.json", json.dumps({"batches": seqs}).encode())
             try:
-                r = self.chain.run("jobpost", self.key, self.model_id, root, str(len(seqs) * self.G), str(self.a.fee),
-                                   str(self.a.deadline), str(self.a.k), str(self.a.n), str(self.a.seq_len))
-                log(f"posted job {r['job'][:8]}: {len(seqs)} sequences, {len(seqs) * self.G} stages, fee {self.a.fee}")
+                r = self.chain.run(*cmd)
+                log(f"posted {'generation ' if self.a.gen else ''}job {r['job'][:8]}: {len(seqs)} sequences, {stages} stages, fee {self.a.fee}")
                 self.st.setdefault("posted", []).append({"job": r["job"], "height": h, "offset": off})
             except ChainError as e:
                 log(f"post: {e}")
@@ -717,14 +809,33 @@ class Client(Agent):
             if j["outputroot"] != "0" * 64 and "outputs_ok" not in p:
                 raw = self.data.get(f"/outputs/{p['job']}.npy")
                 if raw is not None:
-                    embs = np.load(io.BytesIO(raw))
-                    p["outputs_ok"] = output_root(list(embs)).hex() == j["outputroot"]
+                    outs = np.load(io.BytesIO(raw))
+                    if j.get("gen"):  # head-stage samples per batch: their roots make the output root
+                        from detgen.head import gen_output_root, head_output_root
+                        p["outputs_ok"] = gen_output_root([head_output_root(o) for o in outs]).hex() == j["outputroot"]
+                        if p["outputs_ok"]:
+                            self.show_generation(j, outs)
+                    else:
+                        p["outputs_ok"] = output_root(list(outs)).hex() == j["outputroot"]
                     p["delivered"] = h
                     log(f"job {p['job'][:8]}: outputs {'match' if p['outputs_ok'] else 'DO NOT match'} output_root")
             if j["status"] in ("settled", "expired", "failed", "aborted"):
                 p.update(final=j["status"], ended=h)
                 log(f"job {p['job'][:8]}: {j['status']} at height {h}")
             self.save()
+
+
+    def show_generation(self, j: dict, outs: np.ndarray):
+        """Log the first generated continuation (the client's view of a generation job)."""
+        try:
+            from transformers import AutoTokenizer
+            from .compute import prompt_of
+            rows = self.input_batches(j)
+            P = len(prompt_of(rows[0]))
+            tok = AutoTokenizer.from_pretrained(self.model["model_dir"])
+            log(f"job {j['id'][:8]} generated: {tok.decode([int(x) for x in outs[0][P - 1:, 0]])!r}"[:400])
+        except Exception as e:
+            log(f"job {j['id'][:8]}: could not decode the generation ({e})")
 
 
 # ---------------------------------------------------------------- curator (canary units)
@@ -944,6 +1055,9 @@ def main() -> None:
     ap.add_argument("--burst", type=int, default=1, help="client: jobs posted together each time")
     ap.add_argument("--batches", type=int, default=2)
     ap.add_argument("--seq-len", type=int, default=128)
+    ap.add_argument("--gen", action="store_true", help="client: post generation jobs (Rules 3)")
+    ap.add_argument("--prompt-len", type=int, default=32, help="client --gen: prompt tokens per sequence")
+    ap.add_argument("--temp-milli", type=int, default=700, help="client --gen: temperature in thousandths (0: greedy)")
     ap.add_argument("--offset", type=int, default=1000, help="first WikiText chunk (the pool uses 0-199)")
     ap.add_argument("--fee", type=int, default=3_000_000_000)
     ap.add_argument("--deadline", type=int, default=60)

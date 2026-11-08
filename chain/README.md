@@ -33,6 +33,7 @@ exactly as on unmodified Pearl.
 | 0016 | **Rules 2** (testnet run 1 findings, active on the testnet from height 1400): forced-error jackpots only for a catch on the decoy's wrong stage (record v2 with a stage key; jobs record the stage they were caught on), directed jobs, challenge bonds of `ChallengeBondBP` of the provider's bond; node: `getjobopresult`, failed job ops logged, catchers / directed / caught stage in `getjob` |
 | 0017 | `uwcctl sign` / `verify`: BIP-340 signatures by the P2TR output key over a 32-byte digest, verify prints the signer's account (the public data service's signed uploads) |
 | 0018 | **Rules 3: generation jobs**: a head stage per batch (final norm, lm_head scores in 1024-token chunks, chunk bests, Gumbel-max or greedy sample), generated tokens read by layer stage 0 from the head stage, output root over head output roots (head stages open with an output-root path), generation models commit norm + lm_head; encodings and state gain suffixes only when set (spec/generation.md) |
+| 0019 | uwcctl `jobgen`, `modelreg` with `"gen"`, `out_proof` in JSON reveals, `onestep` for generation stages; `getjob` reports `gen` and `tempmilli` |
 
 Design: `spec/job-module.md`, `spec/stage-program.md`, `spec/pool-and-watchers.md`. Results:
 `spec/step3-results.md`, `spec/step4-results.md`, `spec/step5-results.md`, `spec/step6-results.md`.
