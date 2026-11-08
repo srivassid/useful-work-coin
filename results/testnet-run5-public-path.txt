@@ -1,0 +1,26 @@
+Testnet run 5: public path through the droplet (2026-11-08 09:30 -), blocks 1582 -> 1700+.
+Droplet 165.232.182.224: seed node (uwc-node) + signed-upload data service (uwc-data --auth).
+Box 71: node (addpeer droplet), gateway, noise miners GPU 0 and 2, provider miner71 (--mine cuda:1),
+verifier0, verifier1, watcher0, client0; all agents use the droplet's data service.
+5090 box: only the uwc-miner package, default config (seed and data service = droplet), --jobs,
+--nolisten (reaches the network only through the droplet), new wallet, fresh model download.
+
+Droplet: synced 0 -> 1582 from box 71 at ~3.5 blocks/s. pearld RSS 250 MB with the default UTXO
+cache on the 458 MB droplet (800 MB swap in use) -> --utxocachemaxsize=32, GOMEMLIMIT=180MiB: 74 MB.
+Job data copied from box 71: inputs, outputs, req (26 MB; stagein answers left behind).
+
+Package (outside miner):
+  model download 5 min, sha256 checks ok, weights store 47 s, root matches MODEL_REG
+  synced from the droplet (969 -> 1596 while catching up), mining 160-220 TMAC/s on the 5090
+  auto-deposit into the jobs balance (20 coins; then 100 after raising the default reserve)
+  pool: claimed canary units 12, 13, 15 of a8884d32; 112 stages in 0.83 s on the GPU; committed;
+    served 12 stage inputs to box 71's verifiers through the droplet (signed uploads accepted);
+    revealed requested stages; watcher0 checked stage 35 of 36ea4971 from a served input
+  client jobs 8f53f847 and 0442e506 (posted 10:07:32): accepted 10:08:09/14, 224 stages in 0.08 s on
+    the GPU, committed 10:08:44, client0 fetched the outputs from the droplet: "outputs match
+    output_root" at 10:09:13 (101 s from post to verified outputs)
+  restart on the existing wallet: clean stop, model reload, deposit, new accepts
+Found and fixed: default --reserve 20 coins covered only two pool bonds (10 coins each) -> 100.
+Not a protocol fault: 3 run-4 disputes (2ea8c418, 5e28434c, 23cb8be4) of provider245, which is not
+running in this run, failed at block 1583 (an offline provider loses its game, as designed).
+Agents on box 71: 0 tracebacks.
