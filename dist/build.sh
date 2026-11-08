@@ -32,7 +32,7 @@ echo "[$(date +%T)] app"
 cp -a "$R/dist/uwc_miner" "$OUT/app/"
 cp -a "$R/miner/ampere/uwc_ampere" "$OUT/app/"
 mkdir -p "$OUT/app/runtime" "$OUT/app/verifier"
-cp -a "$R/runtime/agent" "$R/runtime/detgpu" "$R/runtime/detrt" "$R/runtime/artifacts" "$OUT/app/runtime/"
+cp -a "$R/runtime/agent" "$R/runtime/detgpu" "$R/runtime/detrt" "$R/runtime/detgen" "$R/runtime/artifacts" "$OUT/app/runtime/"
 cp -a "$R/verifier/forced_errors.py" "$OUT/app/verifier/"
 find "$OUT/app" -name __pycache__ -prune -exec rm -rf {} +
 printf '../../../../app\n../../../../app/runtime\n' > "$SP/uwc_app.pth"
@@ -40,17 +40,19 @@ printf '../../../../app\n../../../../app/runtime\n' > "$SP/uwc_app.pth"
 echo "[$(date +%T)] binaries and network files"
 for b in pearld uwcctl prlctl; do cp "$GOBIN/$b" "$OUT/bin/"; strip "$OUT/bin/$b" 2>/dev/null || true; done
 cp "$R/dist/testnet.json" "$OUT/share/"
-cp "$NETDIR/models/qwen3-1.7b.json" "$NETDIR/models/qwen3-1.7b.reg.json" "$OUT/share/models/"
+MODEL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["name"])' "$R/dist/testnet.json")
+cp "$NETDIR/models/$MODEL.json" "$NETDIR/models/$MODEL.reg.json" "$OUT/share/models/"
 cp "$NETDIR"/pool/*.json "$OUT/share/pool/"
 cp "$R/dist/uwc-miner" "$OUT/"
 cp "$R/dist/README.txt" "$OUT/"
 echo "$V" > "$OUT/VERSION"
 # the runtime hash the chain registered covers the deterministic runtime's sources: check the copy
-"$P" -E -s - "$OUT/share/models/qwen3-1.7b.json" <<'PY'
+"$P" -E -s - "$OUT/share/models/$MODEL.json" <<'PY'
 import json, sys
 from agent.model_info import runtime_hash
-want = json.load(open(sys.argv[1]))["runtime_hash"]
-got = runtime_hash().hex()
+info = json.load(open(sys.argv[1]))
+want = info["runtime_hash"]
+got = runtime_hash(info.get("gen", False)).hex()
 print("runtime hash", "ok" if got == want else f"MISMATCH {got} != {want}")
 sys.exit(got != want)
 PY

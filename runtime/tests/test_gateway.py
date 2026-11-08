@@ -23,6 +23,11 @@ D = 2048
 def test_roots_match_the_runtime():
     from agent.inputs import input_root
     from agent.proto import output_root
+    from detgen import head
+    out = np.random.default_rng(2).integers(0, 1 << 30, size=(15, 2)).astype(np.int32)
+    assert roots.head_output_root(out) == head.head_output_root(out) and roots.SENTINEL == head.SENTINEL
+    assert roots.gen_output_root([b"a" * 32, b"b" * 32]) == head.gen_output_root([b"a" * 32, b"b" * 32])
+    assert roots.input_root([[1, 2, roots.SENTINEL]]) == input_root([[1, 2, roots.SENTINEL]])
     rng = np.random.default_rng(1)
     for n in (1, 3, 7):
         batches = [list(map(int, rng.integers(0, 151000, size=int(rng.integers(1, 600))))) for _ in range(n)]

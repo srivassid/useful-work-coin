@@ -1,0 +1,23 @@
+[Unit]
+Description=UWC testnet job gateway (OpenAI-compatible embeddings and chat completions)
+After=uwc-node.service uwc-data.service
+Requires=uwc-node.service
+
+[Service]
+User=uwc
+Group=uwc
+WorkingDirectory=/opt/uwc/app
+Environment=HOME=/opt/uwc/gateway PYTHONPATH=/opt/uwc/app
+EnvironmentFile=/opt/uwc/gateway/env
+ExecStart=/opt/uwc/venv/bin/python -m agent.gateway --net /opt/uwc/net --data http://127.0.0.1:18692 --home /opt/uwc/gateway/state --model /opt/uwc/gateway/qwen3-1.7b-gen.json --model-name qwen3-1.7b --tokenizer /opt/uwc/gateway/tokenizer.json --bind 127.0.0.1:18693 --faucet-key /opt/uwc/gateway/faucet.json --faucet-coins 100 --cors-origin *
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/uwc/gateway
+PrivateTmp=true
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target

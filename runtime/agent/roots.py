@@ -50,3 +50,18 @@ def output_root(embeddings: list[np.ndarray]) -> bytes:
     """TRACE_COMMIT output_root: Merkle root over the row roots of each batch's embedding."""
     return merkle_root([_leaf_hash(b"out" + struct.pack("<I", b) + row_root(np.asarray(e, dtype=np.float32)))
                         for b, e in enumerate(embeddings)])
+
+
+SENTINEL = 0xFFFFFFFF  # detgen.head.SENTINEL: a generation input row's generated positions
+
+
+def head_output_root(out: np.ndarray) -> bytes:
+    """detgen.head.head_output_root: a head stage's samples [token, score bits] as stage-output leaves."""
+    return merkle_root([_leaf_hash(b"sout" + struct.pack("<I", t) + row_root(np.ascontiguousarray(r, dtype=np.int32)))
+                        for t, r in enumerate(np.asarray(out).astype(np.int32))])
+
+
+def gen_output_root(head_roots: list[bytes]) -> bytes:
+    """detgen.head.gen_output_root: a generation job's output root over its head output roots."""
+    return merkle_root([_leaf_hash(b"gout" + struct.pack("<I", b) + r) for b, r in enumerate(head_roots)])
+

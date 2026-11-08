@@ -46,7 +46,7 @@ import numpy as np
 
 from .chain import Chain, ChainError
 from .data import Data
-from .roots import input_root, output_root
+from .roots import SENTINEL, gen_output_root, head_output_root, input_root, output_root
 
 COIN = 100_000_000
 BUCKETS = (32, 64, 128, 256, 512)
@@ -400,7 +400,6 @@ class Gateway:
         """One job: embedding batches padded to L, or (temp_milli set) a generation job whose
         input rows are the prompts followed by the sentinel up to L."""
         if temp_milli is not None:
-            from detgen.head import SENTINEL
             batches = [seqs[i] + [SENTINEL] * (L - len(seqs[i])) for i in idx]
             cmd = ["jobgen", key["keyfile"], self.model_id, input_root(batches).hex(), str(len(batches) * (self.G + 1)),
                    str(fee), str(self.a.deadline), str(self.a.k), str(self.a.n), str(L), str(temp_milli)]
@@ -455,7 +454,6 @@ class Gateway:
     def deliver_gen(self, j: sqlite3.Row, cj: dict, heads: np.ndarray):
         """A generation job's samples: checked against the committed output root, then the
         generated tokens (positions P..T-1) become the request's result."""
-        from detgen.head import gen_output_root, head_output_root
         jid, rid = j["job"], j["request"]
         T = j["seq_len"]
         if heads.ndim != 3 or heads.shape[1:] != (T - 1, 2) or \
