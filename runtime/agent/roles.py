@@ -334,7 +334,7 @@ class Provider(Agent):
             for jid, e in self.chain.jobs("posted").items():
                 if e["client"] != self.account and jid not in self.st["jobs"]:
                     j = self.chain.job(jid)
-                    if j and j["model"] == self.model_id and j["deadline"] > h + 5 and self.batches(j) is not None:
+                    if j and j["model"] == self.model_id and j["deadline"] > h + 5 and self.input_batches(j) is not None:
                         bond = (j["fee"] * 5000 + 9999) // 10000
                         if not self.can_bond(bond, h):
                             break

@@ -273,6 +273,20 @@ class Data:
         self.url = url.rstrip("/")
         self.signer = signer
 
+    @staticmethod
+    def _retry(fn, tries: int = 3):
+        """Brief network failures (a timeout, a reset, a service restarting) are retried; HTTP
+        answers are not."""
+        for i in range(tries):
+            try:
+                return fn()
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+                if i == tries - 1:
+                    raise
+                time.sleep(2 * (i + 1))
+
     def put(self, path: str, data: bytes) -> None:
         req = urllib.request.Request(self.url + path, data=data, method="PUT")
         if self.signer is not None:
@@ -280,11 +294,11 @@ class Data:
                 req.add_header(SIG_HEADER, self.signer(put_digest(path, data)))
             except Exception:  # an older uwcctl without sign: fine for a LAN service without --auth
                 pass
-        urllib.request.urlopen(req, timeout=60).read()
+        self._retry(lambda: urllib.request.urlopen(req, timeout=60).read())
 
     def get(self, path: str) -> bytes | None:
         try:
-            return urllib.request.urlopen(self.url + path, timeout=60).read()
+            return self._retry(lambda: urllib.request.urlopen(self.url + path, timeout=60).read())
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
