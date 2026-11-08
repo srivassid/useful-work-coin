@@ -22,7 +22,7 @@ AI jobs
 This also runs paid AI jobs (Qwen3-1.7B embeddings) on the first GPU. The first time, it downloads
 the model (about 4 GB) and checks that it is the exact checkpoint the chain registered. While a
 job runs, mining on that GPU pauses, and the job itself mines. Jobs need a bond, so the miner
-keeps about 20 mined coins in your jobs balance (--reserve 0 turns that off).
+keeps about 100 mined coins in your jobs balance (--reserve 0 turns that off).
 
 Options
 -------

@@ -512,7 +512,7 @@ class Status:
     def auto_deposit(self, spend: int, jb: int):
         """With --jobs, keep the jobs balance near --reserve coins from mined coins (job bonds and
         pool claims are paid from it)."""
-        if self.job_gpu is None or self.a.reserve <= 0 or time.time() - self.deposit_t < 600:
+        if self.job_gpu is None or self.a.reserve <= 0 or time.time() - self.deposit_t < 180:
             return
         c = self.cfg["coin"]
         want = int(self.a.reserve * c)
@@ -598,7 +598,8 @@ def main():
         p.add_argument("--jobs", action="store_true", help="also run AI jobs (on --jobs-gpu, the first GPU by default)")
         p.add_argument("--jobs-gpu", type=int, default=None)
         p.add_argument("--max-jobs", type=int, default=None, help="jobs computed together in one GPU pass")
-        p.add_argument("--reserve", type=float, default=20, help="coins kept in the jobs balance from mining (0: off)")
+        p.add_argument("--reserve", type=float, default=100,
+                       help="coins kept in the jobs balance from mining, for job bonds (a pool unit bonds 10; 0: off)")
         p.add_argument("--address", default=None, help="pay mined blocks here instead of the wallet")
         p.add_argument("--peer", action="append", help="extra peer host:port (repeatable)")
         p.add_argument("--no-seeds", action="store_true", help="do not connect to the built-in seed nodes")
