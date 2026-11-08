@@ -1,0 +1,44 @@
+From c68bb998256a450d987950b80dd97a90aa87129b Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Sun, 8 Nov 2026 16:51:45 +0530
+Subject: [PATCH] Testnet: Rules 3 (generation jobs) from block 2120
+
+Replayed: a fresh node with this binary synced the testnet's 2073 blocks from the seed node and
+reached the same tip (8869f3af...).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NvNdLwU8j8WLX4mWzr
+---
+ node/chaincfg/uwc_testnet.go | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/node/chaincfg/uwc_testnet.go b/node/chaincfg/uwc_testnet.go
+index f06bd530..ef70a4e8 100644
+--- a/node/chaincfg/uwc_testnet.go
++++ b/node/chaincfg/uwc_testnet.go
+@@ -43,7 +43,10 @@ func uwcTestNetJobParams() *jobstate.Params {
+ 	// on the decoy's wrong stage, directed jobs, challenge bonds of 10% of the provider's bond.
+ 	r2 := p
+ 	r2.Rules, r2.ChallengeBondBP = 2, 1000
+-	p.Upgrades = []jobstate.Upgrade{{Height: UWCTestNetRules2Height, Params: r2}}
++	// Generation jobs (spec/generation.md): head stages, generation models.
++	r3 := r2
++	r3.Rules = 3
++	p.Upgrades = []jobstate.Upgrade{{Height: UWCTestNetRules2Height, Params: r2}, {Height: UWCTestNetRules3Height, Params: r3}}
+ 	return &p
+ }
+ 
+@@ -51,6 +54,10 @@ func uwcTestNetJobParams() *jobstate.Params {
+ // was scheduled; every node must run a Rules-2 binary before then).
+ const UWCTestNetRules2Height = 1400
+ 
++// UWCTestNetRules3Height is where the testnet adopts Rules 3, generation jobs (it stood at block
++// 2073 when this was scheduled; every node must run a Rules-3 binary before then).
++const UWCTestNetRules3Height = 2120
++
+ var uwcTestNetGenesisBlock = func() wire.MsgBlock {
+ 	b := wire.MsgBlock{
+ 		MsgHeader: wire.MsgHeader{
+-- 
+2.30.2
+
