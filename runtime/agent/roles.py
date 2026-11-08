@@ -83,6 +83,7 @@ class Agent:
         # long computations (whole jobs) run here, so the main loop can always answer reveals
         # and game rounds before their deadlines
         self.worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.worker_io = concurrent.futures.ThreadPoolExecutor(max_workers=1)  # uploads that must not hold up the GPU
         self.busy: concurrent.futures.Future | None = None
 
     @contextlib.contextmanager
@@ -496,8 +497,22 @@ class Provider(Agent):
         rt = self.rt
         t = time.time()
         mined0 = rt.miner.hashed if rt.miner else 0
+        from .compute import prompt_of
+        plen = [len(prompt_of(r)) for r in rows]
+        last = [0.0]
+
+        def stream(seqs):  # partial results for streaming clients, at most every --stream-every seconds
+            now = time.time()
+            if now - last[0] < self.a.stream_every:
+                return
+            last[0] = now
+            try:
+                body = json.dumps({"tokens": [sq[p:] for sq, p in zip(seqs, plen)]}).encode()
+                self.worker_io.submit(self.data.put, f"/stream/{jid}.json", body)
+            except Exception:
+                pass
         with self.gpu_pass():
-            seqs, roots, heads, out_root = rt.gen_job(rows, gen)
+            seqs, roots, heads, out_root = rt.gen_job(rows, gen, on_step=stream if self.a.stream_every > 0 else None)
         hashed = (rt.miner.hashed - mined0) if rt.miner else 0
         buf = io.BytesIO()
         np.save(buf, np.stack(heads).astype(np.int32))
@@ -1056,6 +1071,7 @@ def main() -> None:
     ap.add_argument("--batches", type=int, default=2)
     ap.add_argument("--seq-len", type=int, default=128)
     ap.add_argument("--gen", action="store_true", help="client: post generation jobs (Rules 3)")
+    ap.add_argument("--stream-every", type=float, default=0.5, help="provider: seconds between partial generation uploads (0: off)")
     ap.add_argument("--prompt-len", type=int, default=32, help="client --gen: prompt tokens per sequence")
     ap.add_argument("--temp-milli", type=int, default=700, help="client --gen: temperature in thousandths (0: greedy)")
     ap.add_argument("--offset", type=int, default=1000, help="first WikiText chunk (the pool uses 0-199)")

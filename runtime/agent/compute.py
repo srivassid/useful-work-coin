@@ -208,18 +208,18 @@ class Runtime:
         from detgen.head import run_head_stage
         return run_head_stage(self.m, torch.from_numpy(r2), gen.sampling(), rows=False).output
 
-    def generate(self, prompts: list[list[int]], T: int, gen: GenJob) -> list[list[int]]:
+    def generate(self, prompts: list[list[int]], T: int, gen: GenJob, on_step=None) -> list[list[int]]:
         """The full sequences of a generation job (deterministic: anyone gets the same)."""
         self.bind()
         if self.miner is not None:
             self.miner.refresh()
         if self.gpu and self.m.hd == 128:
             from detgen import fast
-            return fast.generate(self.m, prompts, T, gen.sampling())
+            return fast.generate(self.m, prompts, T, gen.sampling(), on_step=on_step)
         from detgen.generate import generate
         return [generate(self.m, p, T, gen.sampling()) for p in prompts]
 
-    def gen_job(self, rows: list[list[int]], gen: GenJob):
+    def gen_job(self, rows: list[list[int]], gen: GenJob, on_step=None):
         """A provider's generation job: (sequences, stage roots in stage order, head outputs per
         batch, the job's output root). last_gpu_s covers generation, layer stages and heads."""
         from detgen.head import gen_output_root, head_output_root
@@ -228,7 +228,7 @@ class Runtime:
         torch_sync()
         t = time.time()
         T = len(rows[0])
-        seqs = self.generate([prompt_of(r) for r in rows], T, gen)
+        seqs = self.generate([prompt_of(r) for r in rows], T, gen, on_step=on_step)
         roots, heads = [], []
         if self.gpu:
             from detgpu.sha import digest_bytes, stage_roots_gpu

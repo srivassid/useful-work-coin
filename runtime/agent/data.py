@@ -13,6 +13,7 @@ signature (uwcctl sign) over put_digest(path, body), and the chain decides who m
   outputs  only the job's provider
   req      the job's committee, or an account with a stake or --min-balance; capped per job
   stagein  only the job's provider, and only for an open request
+  stream   only the job's provider: a generation job's tokens so far, for streaming clients
 GET /units/<work_root>.json serves pool work lists (placed by the operator; agents check them
 against the category's work root), so a new pool category reaches every provider.
 """
@@ -33,11 +34,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 NAME = re.compile(r"^/((inputs|outputs)/[0-9a-f]{64}\.(json|npy)"
                   r"|(req|stagein)/[0-9a-f]{64}/[0-9]{1,6}-[0-9a-f]{32}\.json"
-                  r"|units/[0-9a-f]{64}\.json)$")
+                  r"|units/[0-9a-f]{64}\.json"
+                  r"|stream/[0-9a-f]{64}\.json)$")
 LISTING = re.compile(r"^/req/([0-9a-f]{64})/$")
 MAX_BODY = 256 << 20
 SIG_HEADER = "X-UWC-Sig"
-LIMITS = {"inputs": 16 << 20, "outputs": 64 << 20, "req": 1 << 10, "stagein": 32 << 20}  # with --auth
+LIMITS = {"inputs": 16 << 20, "outputs": 64 << 20, "req": 1 << 10, "stagein": 32 << 20, "stream": 1 << 20}  # with --auth
 REQ_PER_JOB, REQ_PER_SIGNER = 128, 32
 MIN_FREE = 1 << 30  # refuse uploads below this much free disk
 
@@ -98,9 +100,9 @@ class Policy:
         j = self.job(jid)
         if j is None:
             return 404, "unknown job"
-        if kind in ("outputs", "stagein"):
+        if kind in ("outputs", "stagein", "stream"):
             if signer != j.get("provider"):
-                return 403, "only the job's provider writes its outputs and stage inputs"
+                return 403, "only the job's provider writes its outputs, stage inputs and partial generations"
             if kind == "stagein" and not os.path.exists(os.path.join(root, "req", jid, path.split("/")[3])):
                 return 404, "no such stage-input request"
             return None

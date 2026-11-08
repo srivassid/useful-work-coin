@@ -67,13 +67,15 @@ class FakeChain:
             return {"txid": "00"}
         if cmd == "coins":
             return {"total": 0}
-        if cmd == "jobpost":
-            key, model, root, stages, fee, deadline, k, n, seq_len = args
+        if cmd in ("jobpost", "jobgen"):
+            key, model, root, stages, fee, deadline, k, n, seq_len = args[:9]
             acct = json.load(open(key))["acct"]
             self.balances[acct] -= int(fee)
             jid = f"{len(self.jobs) + 1:064x}"
             self.jobs[jid] = {"id": jid, "status": "posted", "inputroot": root, "fee": int(fee), "stages": int(stages),
                               "seqlen": int(seq_len), "outputroot": "0" * 64, "client": acct}
+            if cmd == "jobgen":
+                self.jobs[jid].update(gen=True, tempmilli=int(args[9]))
             return {"job": jid}
         raise AssertionError(cmd)
 
@@ -87,7 +89,7 @@ def world(tmp_path):
     threading.Thread(target=dsrv.serve_forever, daemon=True).start()
     data_url = f"http://127.0.0.1:{dsrv.server_address[1]}"
     model = tmp_path / "m.json"
-    json.dump({"layer_groups": 7, "cfg": {"MaxPos": 512, "D": D}}, open(model, "w"))
+    json.dump({"layer_groups": 7, "cfg": {"MaxPos": 512, "D": D}, "gen": True}, open(model, "w"))
     json.dump({"model": "ee" * 32}, open(tmp_path / "m.reg.json", "w"))
     fake = FakeChain()
     gwmod.Chain = lambda net: fake
@@ -95,7 +97,7 @@ def world(tmp_path):
                            tokenizer=TOKENIZER, pad_token="<|endoftext|>", price_per_1k=1.5, min_fee=0.5, deadline=60,
                            k=2, n=2, max_batch=64, attempts=3, fee_bump=1.5, give_up=1800, sync_timeout=30, poll=0.2,
                            signup_code="letmein", keys_per_ip=3, spend_cap=0, faucet_key=str(tmp_path / "faucet.json"),
-                           faucet_coins=100, faucet_fee_coins=2, cors_origin="*")
+                           faucet_coins=100, faucet_fee_coins=2, cors_origin="*", max_new=24, temperature=0.7)
     gw = gwmod.Gateway(a)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), gwmod.handler(gw))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -219,3 +221,94 @@ def test_sync_embeddings_openai_shape(world):
     stop.set()
     assert st == 200 and r["object"] == "list" and len(r["data"]) == 2
     assert len(r["data"][0]["embedding"]) == D and r["usage"]["prompt_tokens"] > 0 and r["uwc"]["trust"] == "committed"
+
+
+def provide_gen(fake, data_url, jid, gw, reply: str, stream_first: int | None = None):
+    """A provider of a generation job: samples whose generated part is reply + <|im_end|>, the
+    partial stream (if stream_first), and the commitment of the head-stage outputs."""
+    from detgen.head import SENTINEL, gen_output_root, head_output_root
+    j = fake.jobs[jid]
+    row = json.loads(urllib.request.urlopen(f"{data_url}/inputs/{j['inputroot']}.json").read())["batches"][0]
+    P, T = row.index(SENTINEL), j["seqlen"]
+    assert j["stages"] == 8 and len(row) == T and j.get("gen")
+    gen = gw.tok.encode(reply, add_special_tokens=False).ids + [gw.tok.token_to_id("<|im_end|>")]
+    gen = (gen + [0] * T)[:T - P]
+    if stream_first:
+        urllib.request.urlopen(urllib.request.Request(f"{data_url}/stream/{jid}.json", method="PUT",
+                                                      data=json.dumps({"tokens": [gen[:stream_first]]}).encode())).read()
+    heads = np.zeros((1, T - 1, 2), dtype=np.int32)
+    heads[0, P - 1:, 0] = gen
+    buf = io.BytesIO()
+    np.save(buf, heads)
+    urllib.request.urlopen(urllib.request.Request(f"{data_url}/outputs/{jid}.npy", data=buf.getvalue(), method="PUT")).read()
+    j.update(status="verify-commit", outputroot=gen_output_root([head_output_root(heads[0])]).hex())
+
+
+def test_chat_completion(world):
+    gw, fake, url, data_url = world
+    key = call(url, "POST", "/v1/keys", {"name": "c", "signup_code": "letmein"})[1]["api_key"]
+    assert call(url, "POST", "/v1/chat/completions", {"messages": "hi"}, key)[0] == 400
+    assert call(url, "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 900}, key)[0] == 400
+    threading.Thread(target=gw.run_worker, daemon=True).start()
+    stop = threading.Event()
+
+    def provider():
+        done = set()
+        while not stop.is_set():
+            for jid in list(fake.jobs):
+                if jid not in done:
+                    provide_gen(fake, data_url, jid, gw, "Paris is the capital of France.")
+                    done.add(jid)
+            stop.wait(0.2)
+    threading.Thread(target=provider, daemon=True).start()
+    st, r = call(url, "POST", "/v1/chat/completions",
+                 {"model": "qwen3-1.7b", "messages": [{"role": "user", "content": "What is the capital of France?"}],
+                  "temperature": 0.5}, key)
+    stop.set()
+    assert st == 200 and r["object"] == "chat.completion", r
+    assert r["choices"][0]["message"]["content"] == "Paris is the capital of France."
+    assert r["choices"][0]["finish_reason"] == "stop" and r["uwc"]["trust"] == "committed"
+    (jid,) = fake.jobs
+    assert fake.jobs[jid]["tempmilli"] == 500 and r["usage"]["completion_tokens"] == len(
+        gw.tok.encode("Paris is the capital of France.", add_special_tokens=False).ids) + 1
+
+
+def test_chat_stream(world):
+    gw, fake, url, data_url = world
+    key = call(url, "POST", "/v1/keys", {"name": "s", "signup_code": "letmein"})[1]["api_key"]
+    threading.Thread(target=gw.run_worker, daemon=True).start()
+    reply = "The quick brown fox jumps over the lazy dog."
+    stop = threading.Event()
+
+    def provider():
+        while not stop.is_set() and not fake.jobs:
+            stop.wait(0.1)
+        if stop.is_set():
+            return
+        (jid,) = fake.jobs
+        # a partial generation first, then the committed samples a moment later
+        from detgen.head import SENTINEL  # noqa: F401
+        toks = gw.tok.encode(reply, add_special_tokens=False).ids
+        urllib.request.urlopen(urllib.request.Request(f"{data_url}/stream/{jid}.json", method="PUT",
+                                                      data=json.dumps({"tokens": [toks[:4]]}).encode())).read()
+        stop.wait(1.5)
+        provide_gen(fake, data_url, jid, gw, reply)
+    threading.Thread(target=provider, daemon=True).start()
+    req = urllib.request.Request(url + "/v1/chat/completions", method="POST", data=json.dumps(
+        {"messages": [{"role": "user", "content": "Say the fox sentence."}], "stream": True}).encode())
+    req.add_header("Authorization", f"Bearer {key}")
+    events = []
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        assert resp.headers["Content-Type"] == "text/event-stream"
+        for line in resp:
+            line = line.decode().strip()
+            if line.startswith("data: "):
+                events.append(line[6:])
+    stop.set()
+    assert events[-1] == "[DONE]"
+    chunks = [json.loads(e) for e in events[:-1]]
+    text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert text == reply and len([c for c in chunks if c["choices"][0]["delta"].get("content")]) >= 2  # it streamed
+    last = chunks[-1]
+    assert last["choices"][0]["finish_reason"] == "stop" and last["uwc"]["trust"] == "committed"
+

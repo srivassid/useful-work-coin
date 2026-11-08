@@ -97,8 +97,9 @@ def sample(m: DetQwen3, hn: torch.Tensor, pos: torch.Tensor, s: Sampling) -> tup
 
 
 @torch.no_grad()
-def generate(m: DetQwen3, prompts: list[list[int]], T: int, s: Sampling) -> list[list[int]]:
-    """Every sequence: its prompt followed by generated tokens up to length T."""
+def generate(m: DetQwen3, prompts: list[list[int]], T: int, s: Sampling, on_step=None) -> list[list[int]]:
+    """Every sequence: its prompt followed by generated tokens up to length T. on_step(seqs), if
+    given, is called after every decoding step (a provider streams partial results from it)."""
     dev = m.device
     g = FastGen(m, len(prompts), T)
     seqs = [list(p) for p in prompts]
@@ -109,6 +110,8 @@ def generate(m: DetQwen3, prompts: list[list[int]], T: int, s: Sampling) -> list
         tok, _ = sample(m, hn, pos, s)
         for b, t in zip(bidx.tolist(), tok.tolist()):
             seqs[b].append(t)
+        if on_step is not None:
+            on_step(seqs)
         pos = pos + 1
         keep = pos < T - 1  # a sequence whose last token is written needs no further step
         bidx, pos, tok, hn = bidx[keep], pos[keep], tok[keep], hn[keep]
