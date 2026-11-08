@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from detgen.generate import generate
-from detgen.head import HC, HS, Sampling, head_program, head_weight_rows, logits, run_head_stage, uniform
+from detgen.head import (SENTINEL, Sampling, gen_output_root, head_output_root, head_program, head_weight_rows,
+                         input_row, logits, mismatch, run_head_stage, sequence, uniform)
 from detrt import core
 from detrt.qwen3 import DetQwen3
 from detrt.stage import run_stage
@@ -37,9 +38,9 @@ PROMPT = [int(x) for x in torch.randint(0, V, (9,), generator=torch.Generator().
 SAMPLERS = [Sampling(0), Sampling(800, bytes(range(32)))]
 
 
-def recompute(m, seq, P, s):
+def recompute(m, seq, s, rows=True):
     r2 = run_stage(m, torch.tensor(seq), None, 0, len(m.layers)).output
-    return run_head_stage(m, torch.from_numpy(r2), P, s, tokens=torch.tensor(seq))
+    return run_head_stage(m, torch.from_numpy(r2), s, rows=rows)
 
 
 @pytest.mark.parametrize("dev", DEVS)
@@ -48,10 +49,10 @@ def test_decode_equals_head_stage(hf, dev, s):
     m = DetQwen3(hf, dev, hadamard_block=64, mine=False)
     seq = generate(m, PROMPT, 24, s)
     assert seq[:9] == PROMPT and len(seq) == 24
-    tr = recompute(m, seq, 9, s)
-    assert tr.mismatch == -1
-    assert tr.output.tolist() == seq[9:]
-    assert len(tr.rows) == len(head_program(9, 24, 3)) == 15 * (2 + 3 + 1)
+    tr = recompute(m, seq, s)
+    assert mismatch(seq, tr.output, 9) == -1 and sequence(PROMPT, tr.output) == seq
+    assert len(tr.rows) == len(head_program(2, 24, 3)) == 23 * (2 + 2 * 3 + 1)
+    assert np.array_equal(recompute(m, seq, s, rows=False).output, tr.output)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -61,7 +62,8 @@ def test_cpu_equals_gpu(hf, s):
     for dev in ("cpu", "cuda"):
         m = DetQwen3(hf, dev, hadamard_block=64, mine=False)
         seqs.append(generate(m, PROMPT, 20, s))
-        roots.append(recompute(m, seqs[-1], 9, s).root)
+        tr = recompute(m, seqs[-1], s)
+        roots.append((tr.root, head_output_root(tr.output)))
     assert seqs[0] == seqs[1] and roots[0] == roots[1]
 
 
@@ -79,8 +81,7 @@ def test_a_wrong_token_is_found(hf):
     seq = generate(m, PROMPT, 20, s)
     bad = list(seq)
     bad[14] = (bad[14] + 1) % V
-    tr = recompute(m, bad, 9, s)
-    assert tr.mismatch == 13  # position 13's output is token 14
+    assert mismatch(bad, recompute(m, bad, s).output, 9) == 13  # position 13's sample is token 14
 
 
 def test_sampling_follows_the_seed(hf):
@@ -105,3 +106,12 @@ def test_head_weight_rows(hf):
     m = DetQwen3(hf, "cpu", hadamard_block=64, mine=False)
     rows = list(head_weight_rows(m))
     assert rows[0][0] == "norm" and len(rows) == 1 + V and rows[1][1].shape == (256 + 1,)
+
+
+def test_input_row_and_output_root():
+    row = input_row(PROMPT, 16)
+    assert row[:9] == PROMPT and row[9:] == [SENTINEL] * 7
+    out = np.arange(30, dtype=np.int32).reshape(15, 2)
+    r = head_output_root(out)
+    assert gen_output_root([r]) != gen_output_root([r, r]) and len(r) == 32
+
