@@ -6,7 +6,7 @@ import torch
 from detrt import core
 from detrt.qwen3 import DetQwen3
 from detrt.stage import program, run_stage, weights_tree
-from tests.test_detrt import DEVS, tiny_model
+from test_detrt import DEVS, tiny_model  # (a site-packages "tests" package can shadow tests.*)
 
 core.setup_determinism()
 
