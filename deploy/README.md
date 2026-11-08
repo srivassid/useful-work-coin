@@ -12,7 +12,9 @@ Layout:
 - `/opt/uwc/bin/`: pearld, uwcctl, prlctl (stripped builds with `-tags xmss,zkpow`)
 - `/opt/uwc/net/`: the node's network directory (`env`, `pearld.conf`, `rpcpass` mode 0600; `node/`,
   `logs/`; `bin` points at `../bin`). The data service reads jobs and accounts through it.
-- `/opt/uwc/data/`: the job files (inputs, outputs, stage-input requests and answers)
+- `/opt/uwc/data/`: the job files (inputs, outputs, stage-input requests and answers), plus
+  `units/<work_root>.json`, the pool work lists. These are read-only over HTTP; providers check
+  each one against the category's on-chain work root before using it.
 - `/opt/uwc/app/agent/`: the data service code
 
 The data service with `--auth` accepts only uploads signed with `uwcctl sign` (header
@@ -29,3 +31,12 @@ Unit files are in this folder. Update the code with:
 
     rsync -a runtime/agent/{__init__,data,chain}.py root@165.232.182.224:/opt/uwc/app/agent/ && \
       ssh root@165.232.182.224 systemctl restart uwc-data
+
+New pool category (box 71, council keys in ~/.uwc/testnet/keys):
+
+    python -m agent.worklist --split train --offset <next free chunk> --units 500 --per-unit 8 ... --out testnet/pool/<name>
+    cat testnet/pool/<name>.units.json | ssh root@165.232.182.224 "cat > /opt/uwc/data/units/<work_root>.json"
+    ./uwc.sh propose-category council0.json testnet/pool/<name>.category.json   # then: approve council1.json <proposal>
+
+The train split has about 19,600 chunks of 128 tokens; wiki-train8x128 (category 5e35742f, 2026-11-08)
+uses chunks 0-3999.

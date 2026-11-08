@@ -26,7 +26,7 @@ import numpy as np
 
 from .chain import Chain, ChainError
 from .data import Data
-from .inputs import input_root, unit_proof, wikitext_sequences
+from .inputs import check_units, input_root, unit_proof, wikitext_sequences
 from .game import GONESTEP, GREVEAL, move, write_rows
 from .proto import StageCommit, check_stage_input, job_id, output_root, positions, result_hash
 
@@ -67,6 +67,13 @@ class Agent:
             if path and os.path.exists(path):
                 doc = json.load(open(path))
                 self.lists[doc["work_root"]] = doc
+        cache = os.path.join(a.devnet, "agent", "units")  # work lists fetched from the data service
+        if os.path.isdir(cache):
+            for f in os.listdir(cache):
+                with contextlib.suppress(Exception):
+                    doc = json.load(open(os.path.join(cache, f)))
+                    self.lists[doc["work_root"]] = doc
+        self._list_tried: dict[str, float] = {}
         self.units = next(iter(self.lists.values()), None)
         self._cat_roots: dict[str, str] = {}
         self.path = os.path.join(a.devnet, "agent", f"{self.role}-{self.account[:8]}.json")
@@ -135,7 +142,7 @@ class Agent:
         """The job's token batches: a pool unit from the public work list, a client job from the
         data service (checked against input_root)."""
         if j.get("pool"):
-            doc = self.lists.get(self.work_root(j["pool"]))
+            doc = self.work_list(self.work_root(j["pool"]))
             if not doc:
                 return None
             u = doc["units"][j["unit"]]
@@ -205,6 +212,34 @@ class Agent:
             if j and j.get("disputes") and j["disputes"][0]["challenger"] == self.account:
                 self.play(j, as_provider=False)
 
+    def work_list(self, root: str) -> dict | None:
+        """A pool category's work list: from --units, the local cache, or the data service (checked
+        against the on-chain work root before use; a failed fetch is retried after 10 minutes)."""
+        if root in self.lists:
+            return self.lists[root]
+        if time.time() - self._list_tried.get(root, 0) < 600:
+            return None
+        self._list_tried[root] = time.time()
+        try:
+            raw = self.data.get(f"/units/{root}.json")
+        except Exception as e:
+            log(f"work list {root[:8]}: {e}")
+            return None
+        if raw is None:
+            return None
+        doc = json.loads(raw)
+        if not check_units(doc, root):
+            log(f"work list {root[:8]} from the data service does not match its work root")
+            return None
+        cache = os.path.join(self.a.devnet, "agent", "units")
+        os.makedirs(cache, exist_ok=True)
+        with open(os.path.join(cache, f"{root}.json"), "w") as f:
+            f.write(raw.decode())
+        self.lists[root] = doc
+        self.units = self.units or doc
+        log(f"work list {root[:8]}: {len(doc['units'])} units from the data service")
+        return doc
+
     def work_root(self, cid: str) -> str:
         if cid not in self._cat_roots:
             self._cat_roots[cid] = self.chain.category(cid)["workroot"]
@@ -268,7 +303,7 @@ class Provider(Agent):
                             self.st["jobs"][jid] = {"accepted": h, "tx": r["txid"], "bond": bond}
                             self.save()
                             return
-            if self.units and self.a.pool:
+            if self.a.pool:
                 self.claim(s)
         urgent = {"disputed": 0, "provider-reveal": 1, "accepted": 3}
         self.ready = {}
@@ -312,7 +347,8 @@ class Provider(Agent):
         self.busy = self.worker.submit(self.compute_jobs, items)
 
     def claim(self, s: dict):
-        cats = [(cid, c) for cid, c in s["categories"].items() if not c["retired"] and c["workroot"] in self.lists]
+        cats = [(cid, c) for cid, c in s["categories"].items()
+                if not c["retired"] and not c.get("closed") and self.work_list(c["workroot"]) is not None]
         random.shuffle(cats)
         cats.sort(key=lambda x: not (self.a.prefer and x[0].startswith(self.a.prefer)))
         for cid, c in cats:

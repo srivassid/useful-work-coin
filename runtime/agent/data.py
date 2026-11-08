@@ -13,6 +13,8 @@ signature (uwcctl sign) over put_digest(path, body), and the chain decides who m
   outputs  only the job's provider
   req      the job's committee, or an account with a stake or --min-balance; capped per job
   stagein  only the job's provider, and only for an open request
+GET /units/<work_root>.json serves pool work lists (placed by the operator; agents check them
+against the category's work root), so a new pool category reaches every provider.
 """
 from __future__ import annotations
 
@@ -30,7 +32,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 NAME = re.compile(r"^/((inputs|outputs)/[0-9a-f]{64}\.(json|npy)"
-                  r"|(req|stagein)/[0-9a-f]{64}/[0-9]{1,6}-[0-9a-f]{32}\.json)$")
+                  r"|(req|stagein)/[0-9a-f]{64}/[0-9]{1,6}-[0-9a-f]{32}\.json"
+                  r"|units/[0-9a-f]{64}\.json)$")
 LISTING = re.compile(r"^/req/([0-9a-f]{64})/$")
 MAX_BODY = 256 << 20
 SIG_HEADER = "X-UWC-Sig"
@@ -215,6 +218,9 @@ def handler(root: str, policy: Policy | None = None, slots: threading.BoundedSem
         def do_PUT(self):
             p = self._path()
             if p is None:
+                return
+            if self.path.startswith("/units/"):  # pool work lists are published by the operator
+                self.send_error(403, "work lists are read-only")
                 return
             try:
                 n = int(self.headers.get("Content-Length", 0))

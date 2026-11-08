@@ -20,6 +20,7 @@ def main() -> None:
     ap.add_argument("--units", type=int, default=200)
     ap.add_argument("--seq-len", type=int, default=128)
     ap.add_argument("--offset", type=int, default=0, help="first chunk of the text")
+    ap.add_argument("--split", default="test", help="WikiText-2 split (test, train, validation)")
     ap.add_argument("--groups", type=int, default=7)
     ap.add_argument("--per-unit", type=int, default=1, help="sequences per unit")
     ap.add_argument("--curator", required=True, help="curator account (hex)")
@@ -29,7 +30,9 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    seqs = wikitext_sequences(a.dataset, a.model_dir, a.seq_len, a.units * a.per_unit, a.offset)
+    seqs = wikitext_sequences(a.dataset, a.model_dir, a.seq_len, a.units * a.per_unit, a.offset, a.split)
+    if len(seqs) < a.units * a.per_unit:
+        raise SystemExit(f"the {a.split} split has only {len(seqs)} chunks from offset {a.offset}")
     doc = save_units(a.out + ".units.json", seqs, a.per_unit)
     spec = {"Model": a.model_id, "WorkRoot": doc["work_root"], "Units": len(doc["units"]), "StagesPerUnit": a.groups * a.per_unit,
             "SeqLen": a.seq_len, "K": 2, "N": 2, "UnitDeadline": 120, "CapBP": a.cap_bp, "InitPrice": a.init_price,

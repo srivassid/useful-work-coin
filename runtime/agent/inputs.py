@@ -34,12 +34,13 @@ def canary_leaf(unit: int, expected_roots: list[bytes], salt: bytes) -> bytes:
     return tag_hash("canary", struct.pack("<I", unit), merkle_root(expected_roots), salt)
 
 
-def wikitext_sequences(dataset_dir: str, tokenizer_dir: str, seq_len: int, count: int, offset: int = 0) -> list[list[int]]:
-    """Consecutive seq_len-token chunks of WikiText-2 (test split), public text for the devnet's jobs."""
+def wikitext_sequences(dataset_dir: str, tokenizer_dir: str, seq_len: int, count: int, offset: int = 0,
+                       split: str = "test") -> list[list[int]]:
+    """Consecutive seq_len-token chunks of a WikiText-2 split, public text for the network's jobs."""
     from datasets import load_from_disk
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(tokenizer_dir)
-    text = "\n\n".join(load_from_disk(dataset_dir)["test"]["text"])
+    text = "\n\n".join(load_from_disk(dataset_dir)[split]["text"])
     ids = tok(text, return_tensors=None)["input_ids"]
     out = []
     for i in range(offset, offset + count):
@@ -61,6 +62,22 @@ def save_units(path: str, seqs: list[list[int]], per_unit: int = 1) -> dict:
     with open(path, "w") as f:
         json.dump(doc, f)
     return doc
+
+
+def check_units(doc: dict, work_root: str) -> bool:
+    """A work list fetched from anywhere: every unit's input_root matches its tokens and the
+    units commit to work_root (the category's on-chain root)."""
+    try:
+        roots = []
+        for u in doc["units"]:
+            b = u["batches"] if "batches" in u else [u["tokens"]]
+            r = input_root(b)
+            if r.hex() != u["input_root"]:
+                return False
+            roots.append(r)
+        return merkle_root([unit_leaf(i, r) for i, r in enumerate(roots)]).hex() == work_root == doc.get("work_root")
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def unit_proof(doc: dict, i: int) -> list[str]:
