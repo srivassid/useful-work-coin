@@ -6,14 +6,26 @@ The design leaves delivery off-chain; on the devnet one LAN-only HTTP service ho
   /req/<job>/<stage>-<nonce>.json      a verifier asks for a stage's input; GET /req/<job>/ lists them
   /stagein/<job>/<stage>-<nonce>.json  the provider's answer: rows, Merkle proofs, previous stage opened
 Run: python -m agent.data serve --root devnet/data --bind 192.168.29.71:18680
+
+Public service (--auth --chain <network dir>): every PUT carries X-UWC-Sig, an account's
+signature (uwcctl sign) over put_digest(path, body), and the chain decides who may write what:
+  inputs   any account with a stake or --min-balance; write-once (readers check input_root)
+  outputs  only the job's provider
+  req      the job's committee, or an account with a stake or --min-balance; capped per job
+  stagein  only the job's provider, and only for an open request
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
 import re
+import shutil
+import subprocess
+import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -21,6 +33,87 @@ NAME = re.compile(r"^/((inputs|outputs)/[0-9a-f]{64}\.(json|npy)"
                   r"|(req|stagein)/[0-9a-f]{64}/[0-9]{1,6}-[0-9a-f]{32}\.json)$")
 LISTING = re.compile(r"^/req/([0-9a-f]{64})/$")
 MAX_BODY = 256 << 20
+SIG_HEADER = "X-UWC-Sig"
+LIMITS = {"inputs": 16 << 20, "outputs": 64 << 20, "req": 1 << 10, "stagein": 32 << 20}  # with --auth
+REQ_PER_JOB, REQ_PER_SIGNER = 128, 32
+MIN_FREE = 1 << 30  # refuse uploads below this much free disk
+
+
+def put_digest(path: str, body: bytes) -> bytes:
+    """What an upload's signature covers: the path and the body."""
+    return hashlib.sha256(b"uwc-data\0PUT\0" + path.encode() + b"\0" + hashlib.sha256(body).digest()).digest()
+
+
+class Policy:
+    """Who may write what (--auth): signatures checked with uwcctl verify, rights from the chain."""
+
+    def __init__(self, chain, min_balance: int):
+        self.chain = chain
+        self.min_balance = min_balance
+        self.lock = threading.Lock()
+        self.cache: dict[tuple, tuple[float, object]] = {}
+        self.req_count: dict[tuple[str, str], int] = {}
+
+    def _cached(self, key: tuple, fn, ttl: float = 10.0):
+        now = time.time()
+        with self.lock:
+            hit = self.cache.get(key)
+            if hit and now - hit[0] < ttl:
+                return hit[1]
+        val = fn()
+        with self.lock:
+            if len(self.cache) > 10_000:
+                self.cache.clear()
+            self.cache[key] = (now, val)
+        return val
+
+    def signer(self, sig: str | None, path: str, body: bytes) -> str | None:
+        if not sig or len(sig) > 200:
+            return None
+        r = subprocess.run([self.chain.bin, "verify", sig, put_digest(path, body).hex()], capture_output=True,
+                           text=True, env=self.chain.env, timeout=20)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def job(self, jid: str) -> dict | None:
+        return self._cached(("job", jid), lambda: self.chain.job(jid))
+
+    def funded(self, acct: str) -> bool:
+        a = self._cached(("acct", acct), lambda: self.chain.account(acct), ttl=60)
+        return int(a.get("stake") or 0) > 0 or int(a.get("balance") or 0) >= self.min_balance
+
+    def check(self, path: str, body: bytes, signer: str, root: str) -> tuple[int, str] | None:
+        """None if signer may write body at path, else (HTTP status, reason)."""
+        kind = path.split("/")[1]
+        if len(body) > LIMITS[kind]:
+            return 413, f"{kind} uploads are at most {LIMITS[kind]} bytes"
+        if kind == "inputs":
+            p = os.path.join(root, path.lstrip("/"))
+            if os.path.exists(p) and open(p, "rb").read() != body:
+                return 409, "inputs are write-once"
+            return None if self.funded(signer) else (403, "inputs need an account with a stake or balance")
+        jid = path.split("/")[2].split(".")[0]  # outputs/<job>.npy, req/<job>/..., stagein/<job>/...
+        j = self.job(jid)
+        if j is None:
+            return 404, "unknown job"
+        if kind in ("outputs", "stagein"):
+            if signer != j.get("provider"):
+                return 403, "only the job's provider writes its outputs and stage inputs"
+            if kind == "stagein" and not os.path.exists(os.path.join(root, "req", jid, path.split("/")[3])):
+                return 404, "no such stage-input request"
+            return None
+        # req
+        committee = {c.get("account") for c in (j.get("committee") or [])}
+        if signer not in committee and not self.funded(signer):
+            return 403, "stage-input requests need a committee seat, a stake or a balance"
+        d = os.path.join(root, "req", jid)
+        if os.path.isdir(d) and len(os.listdir(d)) >= REQ_PER_JOB:
+            return 429, "too many requests for this job"
+        with self.lock:
+            n = self.req_count.get((jid, signer), 0)
+            if n >= REQ_PER_SIGNER:
+                return 429, "too many requests from this account for this job"
+            self.req_count[(jid, signer)] = n + 1
+        return None
 
 
 METRICS_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -55,8 +148,26 @@ load();setInterval(load,60000);
 </script>"""
 
 
-def handler(root: str):
+def handler(root: str, policy: Policy | None = None, slots: threading.BoundedSemaphore | None = None):
     class H(BaseHTTPRequestHandler):
+        timeout = 30  # seconds a client may take to send a request
+
+        def handle_one_request(self):
+            if slots is not None and not slots.acquire(blocking=False):
+                try:
+                    self.raw_requestline = self.rfile.readline(65537)
+                    if self.parse_request():
+                        self.send_error(503, "busy")
+                except Exception:
+                    pass
+                self.close_connection = True
+                return
+            try:
+                super().handle_one_request()
+            finally:
+                if slots is not None:
+                    slots.release()
+
         def _path(self):
             if not NAME.match(self.path):
                 self.send_error(404)
@@ -105,11 +216,35 @@ def handler(root: str):
             p = self._path()
             if p is None:
                 return
-            n = int(self.headers.get("Content-Length", 0))
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                n = -1
             if n <= 0 or n > MAX_BODY:
                 self.send_error(400)
                 return
+            if policy is not None:
+                kind = self.path.split("/")[1]
+                if n > LIMITS[kind]:
+                    self.send_error(413, f"{kind} uploads are at most {LIMITS[kind]} bytes")
+                    return
+                if shutil.disk_usage(root).free < MIN_FREE:
+                    self.send_error(507, "the data service is full")
+                    return
             data = self.rfile.read(n)
+            if policy is not None:
+                try:
+                    who = policy.signer(self.headers.get(SIG_HEADER), self.path, data)
+                    if who is None:
+                        self.send_error(401, f"a valid {SIG_HEADER} signature is required")
+                        return
+                    bad = policy.check(self.path, data, who, root)
+                except Exception as e:  # the node is unreachable: refuse rather than guess
+                    self.send_error(503, f"cannot check the upload: {type(e).__name__}")
+                    return
+                if bad:
+                    self.send_error(*bad)
+                    return
             os.makedirs(os.path.dirname(p), exist_ok=True)
             tmp = p + ".tmp"
             with open(tmp, "wb") as f:
@@ -124,11 +259,19 @@ def handler(root: str):
 
 
 class Data:
-    def __init__(self, url: str):
+    """Client. signer(digest) -> "<pubkey>:<sig>" signs uploads (needed by a --auth service)."""
+
+    def __init__(self, url: str, signer=None):
         self.url = url.rstrip("/")
+        self.signer = signer
 
     def put(self, path: str, data: bytes) -> None:
         req = urllib.request.Request(self.url + path, data=data, method="PUT")
+        if self.signer is not None:
+            try:
+                req.add_header(SIG_HEADER, self.signer(put_digest(path, data)))
+            except Exception:  # an older uwcctl without sign: fine for a LAN service without --auth
+                pass
         urllib.request.urlopen(req, timeout=60).read()
 
     def get(self, path: str) -> bytes | None:
@@ -145,10 +288,22 @@ def main() -> None:
     ap.add_argument("cmd", choices=["serve"])
     ap.add_argument("--root", required=True)
     ap.add_argument("--bind", required=True)
+    ap.add_argument("--auth", action="store_true", help="require signed uploads, rights from the chain (public use)")
+    ap.add_argument("--chain", default=None, help="--auth: network directory (env, bin/uwcctl) of a local node")
+    ap.add_argument("--min-balance", type=int, default=100_000_000, help="--auth: balance that lets an account upload inputs and requests")
+    ap.add_argument("--max-conn", type=int, default=64, help="requests handled at once")
     a = ap.parse_args()
     host, port = a.bind.rsplit(":", 1)
     os.makedirs(a.root, exist_ok=True)
-    ThreadingHTTPServer((host, int(port)), handler(os.path.abspath(a.root))).serve_forever()
+    policy = None
+    if a.auth:
+        from .chain import Chain
+        if not a.chain:
+            ap.error("--auth needs --chain")
+        policy = Policy(Chain(a.chain), a.min_balance)
+    srv = ThreadingHTTPServer((host, int(port)), handler(os.path.abspath(a.root), policy, threading.BoundedSemaphore(a.max_conn)))
+    srv.daemon_threads = True
+    srv.serve_forever()
 
 
 if __name__ == "__main__":

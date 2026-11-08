@@ -57,7 +57,7 @@ class Agent:
         self.key = os.path.expanduser(a.key)
         info = self.chain.key_info(self.key)
         self.account = info["account"]
-        self.data = Data(a.data)
+        self.data = Data(a.data, signer=lambda d: self.chain.run("sign", self.key, d.hex()).strip())
         self.model = json.load(open(a.model))
         self.model_id = json.load(open(a.model.replace(".json", ".reg.json")))["model"]
         self.G = self.model["layer_groups"]

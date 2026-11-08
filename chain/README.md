@@ -31,6 +31,7 @@ exactly as on unmodified Pearl.
 | 0014 | stages committed by their output roots; full traces only in disputes |
 | 0015 | testnet genesis timestamp in the past |
 | 0016 | **Rules 2** (testnet run 1 findings, active on the testnet from height 1400): forced-error jackpots only for a catch on the decoy's wrong stage (record v2 with a stage key; jobs record the stage they were caught on), directed jobs, challenge bonds of `ChallengeBondBP` of the provider's bond; node: `getjobopresult`, failed job ops logged, catchers / directed / caught stage in `getjob` |
+| 0017 | `uwcctl sign` / `verify`: BIP-340 signatures by the P2TR output key over a 32-byte digest, verify prints the signer's account (the public data service's signed uploads) |
 
 Design: `spec/job-module.md`, `spec/stage-program.md`, `spec/pool-and-watchers.md`. Results:
 `spec/step3-results.md`, `spec/step4-results.md`, `spec/step5-results.md`, `spec/step6-results.md`.

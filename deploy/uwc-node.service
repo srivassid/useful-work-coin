@@ -1,0 +1,21 @@
+[Unit]
+Description=UWC testnet seed node (pearld)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=uwc
+Group=uwc
+ExecStart=/opt/uwc/bin/pearld --uwctestnet --configfile=/opt/uwc/net/pearld.conf --datadir=/opt/uwc/net/node --logdir=/opt/uwc/net/logs --listen=0.0.0.0:18690 --externalip=165.232.182.224 --rpclisten=127.0.0.1:18691 --notls --maxpeers=125 --debuglevel=info
+Environment=GOMEMLIMIT=256MiB HOME=/opt/uwc/net
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=8192
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/uwc/net
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

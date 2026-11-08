@@ -1,0 +1,95 @@
+From 67e4416fa3675fd31dea5ee147f3bdc06960f9f2 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Sun, 8 Nov 2026 09:25:03 +0530
+Subject: [PATCH] uwcctl sign/verify: BIP-340 signatures by the P2TR output key
+ for off-chain messages
+
+The data service's signed uploads: sign prints <x-only pubkey>:<sig> over a 32-byte digest;
+verify checks it and prints the signer's account (sha256 of the P2TR script with that key).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NvNdLwU8j8WLX4mWzr
+---
+ node/cmd/uwcctl/main.go | 48 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index df3a4540..b931d195 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -13,6 +13,7 @@ import (
+ 	"os"
+ 	"strconv"
+ 
++	"github.com/pearl-research-labs/pearl/node/btcec/schnorr"
+ 	"github.com/pearl-research-labs/pearl/node/btcutil"
+ 	"github.com/pearl-research-labs/pearl/node/chaincfg"
+ 	"github.com/pearl-research-labs/pearl/node/jobstate"
+@@ -26,6 +27,8 @@ const help = `usage: uwcctl <command> [args]
+ keys
+   keygen <file>                       new key; prints its account and address
+   info <key>                          account, P2TR script and address
++  sign <key> <digest>                 BIP-340 signature of a 32-byte digest by the key's output key: <pubkey>:<sig>
++  verify <pubkey:sig> <digest>        check a sign result; prints the signer's account
+ 
+ money
+   coins <key>                         spendable outputs of the key
+@@ -169,6 +172,24 @@ func main() {
+ 	case "info":
+ 		need(args, 1)
+ 		printKey(key(args[0]))
++	case "sign":
++		// Off-chain messages (the data service's uploads): signed by the taproot output key, whose
++		// x-only public key is the P2TR script's program, so the signer's account follows from it.
++		need(args, 2)
++		k, d := key(args[0]), hash32(args[1])
++		tw := txscript.TweakTaprootPrivKey(*k.Priv, nil)
++		sig, err := schnorr.Sign(tw, d[:])
++		if err != nil {
++			die(err)
++		}
++		fmt.Printf("%s:%s\n", hx(schnorr.SerializePubKey(tw.PubKey())), hx(sig.Serialize()))
++	case "verify":
++		need(args, 2)
++		acct, err := verifySig(args[0], hash32(args[1]))
++		if err != nil {
++			die(err)
++		}
++		fmt.Println(hx(acct[:]))
+ 	case "coins":
+ 		need(args, 1)
+ 		coins, err := client().Coins(key(args[0]))
+@@ -354,3 +375,30 @@ func printKey(k *uwcclient.Key) {
+ 	a, _ := k.Address(netParams)
+ 	fmt.Printf("account %s\nscript  %s\naddress %s\n", hx(k.Account[:]), hx(k.Script), a.EncodeAddress())
+ }
++
++// verifySig checks "<x-only pubkey hex>:<signature hex>" over digest and returns the account of
++// the P2TR output with that key.
++func verifySig(s string, digest jobstate.Hash) (jobstate.AccountID, error) {
++	var none jobstate.AccountID
++	if len(s) != 64+1+128 || s[64] != ':' {
++		return none, fmt.Errorf("signature must be <32-byte pubkey hex>:<64-byte sig hex>")
++	}
++	pkb, err1 := hex.DecodeString(s[:64])
++	sb, err2 := hex.DecodeString(s[65:])
++	if err1 != nil || err2 != nil {
++		return none, fmt.Errorf("bad hex")
++	}
++	pk, err := schnorr.ParsePubKey(pkb)
++	if err != nil {
++		return none, err
++	}
++	sig, err := schnorr.ParseSignature(sb)
++	if err != nil {
++		return none, err
++	}
++	if !sig.Verify(digest[:], pk) {
++		return none, fmt.Errorf("signature does not verify")
++	}
++	script := append([]byte{txscript.OP_1, txscript.OP_DATA_32}, pkb...)
++	return jobstate.AccountForScript(script), nil
++}
+-- 
+2.30.2
+
