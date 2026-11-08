@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 
 import numpy as np
@@ -38,6 +39,8 @@ def main() -> None:
     ap.add_argument("--refresh", type=float, default=1.0, help="seconds between getMiningInfo polls")
     ap.add_argument("--stats", default=None, help="append one JSON line per interval")
     ap.add_argument("--interval", type=float, default=30.0)
+    ap.add_argument("--pause-file", default=None,
+                    help="pause while this file exists (a job agent on the same GPU creates it for its GPU passes)")
     a = ap.parse_args()
 
     if ":" in a.gateway:
@@ -45,7 +48,15 @@ def main() -> None:
         cfg_rpc = MinerRpcConfig(transport="tcp", host=host, port=int(port), socket_path=None)
     else:
         cfg_rpc = MinerRpcConfig(transport="uds", socket_path=a.gateway)
-    client = MiningClient(cfg_rpc)
+    for attempt in range(60):  # the gateway may still be starting
+        try:
+            client = MiningClient(cfg_rpc)
+            break
+        except OSError as e:
+            if attempt == 59:
+                raise
+            print(f"gateway not up yet ({e}), retrying", flush=True)
+            time.sleep(2)
 
     def reconnect():
         nonlocal client
@@ -72,7 +83,13 @@ def main() -> None:
     last_poll = 0.0
     t0, macs, attempts, wins_n, submitted = time.time(), 0, 0, 0, 0
     print(f"mining on {torch.cuda.get_device_name(dev)}: m={a.m} n={a.n} k={a.k} r={a.rank}", flush=True)
+    paused = 0.0
     while True:
+        if a.pause_file and os.path.exists(a.pause_file):
+            t_p = time.time()
+            time.sleep(0.02)
+            paused += time.time() - t_p
+            continue
         now = time.time()
         if job is None or now - last_poll > a.refresh:
             last_poll = now
@@ -115,12 +132,12 @@ def main() -> None:
             job = None  # fetch the next template
         if now - t0 >= a.interval:
             rec = {"t": now, "device": torch.cuda.get_device_name(dev), "secs": now - t0, "macs": macs,
-                   "macs_per_s": macs / (now - t0), "attempts": attempts, "wins": wins_n, "submitted": submitted}
+                   "macs_per_s": macs / (now - t0), "attempts": attempts, "wins": wins_n, "submitted": submitted, "paused_s": round(paused, 1)}
             print(json.dumps(rec), flush=True)
             if a.stats:
                 with open(a.stats, "a") as f:
                     f.write(json.dumps(rec) + "\n")
-            t0, macs, attempts, wins_n, submitted = now, 0, 0, 0, 0
+            t0, macs, attempts, wins_n, submitted, paused = now, 0, 0, 0, 0, 0.0
 
 
 if __name__ == "__main__":

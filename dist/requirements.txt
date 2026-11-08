@@ -1,0 +1,21 @@
+# Runtime packages of the uwc-miner bundle (versions of the tested testnet environment).
+# torch comes from the CUDA 13.0 index (uv pip install --torch-backend cu130).
+torch==2.11.0
+numpy==2.5.4
+cupy-cuda13x==14.2.0
+blake3==1.0.11
+transformers==5.22.1
+tokenizers==0.23.3
+accelerate==1.15.0
+safetensors==0.8.0
+huggingface-hub==2.4.0
+aiohttp==3.14.5
+bitcoin-utils==0.8.8
+fastjsonschema==2.22.3
+prometheus-client==0.26.0
+pybase64==1.5.1
+pydantic==2.14.3
+pydantic-settings==2.16.2
+pyyaml==6.0.3
+loguru==0.7.3
+psutil==7.2.2

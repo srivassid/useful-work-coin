@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import hashlib
 import io
 import json
@@ -76,6 +77,19 @@ class Agent:
         # and game rounds before their deadlines
         self.worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.busy: concurrent.futures.Future | None = None
+
+    @contextlib.contextmanager
+    def gpu_pass(self):
+        """Pause a noise miner sharing this GPU (--pause-file) for the length of a GPU pass."""
+        p = getattr(self.a, "pause_file", None)
+        if p:
+            open(p, "w").close()
+        try:
+            yield
+        finally:
+            if p:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(p)
 
     rt_lock = threading.Lock()
 
@@ -386,10 +400,12 @@ class Provider(Agent):
     def compute_jobs(self, items: list[tuple[str, list[list[int]]]]):
         """One GPU pass over several jobs; each job gets its own salts, commitment and outputs.
         Its GPU time and hashed MACs are the pass's, split by its share of the tokens."""
+        rt = self.rt  # loads the model first, outside the pause
         t = time.time()
-        mined0 = self.rt.miner.hashed if self.rt.miner else 0
-        torch_sync()
-        res = self.rt.jobs_roots([b for _, b in items], tokens=self.a.batch_tokens)
+        mined0 = rt.miner.hashed if rt.miner else 0
+        with self.gpu_pass():
+            torch_sync()
+            res = rt.jobs_roots([b for _, b in items], tokens=self.a.batch_tokens)
         gpu_s = self.rt.last_gpu_s
         hashed = (self.rt.miner.hashed - mined0) if self.rt.miner else 0
         tokens = [sum(len(x) for x in b) for _, b in items]
@@ -450,8 +466,10 @@ class Provider(Agent):
     def serve_input(self, jid: str, name: str, stage: int, b: list[list[int]]):
         import base64
         try:
+            rt = self.rt
             t = time.time()
-            pk = self.rt.stage_input(b, stage)
+            with self.gpu_pass():
+                pk = rt.stage_input(b, stage)
             js = self.st["jobs"][jid]
             doc = {"stage": stage, "shape": list(pk["rows"].shape), "proofs": pk["proofs"],
                    "reveal": self.commit_of(js).reveal(stage - 1),
@@ -874,6 +892,7 @@ def main() -> None:
     ap.add_argument("--pool", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--prefer", default="", help="provider: claim from categories with this id prefix first")
     ap.add_argument("--mine", action="store_true", help="provider: mine on every job GEMM (needs this box's gateway)")
+    ap.add_argument("--pause-file", default=None, help="provider: exists during GPU passes (pauses a noise miner on the GPU)")
     # verifier
     ap.add_argument("--stake", type=int, default=100_000_000)
     ap.add_argument("--fetch-inputs", action=argparse.BooleanOptionalAction, default=True,

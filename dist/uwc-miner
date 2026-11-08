@@ -1,0 +1,4 @@
+#!/bin/sh
+# Useful-Work Coin testnet miner. ./uwc-miner --help
+HERE=$(dirname "$(readlink -f "$0")")
+exec "$HERE/python/bin/python3" -E -s -u -m uwc_miner "$@"
