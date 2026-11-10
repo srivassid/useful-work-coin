@@ -7,7 +7,7 @@
 #   testnet-dir  a testnet network directory: models/qwen3-1.7b{,.reg}.json and pool/*.json
 #   out-dir      where uwc-miner-<version>/ and its .tar.gz go
 #
-# Needs uv and cargo (py-pearl-mining is built from source). PEARL (default <repo>/ext/pearl)
+# Needs uv (or UV=<path>) and cargo (py-pearl-mining is built from source). PEARL (default <repo>/ext/pearl)
 # points at the Pearl fork; VERSION overrides the version string.
 set -euo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
@@ -16,18 +16,19 @@ PEARL=${PEARL:-$R/ext/pearl}
 V=${VERSION:-testnet-$(date +%Y%m%d)}
 OUT=$OUTDIR/uwc-miner-$V
 export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH
+UV=${UV:-uv}  # a uv new enough for --torch-backend cu130 (0.13 works)
 rm -rf "$OUT"; mkdir -p "$OUT"/{bin,app,share/models,share/pool}
 echo "[$(date +%T)] python"
-uv python install 3.12 >/dev/null
-PYSRC=$(dirname "$(dirname "$(readlink -f "$(uv python find 3.12)")")")
+"$UV" python install 3.12 >/dev/null
+PYSRC=$(dirname "$(dirname "$(readlink -f "$("$UV" python find 3.12)")")")
 cp -a "$PYSRC" "$OUT/python"
 rm -f "$OUT"/python/lib/python3.12/EXTERNALLY-MANAGED
 P=$OUT/python/bin/python3.12
 SP=$OUT/python/lib/python3.12/site-packages
 echo "[$(date +%T)] packages"
-uv pip install --python "$P" --torch-backend cu130 -r "$R/dist/requirements.txt"
-uv pip install --python "$P" --no-deps "$PEARL/miner/miner-utils" "$PEARL/miner/pearl-gateway" "$PEARL/miner/miner-base"
-uv pip install --python "$P" --no-deps "$PEARL/py-pearl-mining"
+"$UV" pip install --python "$P" --torch-backend cu130 -r "$R/dist/requirements.txt"
+"$UV" pip install --python "$P" --no-deps "$PEARL/miner/miner-utils" "$PEARL/miner/pearl-gateway" "$PEARL/miner/miner-base"
+"$UV" pip install --python "$P" --no-deps "$PEARL/py-pearl-mining"
 echo "[$(date +%T)] app"
 cp -a "$R/dist/uwc_miner" "$OUT/app/"
 cp -a "$R/miner/ampere/uwc_ampere" "$OUT/app/"
