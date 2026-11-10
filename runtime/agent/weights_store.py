@@ -53,10 +53,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="model json from agent.model_info")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--device", default="cpu", help="cuda:N: quantized weights on that GPU (a CPU runtime also keeps "
+                    "float64 copies of every matrix: 8 bytes per weight). The rows are the same either way.")
     a = ap.parse_args()
     info = json.load(open(a.model))
     t = time.time()
-    m = load(info["model_dir"], "cpu", info["rotation_block"], info["cfg"]["MaxPos"])
+    m = load(info["model_dir"], a.device, info["rotation_block"], info["cfg"]["MaxPos"])
     meta = export(m, a.out, gen=info.get("gen", False))
     ok = meta["weights_root"] == info["weights_root"]
     print(json.dumps(meta), "matches MODEL_REG" if ok else "DOES NOT MATCH MODEL_REG", f"{time.time() - t:.0f}s")

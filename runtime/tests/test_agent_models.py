@@ -65,3 +65,36 @@ def test_single_model_as_before():
         assert list(a.models) == ["aa" * 32] and a.G == 7 and a.model_path == qwen
         a.load_models()
         assert built == [qwen]
+
+
+def test_provider_claims_only_its_model():
+    """Several models' pool categories are open (Rules 4): a provider claims units of its own model
+    only, and never computes a job of a model it does not run."""
+    from agent import roles
+    with tempfile.TemporaryDirectory() as d:
+        qwen = write_model(d, "qwen", "aa" * 32, "/m/Qwen3-1.7B", 7)
+        p = object.__new__(roles.Provider)
+        p.a = types.SimpleNamespace(devnet=d, device="cpu", engine="detgpu", mine=False, prefer="")
+        p.init_models(qwen, "")
+        doc = {"work_root": "77" * 32, "units": [{"input_root": "00" * 32, "batches": [[1, 2]]}] * 3}
+        p.work_list = lambda root: doc
+        p.lists = {doc["work_root"]: doc}
+        p.can_bond = lambda bond, h: True
+        p.st, p.path = {"jobs": {}}, os.path.join(d, "state.json")
+        sent = []
+        p.send = lambda ops, what: sent.append(ops) or {"job": "jj" * 32, "txid": "t"}
+        p.chain = types.SimpleNamespace(jobs=lambda status=None: {})
+        cat = lambda model: {"retired": False, "workroot": "77" * 32, "units": 3, "price": 2_000_000_000, "model": model}
+        s = {"height": 10, "categories": {"c1" * 32: cat("cc" * 32), "c2" * 32: cat("dd" * 32)}}
+        p.claim(s)
+        assert sent == []                                   # no category of its model: nothing claimed
+        s["categories"]["c3" * 32] = cat("aa" * 32)
+        p.claim(s)
+        assert len(sent) == 1 and sent[0][0]["job"] == "c3" * 32
+        # a job of another model where this provider is the provider (an older version's claim)
+        p.account = "pp" * 32
+        p.chain = types.SimpleNamespace(job=lambda jid: {"id": jid, "provider": "pp" * 32, "model": "cc" * 32,
+                                                         "status": "accepted", "pool": "c1" * 32, "unit": 0})
+        p.ready, p.gen_ready = {}, {}
+        p.advance("ff" * 32)
+        assert p.ready == {} and p.st["jobs"]["ff" * 32]["foreign_model"] == "cc" * 32

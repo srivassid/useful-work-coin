@@ -527,8 +527,11 @@ class Provider(Agent):
         self.busy = self.submit(f"pass {' '.join(x[:8] for x, _ in items)}", self.compute_jobs, items)
 
     def claim(self, s: dict):
+        # only this provider's model: with Rules 4 several models' categories are open at once,
+        # and a unit computed with another model's runtime commits wrong roots
         cats = [(cid, c) for cid, c in s["categories"].items()
-                if not c["retired"] and not c.get("closed") and self.work_list(c["workroot"]) is not None]
+                if not c["retired"] and not c.get("closed") and c.get("model") == self.model_id
+                and self.work_list(c["workroot"]) is not None]
         random.shuffle(cats)
         cats.sort(key=lambda x: not (self.a.prefer and x[0].startswith(self.a.prefer)))
         for cid, c in cats:
@@ -561,6 +564,14 @@ class Provider(Agent):
         js = self.st["jobs"].setdefault(jid, {})
         if j["provider"] != self.account:
             return  # our accept lost the race (or is not mined yet): nothing to compute or commit
+        if j["model"] not in self.models:
+            # a job of a model this provider does not run (claimed by a version without the model
+            # check): never compute it; its bond is lost when it expires, which is better than wrong roots
+            if not js.get("foreign_model"):
+                js["foreign_model"] = j["model"]
+                log(f"job {jid[:8]} is for model {j['model'][:8]}, which this provider does not run: left to expire")
+                self.save()
+            return
         if j["status"] == "accepted" and "roots" not in js:
             b = self.input_batches(j) if j.get("gen") else self.job_batches(j)
             if b is not None:
