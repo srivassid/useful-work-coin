@@ -144,7 +144,7 @@ def layer_fused(m: DetQwen3, L, x: torch.Tensor, B: int, T: int) -> torch.Tensor
     H, Hkv = m.H, m.Hkv
     q1, s1 = kernels.rmsnorm_quant(x, L["in_norm"], m.eps, L["qkv"].bs)
     qq, qs, kq, ks, vq, vs = kernels.qkv_post(L["qkv"].int_gemm(q1), s1, L["qkv"].sw, L["q_norm"], L["k_norm"],
-                                              m.cos[:T], m.sin[:T], T, H, Hkv, m.eps)
+                                              m.cos[:T], m.sin[:T], T, H, Hkv, m.eps, m.qk_norm)
     oc = kernels.attention(qq, qs, kq, ks, vq, vs, B, T, H, Hkv, m.inv_sqrt_hd)
     q2, s2 = kernels.quant_act(oc, L["o"].bs)
     r1 = kernels.dequant_residual(L["o"].int_gemm(q2), s2, L["o"].sw, x)
@@ -180,8 +180,8 @@ def stage_outputs(m: DetQwen3, tokens: torch.Tensor | None, x: torch.Tensor | No
             continue
         qkv = norm_linear(L, "in_norm", "qkv", x, m.eps)
         q, k, v = torch.split(qkv, [H * hd, Hkv * hd, Hkv * hd], dim=-1)
-        qn = det_rmsnorm(q.reshape(N, H, hd), L["q_norm"], m.eps)
-        kn = det_rmsnorm(k.reshape(N, Hkv, hd), L["k_norm"], m.eps)
+        qn = det_rmsnorm(q.reshape(N, H, hd), L["q_norm"], m.eps) if m.qk_norm else q.reshape(N, H, hd)
+        kn = det_rmsnorm(k.reshape(N, Hkv, hd), L["k_norm"], m.eps) if m.qk_norm else k.reshape(N, Hkv, hd)
 
         def rope(z):
             return z * cos + torch.cat([-z[..., half:], z[..., :half]], -1) * sin

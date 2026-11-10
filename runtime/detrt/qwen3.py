@@ -1,6 +1,11 @@
 """Deterministic Qwen3 reference runtime: bit-identical on every GPU and on CPU, and identical
 between full prefill, token-by-token decode with a KV cache, and teacher forcing.
 
+Architectures (ModelCfg.Arch): 0 Qwen3 (RMSNorm on each q and k head); 1 Llama / Mistral (no q/k
+norm: the QN and KN rows are copies of q and k, and the weights tree holds all-ones q_norm and
+k_norm rows that nothing reads). Llama 3.1+ rotary scaling ("llama3") is only a different pinned
+cos/sin table.
+
 Numerics (see core.py for why each step is exact or correctly rounded):
   linear      int8 W (W7, rotated) x int8 activations (A7, per token) -> exact int sum, then
               fp32 (acc * s_x) * s_w. GPU: Pearl-mined Ampere kernel (or cuBLAS int8);
@@ -30,13 +35,31 @@ P_LEVELS = 16383  # 14-bit attention probabilities = 128 * hi + lo, hi, lo in [0
 KEY_CHUNK = 1024  # keeps every partial sum of a 7-bit x int8 GEMM below 2**24
 
 
-def rope_table(theta: float, head_dim: int, max_pos: int = 8192) -> tuple[np.ndarray, np.ndarray, str]:
-    """Load (or, once, build and pin) the fp32 cos/sin table. Returns cos, sin, sha256."""
+def llama3_inv_freq(inv: np.ndarray, factor: float, low: float, high: float, orig: int) -> np.ndarray:
+    """Llama 3.1+ frequency scaling (transformers' _compute_llama3_parameters), in float64."""
+    low_wl, high_wl = orig / low, orig / high
+    wl = 2 * np.pi / inv
+    out = np.where(wl > low_wl, inv / factor, inv)
+    smooth = (orig / wl - low) / (high - low)
+    mid = (1 - smooth) * out / factor + smooth * out
+    is_mid = ~(wl < high_wl) & ~(wl > low_wl)
+    return np.where(is_mid, mid, out)
+
+
+def rope_table(theta: float, head_dim: int, max_pos: int = 8192, scaling: dict | None = None) -> tuple[np.ndarray, np.ndarray, str]:
+    """Load (or, once, build and pin) the fp32 cos/sin table. Returns cos, sin, sha256.
+    scaling: None, or Llama 3's {"factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings"}."""
     name = f"rope_theta{theta:g}_hd{head_dim}_pos{max_pos}.npz"
+    if scaling:
+        sc = (float(scaling["factor"]), float(scaling["low_freq_factor"]), float(scaling["high_freq_factor"]),
+              int(scaling["original_max_position_embeddings"]))
+        name = f"rope_theta{theta:g}_hd{head_dim}_pos{max_pos}_llama3_{sc[0]:g}_{sc[1]:g}_{sc[2]:g}_{sc[3]}.npz"
     path = os.path.join(ART, name)
     if not os.path.exists(path):
         os.makedirs(ART, exist_ok=True)
         inv = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
+        if scaling:
+            inv = llama3_inv_freq(inv, *sc)
         ang = np.arange(max_pos, dtype=np.float64)[:, None] * inv[None, :]
         emb = np.concatenate([ang, ang], axis=1)
         np.savez(path, cos=np.cos(emb).astype(np.float32), sin=np.sin(emb).astype(np.float32))
@@ -103,18 +126,48 @@ class DetLinear:
         return y.reshape(*shp[:-1], self.n)
 
 
+ARCH_QWEN3, ARCH_LLAMA = 0, 1  # jobstate.ModelCfg.Arch
+ARCHS = {"qwen3": ARCH_QWEN3, "llama": ARCH_LLAMA, "mistral": ARCH_LLAMA}
+
+
+def rope_config(cfg) -> tuple[float, dict | None]:
+    """(theta, Llama 3 scaling or None) from a transformers config (v4 or v5 layout)."""
+    rp = dict(getattr(cfg, "rope_parameters", None) or {})
+    rs = dict(getattr(cfg, "rope_scaling", None) or {})
+    theta = getattr(cfg, "rope_theta", None) or rp.get("rope_theta") or 1e6
+    kind = rp.get("rope_type") or rs.get("rope_type") or rs.get("type") or "default"
+    if kind == "default":
+        return float(theta), None
+    if kind != "llama3":
+        raise ValueError(f"rope scaling {kind!r} is not supported by the deterministic runtime")
+    src = rp if rp.get("rope_type") == "llama3" else rs
+    return float(theta), {k: src[k] for k in ("factor", "low_freq_factor", "high_freq_factor",
+                                              "original_max_position_embeddings")}
+
+
 class DetQwen3:
+    """Qwen3, Llama and Mistral checkpoints (see ARCHS)."""
+
     def __init__(self, hf_model, device, hadamard_block: int = 512, mine: bool = True, max_pos: int = 8192):
         cfg = hf_model.config
         self.cfg, self.device = cfg, torch.device(device)
+        if cfg.model_type not in ARCHS:
+            raise ValueError(f"model type {cfg.model_type!r} is not supported (supported: {sorted(ARCHS)})")
+        self.arch = ARCHS[cfg.model_type]
+        if getattr(cfg, "attention_bias", False) or getattr(cfg, "mlp_bias", False):
+            raise ValueError("biased attention or MLP projections are not supported")
+        sw = getattr(cfg, "sliding_window", None)
+        if self.arch == ARCH_LLAMA and sw is not None and sw < max_pos:
+            raise ValueError(f"sliding-window attention ({sw} < MaxPos {max_pos}) is not supported")
+        if getattr(cfg, "hidden_act", "silu") != "silu":
+            raise ValueError(f"activation {cfg.hidden_act!r} is not supported")
         self.hadamard_block = hadamard_block
         self.D, self.H, self.Hkv = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads
         self.hd = getattr(cfg, "head_dim", None) or self.D // self.H
         self.eps = cfg.rms_norm_eps
-        theta = getattr(cfg, "rope_theta", None)
-        if theta is None:
-            theta = (getattr(cfg, "rope_parameters", None) or {}).get("rope_theta", 1e6)
-        cos, sin, self.rope_sha = rope_table(float(theta), self.hd, max_pos)
+        self.qk_norm = self.arch == ARCH_QWEN3
+        theta, scaling = rope_config(cfg)
+        cos, sin, self.rope_sha = rope_table(theta, self.hd, max_pos, scaling)
         self.cos, self.sin = torch.from_numpy(cos).to(self.device), torch.from_numpy(sin).to(self.device)
         dev, hb = self.device, hadamard_block
         base = hf_model.model
@@ -123,10 +176,12 @@ class DetQwen3:
         for lay in base.layers:
             at, mlp = lay.self_attn, lay.mlp
             W = lambda mod: mod.weight.detach()
+            ones = torch.ones(self.hd, dtype=F32, device=dev)  # committed, never read (Arch 1)
             self.layers.append(dict(
                 in_norm=W(lay.input_layernorm).to(F32).to(dev),
                 post_norm=W(lay.post_attention_layernorm).to(F32).to(dev),
-                q_norm=W(at.q_norm).to(F32).to(dev), k_norm=W(at.k_norm).to(F32).to(dev),
+                q_norm=W(at.q_norm).to(F32).to(dev) if self.qk_norm else ones,
+                k_norm=W(at.k_norm).to(F32).to(dev) if self.qk_norm else ones,
                 qkv=DetLinear(torch.cat([W(at.q_proj), W(at.k_proj), W(at.v_proj)]), dev, hb, mine),
                 o=DetLinear(W(at.o_proj), dev, hb, mine),
                 gu=DetLinear(torch.cat([W(mlp.gate_proj), W(mlp.up_proj)]), dev, hb, mine),
@@ -135,6 +190,10 @@ class DetQwen3:
         self.norm = base.norm.weight.detach().to(F32).to(dev)
         self.lm_head = DetLinear(hf_model.lm_head.weight.detach(), dev, hb, mine)
         self.inv_sqrt_hd = float(torch.tensor(1.0 / np.sqrt(self.hd)).to(F32))
+
+    def qkn(self, z: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """The QN / KN step: RMSNorm per head (Qwen3), or the head itself (Llama, Mistral)."""
+        return core.det_rmsnorm(z, w, self.eps) if self.qk_norm else z
 
     def linears(self):
         for L in self.layers:
@@ -161,8 +220,8 @@ class DetQwen3:
         H, Hkv, hd = self.H, self.Hkv, self.hd
         qkv = L["qkv"](h)
         q, k, v = torch.split(qkv, [H * hd, Hkv * hd, Hkv * hd], dim=-1)
-        q = core.det_rmsnorm(q.reshape(B, T, H, hd), L["q_norm"], self.eps)
-        k = core.det_rmsnorm(k.reshape(B, T, Hkv, hd), L["k_norm"], self.eps)
+        q = self.qkn(q.reshape(B, T, H, hd), L["q_norm"])
+        k = self.qkn(k.reshape(B, T, Hkv, hd), L["k_norm"])
         v = v.reshape(B, T, Hkv, hd)
         pos = torch.arange(start, start + T, device=self.device)
         q, k = self._rope(q, pos), self._rope(k, pos)

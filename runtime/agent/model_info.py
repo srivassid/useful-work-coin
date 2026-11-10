@@ -48,7 +48,7 @@ def load(model_dir: str, device: str, hadamard_block: int, max_pos: int, mine: b
 def go_cfg(m: DetQwen3, max_pos: int) -> dict:
     c = model_cfg(m)
     return {"D": c["D"], "H": c["H"], "Hkv": c["Hkv"], "Hd": c["hd"], "I": c["I"], "L": c["L"], "V": c["V"],
-            "Eps": c["eps"], "Bs": c["bs"], "MaxPos": max_pos}
+            "Eps": c["eps"], "Bs": c["bs"], "MaxPos": max_pos, "Arch": c["arch"]}
 
 
 def main() -> None:

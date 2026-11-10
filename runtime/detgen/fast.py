@@ -42,7 +42,7 @@ class FastGen:
         q1, s1 = K.rmsnorm_quant(x, L["in_norm"], m.eps, L["qkv"].bs)
         N = x.shape[0]  # rope per row: T = N rows, cos/sin gathered at each row's position
         qq, qs, kq, ks, vq, vs = K.qkv_post(L["qkv"].int_gemm(q1), s1, L["qkv"].sw, L["q_norm"], L["k_norm"],
-                                            m.cos[pos].contiguous(), m.sin[pos].contiguous(), N, m.H, m.Hkv, m.eps)
+                                            m.cos[pos].contiguous(), m.sin[pos].contiguous(), N, m.H, m.Hkv, m.eps, m.qk_norm)
         c["k"][bidx, pos], c["ks"][bidx, pos] = kq, ks[..., 0]
         c["v"][bidx, pos], c["vs"][bidx, pos] = vq, vs[..., 0]
         return qq, qs, kq, ks, vq, vs

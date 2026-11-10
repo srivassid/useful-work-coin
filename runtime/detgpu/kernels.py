@@ -301,11 +301,12 @@ attention_row(const signed char* __restrict__ qq, const float* __restrict__ qs, 
   out[(long long)rq * (H * HD) + h * HD + tid] = __fmul_rn(__ll2float_rn(o), sp);
 }
 // qkv GEMM output (int32, N x (H + 2 Hkv) * 128) -> quantized q, k, v exactly as detrt.fast:
-// dequant, split, q/k per-head rmsnorm, rope, quant_sym(127) (v: quant_sym only). One warp per head.
+// dequant, split, q/k per-head rmsnorm (qknorm != 0: Qwen3; 0: Llama, Mistral), rope, quant_sym(127)
+// (v: quant_sym only). One warp per head.
 extern "C" __global__ void __launch_bounds__(256)
 qkv_post(const int* __restrict__ acc, const float* __restrict__ s1, const float* __restrict__ sw,
          const float* __restrict__ qnw, const float* __restrict__ knw, const float* __restrict__ cosT,
-         const float* __restrict__ sinT, int T, int H, int Hkv, float inv_hd, float eps,
+         const float* __restrict__ sinT, int T, int H, int Hkv, float inv_hd, float eps, int qknorm,
          signed char* __restrict__ qq, float* __restrict__ qs, signed char* __restrict__ kq, float* __restrict__ ks,
          signed char* __restrict__ vq, float* __restrict__ vs) {
   __shared__ float buf[8][128];
@@ -316,9 +317,13 @@ qkv_post(const int* __restrict__ acc, const float* __restrict__ s1, const float*
     float v[4];
     for (int j = 0; j < 4; j++) { int c = hh * 128 + lane + 32 * j; v[j] = deq(acc[(long long)row * width + c], s, sw[c]); }
     if (hh < H + Hkv) {                       // q or k head: rmsnorm, rope, quant
-      const float* w = hh < H ? qnw : knw;
-      const float r = warp_rms_factor(v, 4, 7, inv_hd, eps);
-      for (int j = 0; j < 4; j++) { int i = lane + 32 * j; buf[warp][i] = __fmul_rn(__fmul_rn(v[j], r), w[i]); }
+      if (qknorm) {
+        const float* w = hh < H ? qnw : knw;
+        const float r = warp_rms_factor(v, 4, 7, inv_hd, eps);
+        for (int j = 0; j < 4; j++) { int i = lane + 32 * j; buf[warp][i] = __fmul_rn(__fmul_rn(v[j], r), w[i]); }
+      } else {
+        for (int j = 0; j < 4; j++) buf[warp][lane + 32 * j] = v[j];
+      }
       __syncwarp();
       float o[4];
       for (int j = 0; j < 4; j++) {
@@ -679,15 +684,27 @@ def _stream() -> cp.cuda.Stream:
     return s
 
 
+SMEM_MAX = 99 * 1024  # opt-in dynamic shared memory per block on sm_86 and sm_120 (sm_80: 163 KB)
+
+
+def _row_kernel(name: str, smem: int):
+    """A kernel that keeps one row in shared memory; rows over 48 KB opt in to more."""
+    assert smem <= SMEM_MAX, f"{name}: a row of {smem} bytes exceeds shared memory"
+    f = _fn(name)
+    if smem > 48 * 1024:
+        f.max_dynamic_shared_size_bytes = smem
+    return f
+
+
 def quant_act(x: torch.Tensor, bs: int) -> tuple[torch.Tensor, torch.Tensor]:
     """detrt.core.quant_act(x, bs) for float32 x (rows, k) on a GPU: (int8 q, float32 scale)."""
     x = x.contiguous()
     m, k = x.shape
-    assert x.dtype == torch.float32 and (bs <= 1 or k % bs == 0) and 4 * k <= 48 * 1024
+    assert x.dtype == torch.float32 and (bs <= 1 or k % bs == 0)
     q = torch.empty((m, k), dtype=torch.int8, device=x.device)
     s = torch.empty(m, dtype=torch.float32, device=x.device)
     with cp.cuda.Device(x.device.index):
-        _fn("quant_act_f32")((m,), (256,), (np.uint64(x.data_ptr()), np.int32(k), np.int32(bs), np.uint64(q.data_ptr()),
+        _row_kernel("quant_act_f32", 4 * k)((m,), (256,), (np.uint64(x.data_ptr()), np.int32(k), np.int32(bs), np.uint64(q.data_ptr()),
                                           np.uint64(s.data_ptr())), stream=_stream(), shared_mem=4 * k)
     return q, s
 
@@ -698,14 +715,14 @@ def rmsnorm_quant(x: torch.Tensor, w: torch.Tensor, eps: float, bs: int) -> tupl
     from detrt.core import F32, F64
     x = x.contiguous()
     m, k = x.shape
-    assert x.dtype == torch.float32 and w.dtype == torch.float32 and (bs <= 1 or k % bs == 0) and 4 * k <= 48 * 1024
+    assert x.dtype == torch.float32 and w.dtype == torch.float32 and (bs <= 1 or k % bs == 0)
     inv_d = np.float32(float(torch.tensor(1.0 / k, dtype=F64).to(F32)))
     eps32 = np.float32(float(torch.tensor(eps, dtype=F64).to(F32)))
     L = max(1, math.ceil(math.log2(k)))
     q = torch.empty((m, k), dtype=torch.int8, device=x.device)
     s = torch.empty(m, dtype=torch.float32, device=x.device)
     with cp.cuda.Device(x.device.index):
-        _fn("rmsnorm_quant_f32")((m,), (256,), (np.uint64(x.data_ptr()), np.uint64(w.contiguous().data_ptr()), np.int32(k),
+        _row_kernel("rmsnorm_quant_f32", 4 * k)((m,), (256,), (np.uint64(x.data_ptr()), np.uint64(w.contiguous().data_ptr()), np.int32(k),
                                                np.int32(bs), inv_d, eps32, np.int32(L), np.uint64(q.data_ptr()),
                                                np.uint64(s.data_ptr())), stream=_stream(), shared_mem=4 * k)
     return q, s
@@ -768,8 +785,9 @@ def _ptr(t):
     return np.uint64(0 if t is None else t.data_ptr())
 
 
-def qkv_post(acc, s1, sw, qnw, knw, cos, sin, T: int, H: int, Hkv: int, eps: float):
-    """Quantized q, k, v from the qkv GEMM's int32 output: (qq (N,H,128) int8, qs (N,H,1), kq, ks, vq, vs)."""
+def qkv_post(acc, s1, sw, qnw, knw, cos, sin, T: int, H: int, Hkv: int, eps: float, qknorm: bool = True):
+    """Quantized q, k, v from the qkv GEMM's int32 output: (qq (N,H,128) int8, qs (N,H,1), kq, ks, vq, vs).
+    qknorm False (Llama, Mistral): no per-head RMSNorm before rope."""
     from detrt.core import F32, F64
     N = acc.shape[0]
     dev = acc.device
@@ -779,7 +797,7 @@ def qkv_post(acc, s1, sw, qnw, knw, cos, sin, T: int, H: int, Hkv: int, eps: flo
     eps32 = np.float32(float(torch.tensor(eps, dtype=F64).to(F32)))
     args = [acc.contiguous(), s1.contiguous(), sw.contiguous(), qnw.contiguous(), knw.contiguous(), cos.contiguous(), sin.contiguous()]
     with cp.cuda.Device(dev.index):
-        _fn("qkv_post")((N,), (256,), tuple(_ptr(a) for a in args) + (np.int32(T), np.int32(H), np.int32(Hkv), inv_hd, eps32) +
+        _fn("qkv_post")((N,), (256,), tuple(_ptr(a) for a in args) + (np.int32(T), np.int32(H), np.int32(Hkv), inv_hd, eps32, np.int32(bool(qknorm))) +
                         tuple(_ptr(a) for a in (qq, qs, kq, ks, vq, vs)), stream=_stream())
     return qq, qs, kq, ks, vq, vs
 
@@ -799,11 +817,11 @@ def swiglu_quant(acc, s3, sw, bs: int):
     acc = acc.contiguous()
     N, two_i = acc.shape
     I = two_i // 2
-    assert 4 * I <= 48 * 1024 and (bs <= 1 or I % bs == 0)
+    assert bs <= 1 or I % bs == 0
     q = torch.empty((N, I), dtype=torch.int8, device=acc.device)
     sc = torch.empty(N, dtype=torch.float32, device=acc.device)
     with cp.cuda.Device(acc.device.index):
-        _fn("swiglu_quant")((N,), (256,), (_ptr(acc), _ptr(s3.contiguous()), _ptr(sw.contiguous()), np.int32(I), np.int32(bs),
+        _row_kernel("swiglu_quant", 4 * I)((N,), (256,), (_ptr(acc), _ptr(s3.contiguous()), _ptr(sw.contiguous()), np.int32(I), np.int32(bs),
                                            _ptr(q), _ptr(sc)), stream=_stream(), shared_mem=4 * I)
     return q, sc
 

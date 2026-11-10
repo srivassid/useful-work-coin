@@ -112,7 +112,7 @@ def program(cfg: dict, T: int, l0: int, l1: int) -> list[Leaf]:
 
 def model_cfg(m: DetQwen3) -> dict:
     return dict(D=m.D, H=m.H, Hkv=m.Hkv, hd=m.hd, I=m.layers[0]["gu"].n // 2, L=len(m.layers),
-                V=m.embed.shape[0], eps=m.eps, bs=m.layers[0]["qkv"].bs)
+                V=m.embed.shape[0], eps=m.eps, bs=m.layers[0]["qkv"].bs, arch=m.arch)
 
 
 @dataclass
@@ -160,8 +160,8 @@ def run_stage(m: DetQwen3, tokens: torch.Tensor | None, x_in: torch.Tensor | Non
         q1, s1 = core.quant_act(h1, L["qkv"].bs)
         qkv = fmul(fmul(L["qkv"].int_gemm(q1).to(F32), s1[:, None]), L["qkv"].sw[None, :])
         q, k, v = torch.split(qkv, [H * hd, Hkv * hd, Hkv * hd], dim=-1)
-        qn = core.det_rmsnorm(q.reshape(T, H, hd), L["q_norm"], m.eps)
-        kn = core.det_rmsnorm(k.reshape(T, Hkv, hd), L["k_norm"], m.eps)
+        qn = m.qkn(q.reshape(T, H, hd), L["q_norm"])
+        kn = m.qkn(k.reshape(T, Hkv, hd), L["k_norm"])
         cos, sin = m.cos[pos][:, None, :], m.sin[pos][:, None, :]
         half = hd // 2
         rope = lambda z: fadd(fmul(z, cos), fmul(torch.cat([-z[..., half:], z[..., :half]], -1), sin))
