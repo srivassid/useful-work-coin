@@ -19,8 +19,7 @@
     }
   },
   "units": [
-    "wiki8x128.units.json",
-    "wiki128-canary.units.json"
+    "wiki-train8x128.units.json"
   ],
   "coinbase_maturity": 20
 }
