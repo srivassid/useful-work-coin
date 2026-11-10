@@ -60,7 +60,7 @@ def det_ppl(m, chunks) -> float:
     for c in chunks:
         ids = torch.tensor([c], device=m.device)
         lp = m.logprobs(m.forward(ids, m.new_cache(1, len(c))))[0, :-1]
-        nll -= lp.gather(-1, ids[0, 1:, None]).double().sum().item()
+        nll -= lp.gather(-1, ids[0, 1:, None].to(lp.device)).double().sum().item()
         n += len(c) - 1
     return math.exp(nll / n)
 
@@ -69,7 +69,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("--groups", type=int, default=4)
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default="cuda:0", help='a GPU, or several ("cuda:0,cuda:1") to split the layers')
     ap.add_argument("--hadamard", type=int, default=128)
     ap.add_argument("--max-pos", type=int, default=1024)
     ap.add_argument("--ppl-chunks", type=int, default=16)
@@ -80,10 +80,10 @@ def main():
     a = ap.parse_args()
     from transformers import AutoModelForCausalLM
     from agent.inputs import wikitext_sequences
-    dev = torch.device(a.device)
+    dev = torch.device(a.device.split(",")[0])
     torch.cuda.set_device(dev)
     core.setup_determinism()
-    res = {"model": a.model, "gpu": torch.cuda.get_device_name(dev), "hadamard": a.hadamard, "groups": a.groups}
+    res = {"model": a.model, "gpu": torch.cuda.get_device_name(dev), "devices": a.device, "hadamard": a.hadamard, "groups": a.groups}
     t = time.time()
     hf = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cpu").eval()
     print(f"{hf.config.model_type}: {sum(p.numel() for p in hf.parameters()) / 1e9:.2f}B params, loaded in {time.time() - t:.0f}s", flush=True)
@@ -95,12 +95,12 @@ def main():
         torch.cuda.empty_cache()
         print(f"bf16 perplexity over {len(chunks)} x {a.ppl_len} tokens: {res['ppl_bf16']:.4f}", flush=True)
     t = time.time()
-    m = DetQwen3(hf, dev, hadamard_block=a.hadamard, mine=False, max_pos=a.max_pos)
+    m = DetQwen3(hf, a.device, hadamard_block=a.hadamard, mine=False, max_pos=a.max_pos)
     del hf
     gc.collect()
     res["arch"], res["qk_norm"], res["rope_sha"] = m.arch, m.qk_norm, m.rope_sha
     print(f"deterministic runtime: arch {m.arch}, qk_norm {m.qk_norm}, D {m.D} I {m.layers[0]['gu'].n // 2} L {len(m.layers)} "
-          f"V {m.embed.shape[0]}, built in {time.time() - t:.0f}s, GPU memory {torch.cuda.memory_allocated(dev) / 2**30:.1f} GiB", flush=True)
+          f"V {m.embed.shape[0]}, built in {time.time() - t:.0f}s, GPU memory " + ", ".join(f"{d} {torch.cuda.memory_allocated(d) / 2**30:.1f} GiB" for d in dict.fromkeys(m.devices)), flush=True)
     assert len(m.layers) % a.groups == 0, "layers do not split into groups"
 
     # 1. fast GPU engine == reference

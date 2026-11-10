@@ -1,0 +1,10 @@
+llama: 3.21B params, loaded in 1s
+deterministic runtime: arch 1, qk_norm False, D 3072 I 8192 L 28 V 128256, built in 193s, GPU memory 4.5 GiB
+wiki 4x128: all 7 groups bit-identical (reference 1.0s, detgpu 0.18s), sha256 7abb33fe52659b45
+random 3x128: all 7 groups bit-identical (reference 0.6s, detgpu 0.07s), sha256 4e94e1e63562ecc5
+random 1x512: all 7 groups bit-identical (reference 1.1s, detgpu 0.10s), sha256 96e86ca80bb7406e
+random 2x300: all 7 groups bit-identical (reference 1.1s, detgpu 0.11s), sha256 aefae95e9ec134d7
+generation greedy: 3 prompts x 40 tokens, fast == reference (fast 1.5s), head outputs equal, tokens sha256 ec771737788e216b
+generation t0.8: 3 prompts x 40 tokens, fast == reference (fast 1.5s), head outputs equal, tokens sha256 6b6607e6a14f7fdb
+deterministic W7A7 (Hadamard 128) perplexity 12.029392307345631 (18s)
+ARCH GPU CHECKS PASS

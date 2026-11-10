@@ -103,7 +103,7 @@ def norm_linear(L, norm: str, name: str, x: torch.Tensor, eps: float) -> torch.T
 
 
 def attention_torch(m, qq, qs, kq, ks, vq, vs, B, T):
-    dev = m.device
+    dev = qq.device
     H, Hkv, hd = m.H, m.Hkv, m.hd
     N = B * T
     rep = H // Hkv
@@ -144,7 +144,7 @@ def layer_fused(m: DetQwen3, L, x: torch.Tensor, B: int, T: int) -> torch.Tensor
     H, Hkv = m.H, m.Hkv
     q1, s1 = kernels.rmsnorm_quant(x, L["in_norm"], m.eps, L["qkv"].bs)
     qq, qs, kq, ks, vq, vs = kernels.qkv_post(L["qkv"].int_gemm(q1), s1, L["qkv"].sw, L["q_norm"], L["k_norm"],
-                                              m.cos[:T], m.sin[:T], T, H, Hkv, m.eps, m.qk_norm)
+                                              L["cos"][:T], L["sin"][:T], T, H, Hkv, m.eps, m.qk_norm)
     oc = kernels.attention(qq, qs, kq, ks, vq, vs, B, T, H, Hkv, m.inv_sqrt_hd)
     q2, s2 = kernels.quant_act(oc, L["o"].bs)
     r1 = kernels.dequant_residual(L["o"].int_gemm(q2), s2, L["o"].sw, x)
@@ -175,6 +175,11 @@ def stage_outputs(m: DetQwen3, tokens: torch.Tensor | None, x: torch.Tensor | No
     mask = torch.arange(T, device=dev)[None, :] <= torch.arange(T, device=dev)[:, None]
     for l in range(l0, l1):
         L = m.layers[l]
+        if m.enter(L["dev"]) != dev:  # the next block of layers is on another GPU
+            dev = L["dev"]
+            x, pos = x.to(dev), pos.to(dev)
+            cos, sin = L["cos"][pos][:, None, :], L["sin"][pos][:, None, :]
+            mask = torch.arange(T, device=dev)[None, :] <= torch.arange(T, device=dev)[:, None]
         if FUSED and x.is_cuda and hd == 128:
             x = layer_fused(m, L, x, B, T)
             continue

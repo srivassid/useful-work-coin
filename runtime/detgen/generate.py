@@ -21,7 +21,7 @@ def generate(m: DetQwen3, prompt: list[int], T: int, s: Sampling, vchunk: int = 
     hn = m.forward(torch.tensor([prompt], device=m.device), cache, 0)[0, -1:]  # final-norm row at P-1
     seq = list(prompt)
     for pos in range(P - 1, T - 1):
-        tok = int(sample_normed(m, hn, torch.tensor([pos], device=m.device), s, vchunk)[5][0])
+        tok = int(sample_normed(m, hn, torch.tensor([pos], device=hn.device), s, vchunk)[5][0])
         seq.append(tok)
         if pos + 1 < T - 1:
             hn = m.forward(torch.tensor([[tok]], device=m.device), cache, pos + 1)[0]

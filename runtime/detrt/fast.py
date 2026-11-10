@@ -103,13 +103,15 @@ def run_stages(m: DetQwen3, tokens: list[torch.Tensor] | None, x_in: list[torch.
     rep = H // Hkv
     for l in range(l0, l1):
         L = m.layers[l]
+        dev = m.enter(L["dev"])
+        x, pos = x.to(dev), pos.to(dev)
         h1 = core.det_rmsnorm(x, L["in_norm"], m.eps)
         q1, s1 = core.quant_act(h1, L["qkv"].bs)
         qkv = fmul(fmul(L["qkv"].int_gemm(q1).to(F32), s1[:, None]), L["qkv"].sw[None, :])
         q, k, v = torch.split(qkv, [H * hd, Hkv * hd, Hkv * hd], dim=-1)
         qn = m.qkn(q.reshape(N, H, hd), L["q_norm"])
         kn = m.qkn(k.reshape(N, Hkv, hd), L["k_norm"])
-        cos, sin = m.cos[pos][:, None, :], m.sin[pos][:, None, :]
+        cos, sin = L["cos"][pos][:, None, :], L["sin"][pos][:, None, :]
         half = hd // 2
         rope = lambda z: fadd(fmul(z, cos), fmul(torch.cat([-z[..., half:], z[..., :half]], -1), sin))
         qr, kr = rope(qn), rope(kn)

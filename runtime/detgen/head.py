@@ -154,7 +154,7 @@ def run_head_stage(m: DetQwen3, r2: torch.Tensor, s: Sampling, vchunk: int = VCH
     samples [token, score bits] for positions 0..T-2 (the stage's output root commits them);
     with rows=False only the outputs are kept (what providers and verifiers need)."""
     T = r2.shape[0]
-    dev = m.device
+    dev = m.enter(m.out_device)
     t = torch.arange(T - 1, device=dev)
     hn = core.det_rmsnorm(r2[:T - 1].to(dev, F32), m.norm, m.eps)
     hq, sx, kept, bt, bs, tok, sco = sample_normed(m, hn, t, s, vchunk, keep_scores=rows)

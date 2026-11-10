@@ -146,11 +146,17 @@ def rope_config(cfg) -> tuple[float, dict | None]:
 
 
 class DetQwen3:
-    """Qwen3, Llama and Mistral checkpoints (see ARCHS)."""
+    """Qwen3, Llama and Mistral checkpoints (see ARCHS).
+
+    device may list several GPUs ("cuda:0,cuda:1"): the layers are split into contiguous blocks,
+    one per device; the embedding sits on the first, the final norm and lm_head on the last.
+    Rows cross devices as exact copies, so outputs are bit-identical to one device."""
 
     def __init__(self, hf_model, device, hadamard_block: int = 512, mine: bool = True, max_pos: int = 8192):
         cfg = hf_model.config
-        self.cfg, self.device = cfg, torch.device(device)
+        self.devices = [torch.device(d) for d in str(device).split(",")]
+        self.cfg, self.device, self.out_device = cfg, self.devices[0], self.devices[-1]
+        self.multi = len(set(self.devices)) > 1
         if cfg.model_type not in ARCHS:
             raise ValueError(f"model type {cfg.model_type!r} is not supported (supported: {sorted(ARCHS)})")
         self.arch = ARCHS[cfg.model_type]
@@ -168,12 +174,15 @@ class DetQwen3:
         self.qk_norm = self.arch == ARCH_QWEN3
         theta, scaling = rope_config(cfg)
         cos, sin, self.rope_sha = rope_table(theta, self.hd, max_pos, scaling)
-        self.cos, self.sin = torch.from_numpy(cos).to(self.device), torch.from_numpy(sin).to(self.device)
-        dev, hb = self.device, hadamard_block
+        tabs = {d: (torch.from_numpy(cos).to(d), torch.from_numpy(sin).to(d)) for d in self.devices}
+        self.cos, self.sin = tabs[self.device]
+        hb = hadamard_block
         base = hf_model.model
-        self.embed = base.embed_tokens.weight.detach().to(F32).to(dev)
+        self.embed = base.embed_tokens.weight.detach().to(F32).to(self.device)
         self.layers = []
-        for lay in base.layers:
+        nl = len(base.layers)
+        for i, lay in enumerate(base.layers):
+            dev = self.devices[i * len(self.devices) // nl]
             at, mlp = lay.self_attn, lay.mlp
             W = lambda mod: mod.weight.detach()
             ones = torch.ones(self.hd, dtype=F32, device=dev)  # committed, never read (Arch 1)
@@ -186,10 +195,22 @@ class DetQwen3:
                 o=DetLinear(W(at.o_proj), dev, hb, mine),
                 gu=DetLinear(torch.cat([W(mlp.gate_proj), W(mlp.up_proj)]), dev, hb, mine),
                 down=DetLinear(W(mlp.down_proj), dev, hb, mine),
+                dev=dev, cos=tabs[dev][0], sin=tabs[dev][1],
             ))
-        self.norm = base.norm.weight.detach().to(F32).to(dev)
-        self.lm_head = DetLinear(hf_model.lm_head.weight.detach(), dev, hb, mine)
+        self.norm = base.norm.weight.detach().to(F32).to(self.out_device)
+        self.lm_head = DetLinear(hf_model.lm_head.weight.detach(), self.out_device, hb, mine)
         self.inv_sqrt_hd = float(torch.tensor(1.0 / np.sqrt(self.hd)).to(F32))
+
+    def enter(self, dev: torch.device) -> torch.device:
+        """Make dev current for torch and CuPy (a layer's GPU) and return it; nothing on one device."""
+        if self.multi and dev.type == "cuda":
+            torch.cuda.set_device(dev)
+            try:
+                import cupy
+                cupy.cuda.Device(dev.index).use()
+            except ImportError:
+                pass
+        return dev
 
     def qkn(self, z: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """The QN / KN step: RMSNorm per head (Qwen3), or the head itself (Llama, Mistral)."""
@@ -202,15 +223,15 @@ class DetQwen3:
 
     # ---------------------------------------------------------------- cache
     def new_cache(self, B: int, max_len: int):
-        z = lambda *s, dt=torch.int8: torch.zeros(*s, dtype=dt, device=self.device)
-        return [dict(k=z(B, self.Hkv, max_len, self.hd), sk=z(B, self.Hkv, max_len, 1, dt=F32),
-                     v=z(B, self.Hkv, max_len, self.hd), sv=z(B, self.Hkv, max_len, 1, dt=F32))
-                for _ in self.layers]
+        z = lambda d, *s, dt=torch.int8: torch.zeros(*s, dtype=dt, device=d)
+        return [dict(k=z(L["dev"], B, self.Hkv, max_len, self.hd), sk=z(L["dev"], B, self.Hkv, max_len, 1, dt=F32),
+                     v=z(L["dev"], B, self.Hkv, max_len, self.hd), sv=z(L["dev"], B, self.Hkv, max_len, 1, dt=F32))
+                for L in self.layers]
 
     # ---------------------------------------------------------------- forward
-    def _rope(self, x, pos):
-        cos = self.cos[pos][None, :, None, :]  # (1, T, 1, hd)
-        sin = self.sin[pos][None, :, None, :]
+    def _rope(self, x, pos, L):
+        cos = L["cos"][pos][None, :, None, :]  # (1, T, 1, hd)
+        sin = L["sin"][pos][None, :, None, :]
         h = self.hd // 2
         rot = torch.cat([-x[..., h:], x[..., :h]], dim=-1)
         return fadd(fmul(x, cos), fmul(rot, sin))
@@ -223,8 +244,8 @@ class DetQwen3:
         q = self.qkn(q.reshape(B, T, H, hd), L["q_norm"])
         k = self.qkn(k.reshape(B, T, Hkv, hd), L["k_norm"])
         v = v.reshape(B, T, Hkv, hd)
-        pos = torch.arange(start, start + T, device=self.device)
-        q, k = self._rope(q, pos), self._rope(k, pos)
+        pos = torch.arange(start, start + T, device=h.device)
+        q, k = self._rope(q, pos, L), self._rope(k, pos, L)
         kq, ks = core.quant_sym(k, 127)
         vq, vs = core.quant_sym(v, 127)
         cache["k"][:, :, start:start + T] = kq.to(torch.int8).transpose(1, 2)
@@ -241,7 +262,7 @@ class DetQwen3:
         sc_int = core.exact_matmul_small(qq, K.transpose(-1, -2), 127 * 127 * hd)  # (B,H,T,S)
         sc = fmul(fmul(fmul(sc_int, qs), SK.transpose(-1, -2)), c32(self.inv_sqrt_hd, sc_int))
         qpos = pos[None, None, :, None]
-        kpos = torch.arange(S, device=self.device)[None, None, None, :]
+        kpos = torch.arange(S, device=h.device)[None, None, None, :]
         sc = torch.where(kpos <= qpos, sc, torch.full_like(sc, float("-inf")))
         mx = sc.amax(dim=-1, keepdim=True)
         e = core.det_exp(fsub(sc, mx))
@@ -252,7 +273,7 @@ class DetQwen3:
         sp = fdiv(torch.maximum(pmax, c32(1e-30, pmax)), c32(float(P_LEVELS), pmax))
         pi = torch.round(fdiv(Pv, sp)).clamp_(0, P_LEVELS).to(torch.int32)
         hi, lo = (pi >> 7).to(F32), (pi & 127).to(F32)
-        acc = torch.zeros(B, H, T, hd, dtype=I64, device=self.device)
+        acc = torch.zeros(B, H, T, hd, dtype=I64, device=h.device)
         for c0 in range(0, S, KEY_CHUNK):
             Vc = V[:, :, c0:c0 + KEY_CHUNK]
             bound = 127 * 127 * KEY_CHUNK
@@ -267,18 +288,20 @@ class DetQwen3:
         """ids: (B, T) tokens at positions start..start+T-1. Returns final-norm hidden (B, T, D) fp32."""
         x = self.embed[ids]
         for L, c in zip(self.layers, cache):
+            x = x.to(self.enter(L["dev"]))
             x = fadd(x, self._attention(L, core.det_rmsnorm(x, L["in_norm"], self.eps), c, start))
             h = core.det_rmsnorm(x, L["post_norm"], self.eps)
             g, u = torch.split(L["gu"](h), [L["gu"].n // 2, L["gu"].n // 2], dim=-1)
             x = fadd(x, L["down"](fmul(core.det_silu(g), u)))
             if layer_hashes is not None:
                 layer_hashes.append(sha(x))
+        x = x.to(self.enter(self.out_device))
         return core.det_rmsnorm(x, self.norm, self.eps)
 
     @torch.no_grad()
     def logprobs(self, hidden: torch.Tensor, chunk: int = 256) -> torch.Tensor:
         """log_softmax(lm_head(hidden)) rows, deterministic (det_exp, exact sum, det_log)."""
-        flat = hidden.reshape(-1, self.D)
+        flat = hidden.reshape(-1, self.D).to(self.enter(self.out_device))
         out = []
         for s0 in range(0, flat.shape[0], chunk):
             lg = self.lm_head(flat[s0:s0 + chunk])

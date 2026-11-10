@@ -156,10 +156,10 @@ _MODS: dict = {}
 
 
 def _fn(name: str):
-    dev = torch.cuda.current_device()
+    dev = cp.cuda.Device().id  # the device the wrapper selected from its tensors (layers may sit on several GPUs)
     mod = _MODS.get(dev)
     if mod is None:
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = torch.cuda.get_device_capability(dev)
         src = f"#define BLOCKB {BLOCK}\n#define MAXBLK {MAXBLK}\n" + _SRC
         with cp.cuda.Device(dev):
             mod = _MODS[dev] = cp.RawModule(code=src, options=(f"-arch=sm_{major}{minor}", "-std=c++17"))

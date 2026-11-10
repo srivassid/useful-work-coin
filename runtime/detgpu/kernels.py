@@ -663,10 +663,10 @@ def _constants() -> str:
 
 
 def _fn(name: str):
-    dev = torch.cuda.current_device()
+    dev = cp.cuda.Device().id  # the device the wrapper selected from its tensors (layers may sit on several GPUs)
     mod = _MODS.get(dev)
     if mod is None:
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = torch.cuda.get_device_capability(dev)
         src = _constants() + _SRC
         with cp.cuda.Device(dev):
             mod = _MODS[dev] = cp.RawModule(code=src, options=(f"-arch=sm_{major}{minor}", "-std=c++17"))
@@ -677,7 +677,7 @@ _STREAMS: dict = {}
 
 
 def _stream() -> cp.cuda.Stream:
-    ts = torch.cuda.current_stream()
+    ts = torch.cuda.current_stream(cp.cuda.Device().id)
     s = _STREAMS.get(ts.cuda_stream)
     if s is None:
         s = _STREAMS[ts.cuda_stream] = cp.cuda.Stream.from_external(ts)

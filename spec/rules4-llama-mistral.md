@@ -1,7 +1,8 @@
 # Rules 4: Llama and Mistral models
 
-Status (2026-11-10): runtime and consensus code done; CPU tests and RTX 5090 checks on three
-real checkpoints pass (below); no 3080 run yet; no network schedules Rules 4 yet.
+Status (2026-11-10): runtime and consensus code done; CPU tests pass; on real checkpoints the
+RTX 5090 and RTX 3080 (one GPU, or the layers split over two) give bit-identical outputs (below);
+no network schedules Rules 4 yet.
 
 ## What changes
 
@@ -65,16 +66,43 @@ The I = 14336 models exercise the rows over 48 KB of shared memory. Output and t
 are in the JSON files for a later 3080 comparison (Qwen3-8B was +1.0% at W7A7 in step 1, so
 Llama 3.1 8B's +1.07% is in line; a larger Hadamard block may lower it).
 
+## RTX 3080 and cross-GPU identity (box 71)
+
+`tests/test_arch_gpu.py --no-bf16` (the bf16 reference does not fit a 10 GB card; the
+deterministic perplexity is printed in full):
+
+| model | devices | GPU memory | stage digests, token digests, perplexity vs the 5090 |
+|---|---|---|---|
+| Llama 3.2 3B | one 3080 | 4.5 GiB | identical (12.029392307345631) |
+| Llama 3.2 3B | two 3080s (layers split) | 2.8 + 1.7 GiB | identical |
+| Mistral 7B Instruct v0.2 | one 3080 | 7.1 GiB | identical (9.946418838254978) |
+| Llama 3.1 8B | two 3080s (layers split) | 5.2 + 3.7 GiB | identical (9.60535363432514) |
+
+Qwen3-1.7B digests are also unchanged on the 3080 with this code (test_detgpu, test_agent_engines,
+test_sha_gpu, test_attention_mma, test_detgen_fast, test_detgen, test_provider_batch).
+
+Found on the 3080: `detgen.head.logits` passed lm_head weights row-major to `torch._int_mm`,
+which sm_86 cuBLASLt refuses unless the row count is a multiple of 32 (latent for Qwen3 too);
+it now passes a column-major view, exact either way.
+
+## Layers split over GPUs
+
+`DetQwen3(..., device="cuda:0,cuda:1")` (and `agent.compute.Runtime`, `test_arch_gpu --device`)
+gives each GPU a contiguous block of layers; the embedding is on the first GPU, the final norm and
+lm_head on the last. Each layer runs with its GPU current for torch and CuPy, and kernel modules
+and streams are chosen from the CuPy device the wrapper sets from its tensors. Rows cross GPUs
+as exact copies, so a split model is bit-identical to one GPU. One device behaves exactly as
+before. Mining while split (a JobMiner per GPU) is not wired yet.
+
 ## Still to do
 
-1. 3080 run of `tests/test_arch_gpu.py` (box 71) and comparison of the digests with the 5090.
-2. Models: the fast GPU paths need head_dim 128, so Llama 3.2 3B, Llama 3.1 8B and Mistral 7B
+1. Models: the fast GPU paths need head_dim 128, so Llama 3.2 3B, Llama 3.1 8B and Mistral 7B
    v0.3 (not Llama 3.2 1B, head_dim 64). Memory on a 10 GB 3080: the embedding is held in fp32
    (V x D x 4 bytes: 1.6 GB for Llama 3.2 3B, 2.1 GB for Llama 3.1 8B), so 3B and Mistral 7B
-   fit, Llama 3.1 8B (9.0 GiB before activations) does not. Fix to consider: keep the
-   embedding table in bf16 on the GPU (the rows come from a bf16 checkpoint, and bf16 to fp32 is
-   exact, so outputs stay bit-identical), which saves 1 GiB on the 8B. Llama and
+   fit, Llama 3.1 8B (9.0 GiB before activations) needs two 3080s (layers split, above) or a
+   larger GPU. Option: keep the embedding table in bf16 on the GPU (rows from a bf16 checkpoint;
+   bf16 to fp32 is exact), which saves 1 GiB. Llama and
    Mistral weights on Hugging Face are gated (licence acceptance and a token).
-3. W7A7 quality per model (perplexity vs bf16, Hadamard block choice), as step 1 did for Qwen3.
-4. Schedule Rules 4 on the testnet (`UWCTestNetRules4Height`), rebuild and deploy `pearld` /
+2. W7A7 quality per model (perplexity vs bf16, Hadamard block choice), as step 1 did for Qwen3.
+3. Schedule Rules 4 on the testnet (`UWCTestNetRules4Height`), rebuild and deploy `pearld` /
    `uwcctl` on every node including the droplet, register the models, update the package.

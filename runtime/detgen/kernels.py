@@ -167,10 +167,10 @@ def _constants() -> str:
 
 
 def _fn(name: str):
-    dev = torch.cuda.current_device()
+    dev = cp.cuda.Device().id  # the device the wrapper selected from its tensors (layers may sit on several GPUs)
     mod = _MODS.get(dev)
     if mod is None:
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = torch.cuda.get_device_capability(dev)
         with cp.cuda.Device(dev):
             mod = _MODS[dev] = cp.RawModule(code=_constants() + _SRC, options=(f"-arch=sm_{major}{minor}", "-std=c++17"))
     return mod.get_function(name)

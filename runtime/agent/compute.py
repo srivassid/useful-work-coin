@@ -39,7 +39,7 @@ class Runtime:
                  mine: bool | None = None):
         info = json.load(open(model_json))
         self.info = info
-        self.device = torch.device(device)
+        self.device = torch.device(str(device).split(",")[0])  # "cuda:0,cuda:1": layers split over GPUs
         # detgpu: bit-identical to detrt (tests/test_detgpu.py), native fp32 and fused kernels, stage
         # roots hashed on the GPU. detrt.fast stays the reference and the CPU path.
         self.gpu = engine == "detgpu" and self.device.type == "cuda"
@@ -204,7 +204,7 @@ class Runtime:
         if self.gpu:
             from detgen.fast import head_outputs
             self.bind()
-            return head_outputs(self.m, torch.from_numpy(np.ascontiguousarray(r2)).to(self.device)[None], gen.sampling())[0]
+            return head_outputs(self.m, torch.from_numpy(np.ascontiguousarray(r2)).to(self.m.out_device)[None], gen.sampling())[0]
         from detgen.head import run_head_stage
         return run_head_stage(self.m, torch.from_numpy(r2), gen.sampling(), rows=False).output
 

@@ -29,10 +29,9 @@ class FastGen:
     def __init__(self, m: DetQwen3, B: int, S: int):
         assert m.hd == 128 and m.device.type == "cuda", "fast generation needs head_dim 128 on a GPU"
         self.m, self.B, self.S = m, B, S
-        dev = m.device
-        z = lambda *s, dt=torch.int8: torch.zeros(*s, dtype=dt, device=dev)
-        self.cache = [dict(k=z(B, S, m.Hkv, 128), ks=z(B, S, m.Hkv, dt=F32), v=z(B, S, m.Hkv, 128), vs=z(B, S, m.Hkv, dt=F32))
-                      for _ in m.layers]
+        z = lambda d, *s, dt=torch.int8: torch.zeros(*s, dtype=dt, device=d)
+        self.cache = [dict(k=z(L["dev"], B, S, m.Hkv, 128), ks=z(L["dev"], B, S, m.Hkv, dt=F32),
+                           v=z(L["dev"], B, S, m.Hkv, 128), vs=z(L["dev"], B, S, m.Hkv, dt=F32)) for L in m.layers]
 
     # ------------------------------------------------------------ layers
     def _qkv(self, L, c, x, bidx, pos):
@@ -42,7 +41,7 @@ class FastGen:
         q1, s1 = K.rmsnorm_quant(x, L["in_norm"], m.eps, L["qkv"].bs)
         N = x.shape[0]  # rope per row: T = N rows, cos/sin gathered at each row's position
         qq, qs, kq, ks, vq, vs = K.qkv_post(L["qkv"].int_gemm(q1), s1, L["qkv"].sw, L["q_norm"], L["k_norm"],
-                                            m.cos[pos].contiguous(), m.sin[pos].contiguous(), N, m.H, m.Hkv, m.eps, m.qk_norm)
+                                            L["cos"][pos].contiguous(), L["sin"][pos].contiguous(), N, m.H, m.Hkv, m.eps, m.qk_norm)
         c["k"][bidx, pos], c["ks"][bidx, pos] = kq, ks[..., 0]
         c["v"][bidx, pos], c["vs"][bidx, pos] = vq, vs[..., 0]
         return qq, qs, kq, ks, vq, vs
@@ -65,28 +64,34 @@ class FastGen:
         bidx = torch.full((P,), b, device=dev, dtype=torch.long)
         pos = torch.arange(P, device=dev)
         for L, c in zip(m.layers, self.cache):
+            d = m.enter(L["dev"])
+            x, bidx, pos = x.to(d), bidx.to(d), pos.to(d)
             qq, qs, kq, ks, vq, vs = self._qkv(L, c, x, bidx, pos)
             # the prompt attends within itself: the full-sequence kernel (the cache holds the same k, v)
             oc = K.attention(qq, qs, kq, ks, vq, vs, 1, P, m.H, m.Hkv, m.inv_sqrt_hd)
             x = self._rest(L, x, oc)
-        return core.det_rmsnorm(x[-1:], m.norm, m.eps)
+        return core.det_rmsnorm(x[-1:].to(m.enter(m.out_device)), m.norm, m.eps)
 
     @torch.no_grad()
     def step(self, bidx: torch.Tensor, toks: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         """One token per row (sequence bidx at position pos); returns final-norm rows (R, D)."""
         m = self.m
-        x = m.embed[toks]
+        x = m.embed[toks.to(m.device)]
         for L, c in zip(m.layers, self.cache):
+            d = m.enter(L["dev"])
+            x, bidx, pos = x.to(d), bidx.to(d), pos.to(d)
             qq, qs, *_ = self._qkv(L, c, x, bidx, pos)
             oc = GK.attention_cache(qq, qs, c["k"], c["ks"], c["v"], c["vs"], pos, bidx, m.H, m.Hkv, m.inv_sqrt_hd)
             x = self._rest(L, x, oc)
-        return core.det_rmsnorm(x, m.norm, m.eps)
+        return core.det_rmsnorm(x.to(m.enter(m.out_device)), m.norm, m.eps)
 
 
 def sample(m: DetQwen3, hn: torch.Tensor, pos: torch.Tensor, s: Sampling) -> tuple[torch.Tensor, torch.Tensor]:
     """Tokens and scores (float32) for final-norm rows hn (R, D) at positions pos (R,)."""
     from detgpu import kernels as K
     lm = m.lm_head
+    d = m.enter(m.out_device)
+    hn, pos = hn.to(d), pos.to(d)
     q, sx = K.quant_act(hn.contiguous(), lm.bs)
     lg = lm.int_gemm(q).to(F32) * sx[:, None] * lm.sw[None, :]
     if s.temp_milli:
@@ -100,7 +105,7 @@ def sample(m: DetQwen3, hn: torch.Tensor, pos: torch.Tensor, s: Sampling) -> tup
 def generate(m: DetQwen3, prompts: list[list[int]], T: int, s: Sampling, on_step=None) -> list[list[int]]:
     """Every sequence: its prompt followed by generated tokens up to length T. on_step(seqs), if
     given, is called after every decoding step (a provider streams partial results from it)."""
-    dev = m.device
+    dev = m.out_device  # where sampling runs (the step moves rows to each layer's GPU)
     g = FastGen(m, len(prompts), T)
     seqs = [list(p) for p in prompts]
     hn = torch.cat([g.prefill(b, p) for b, p in enumerate(prompts)])
@@ -125,6 +130,7 @@ def head_outputs(m: DetQwen3, r2: torch.Tensor, s: Sampling, rows: int = 256) ->
     """The head stage's output rows [token, score bits] (B, T-1, 2) int32 from the last layer's R2
     rows r2 (B, T, D) on the GPU (bit-identical to detgen.head.run_head_stage(rows=False))."""
     B, T, D = r2.shape
+    r2 = r2.to(m.enter(m.out_device))
     flat = core.det_rmsnorm(r2[:, :T - 1].reshape(-1, D).to(F32), m.norm, m.eps)
     pos = torch.arange(T - 1, device=r2.device).repeat(B)
     toks, scs = [], []
