@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import faulthandler
 import hashlib
 import io
 import json
 import os
 import random
 import secrets
+import signal
 import sys
 import threading
 import time
@@ -50,6 +52,12 @@ def log(*a):
 
 class Agent:
     role = "agent"
+    # True: every GPU use runs on the worker thread (roles whose worker runs passes while the
+    # main loop answers deadlines). The runtime and its job miner are not thread-safe: on
+    # 2026-11-09 a provider's main loop computing a game trace while the worker ran a job hung
+    # for three hours in the miner's shared gateway socket and missed 28 reveal deadlines.
+    gpu_async = False
+    WATCH_EVERY = 30.0  # seconds between watchdog checks
 
     def __init__(self, a: argparse.Namespace):
         self.a = a
@@ -85,6 +93,70 @@ class Agent:
         self.worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.worker_io = concurrent.futures.ThreadPoolExecutor(max_workers=1)  # uploads that must not hold up the GPU
         self.busy: concurrent.futures.Future | None = None
+        self._gpu_tasks: dict[tuple, tuple[concurrent.futures.Future, float]] = {}
+        self._task: tuple[str, float] | None = None  # the worker's running task, for the watchdog
+        self._beat = time.time()  # the main loop's last finished step
+
+    def submit(self, what: str, fn, *args) -> concurrent.futures.Future:
+        """Queue fn on the GPU worker; the watchdog reports a task that runs too long."""
+        def task():
+            self._task = (what, time.time())
+            try:
+                return fn(*args)
+            finally:
+                self._task = None
+        return self.worker.submit(task)
+
+    def on_gpu(self, key: tuple, fn):
+        """fn's result, computed on the GPU worker for roles with gpu_async: None until it is
+        done (the caller retries on a later step, so the main loop never waits on the GPU).
+        Other roles compute it here."""
+        if not self.gpu_async:
+            return fn()
+        now = time.time()
+        for k, (f, t) in list(self._gpu_tasks.items()):  # results nobody came back for (a game that ended)
+            if f.done() and now - t > 3600:
+                del self._gpu_tasks[k]
+        f, _ = self._gpu_tasks.get(key, (None, 0))
+        if f is None:
+            self._gpu_tasks[key] = (self.submit(" ".join(str(k)[:16] for k in key), fn), now)
+            return None
+        if not f.done():
+            return None
+        del self._gpu_tasks[key]
+        try:
+            return f.result()
+        except Exception:
+            log(f"GPU task {key[0]} failed (retried next step):")
+            traceback.print_exc()
+            return None
+
+    def watchdog(self, stop: threading.Event | None = None):
+        """Log every thread's stack when the main loop stops finishing steps (deadlines would
+        pass silently) or a GPU task runs far longer than any pass should."""
+        logged = {"loop": 0.0, "task": 0.0}
+        while not (stop and stop.wait(self.WATCH_EVERY)):
+            if stop is None:
+                time.sleep(self.WATCH_EVERY)
+            now = time.time()
+            stalled = now - self._beat
+            if stalled >= self.a.stall and now - logged["loop"] >= self.a.stall:
+                logged["loop"] = now
+                log(f"WATCHDOG: the main loop has not finished a step for {stalled:.0f}s")
+                self.dump_threads()
+            t = self._task
+            if t and now - t[1] >= self.a.task_stall and now - logged["task"] >= self.a.task_stall:
+                logged["task"] = now
+                log(f"WATCHDOG: the GPU worker has run '{t[0]}' for {now - t[1]:.0f}s")
+                self.dump_threads()
+
+    @staticmethod
+    def dump_threads():
+        names = {t.ident: t.name for t in threading.enumerate()}
+        for ident, frame in sys._current_frames().items():
+            if names.get(ident) == "watchdog":
+                continue
+            print(f"--- thread {names.get(ident, ident)}:\n" + "".join(traceback.format_stack(frame)), end="", flush=True)
 
     @contextlib.contextmanager
     def gpu_pass(self):
@@ -164,9 +236,17 @@ class Agent:
         cache = self.__dict__.setdefault("_gen_seqs", {})
         if j["id"] not in cache:
             from .compute import prompt_of
-            t = time.time()
-            cache[j["id"]] = self.rt.generate([prompt_of(r) for r in rows], j["seqlen"], self.gen(j))
-            log(f"job {j['id'][:8]}: regenerated {len(rows)} sequences in {time.time() - t:.1f}s")
+            gen = self.gen(j)
+
+            def regenerate():
+                t = time.time()
+                seqs = self.rt.generate([prompt_of(r) for r in rows], j["seqlen"], gen)
+                log(f"job {j['id'][:8]}: regenerated {len(rows)} sequences in {time.time() - t:.1f}s")
+                return seqs
+            seqs = self.on_gpu(("regenerate", j["id"]), regenerate)
+            if seqs is None:
+                return None
+            cache[j["id"]] = seqs
             while len(cache) > 16:
                 cache.pop(next(iter(cache)))
         return cache[j["id"]]
@@ -210,7 +290,10 @@ class Agent:
             if as_provider:
                 self.one_step(j, b, js, tag)
             return
-        op = move(j["id"], g, self.game_trace(j, b, g["stage"], as_provider))
+        tr = self.on_gpu(("trace", j["id"], g["stage"], as_provider), lambda: self.game_trace(j, b, g["stage"], as_provider))
+        if tr is None:
+            return
+        op = move(j["id"], g, tr)
         if op and self.send([op], f"game {j['id'][:8]} stage {g['stage']} phase {g['phase']} lo {g['lo']} size {g['size']}"):
             js["last_move"], js["last_move_h"] = tag, h
             self.save()
@@ -225,17 +308,27 @@ class Agent:
         os.makedirs(d, exist_ok=True)
         gen = self.gen(j)
         per = self.per_batch(j)
+        stage = g["stage"]
+        hs = (stage // per) * per + self.G
+
+        def rows():  # on the GPU worker: (previous stage's outputs, head outputs, trace rows)
+            prev = list(self.rt.stage_output(b, stage - 1, gen)) if stage % per else None
+            head = list(self.rt.stage_output(b, hs, gen)) if gen is not None else None
+            return prev, head, self.rt.trace(b, stage, gen).rows
+        got = self.on_gpu(("onestep", j["id"], tag), rows)
+        if got is None:
+            return
+        prev, head, trace_rows = got
         req = {"job": j["id"], "model": self.a.model, "weights": self.a.weights, "rows": os.path.join(d, "rows.bin"),
                "prev_outputs": "", "batches": b, "salts": js["salts"], "roots": js["roots"]}
-        if g["stage"] % per:
-            write_rows(os.path.join(d, "prev.bin"), list(self.rt.stage_output(b, g["stage"] - 1, gen)))
+        if prev is not None:
+            write_rows(os.path.join(d, "prev.bin"), prev)
             req["prev_outputs"] = os.path.join(d, "prev.bin")
         if gen is not None:
             req.update(gen=True, temp_milli=gen.temp_milli, input_rows=self.input_batches(j),
                        head_outputs=os.path.join(d, "head.bin"))
-            hs = (g["stage"] // per) * per + self.G
-            write_rows(req["head_outputs"], list(self.rt.stage_output(b, hs, gen)))
-        write_rows(req["rows"], self.rt.trace(b, g["stage"], gen).rows)
+            write_rows(req["head_outputs"], head)
+        write_rows(req["rows"], trace_rows)
         json.dump(req, open(os.path.join(d, "req.json"), "w"))
         try:
             r = self.chain.run("onestep", self.key, os.path.join(d, "req.json"))
@@ -287,13 +380,16 @@ class Agent:
 
     def run(self):
         log(f"{self.role} {self.account[:12]} starting")
+        faulthandler.register(signal.SIGUSR1, all_threads=True)  # kill -USR1 <pid>: every thread's stack
+        threading.Thread(target=self.watchdog, name="watchdog", daemon=True).start()
         if self.role != "client":  # load the model in the background; reveals need no model
-            self.busy = self.worker.submit(lambda: self.rt)
+            self.busy = self.submit("load model", lambda: self.rt)
         while True:
             try:
                 self.step()
             except Exception:
                 traceback.print_exc()
+            self._beat = time.time()
             time.sleep(self.a.poll)
 
     def step(self):
@@ -306,6 +402,7 @@ class Provider(Agent):
     """Claims pool units and accepts client jobs, runs every stage, commits salted stage roots
     and the output root, delivers outputs off-chain, reveals what is requested."""
     role = "provider"
+    gpu_async = True
 
     def step(self):
         s = self.chain.state()
@@ -378,7 +475,7 @@ class Provider(Agent):
                                                                           self.st["jobs"].get(x, {}).get("claimed", 0)))
         if order and order[0] in self.gen_ready:  # a generation job runs alone in its pass
             jid = order[0]
-            self.busy = self.worker.submit(self.compute_gen, jid, self.ready[jid], self.gen_ready[jid])
+            self.busy = self.submit(f"generation job {jid[:8]}", self.compute_gen, jid, self.ready[jid], self.gen_ready[jid])
             return
         order = [x for x in order if x not in self.gen_ready]
         items, n = [], 0
@@ -389,7 +486,7 @@ class Provider(Agent):
                 break
             items.append((jid, b))
             n += tok
-        self.busy = self.worker.submit(self.compute_jobs, items)
+        self.busy = self.submit(f"pass {' '.join(x[:8] for x, _ in items)}", self.compute_jobs, items)
 
     def claim(self, s: dict):
         cats = [(cid, c) for cid, c in s["categories"].items()
@@ -594,7 +691,7 @@ class Provider(Agent):
                 served.append(name)  # nothing to serve: the verifier recomputes the prefix
                 continue
             queued.add(name)
-            self.worker.submit(self.serve_input, jid, name, stage, b, self.gen(j))
+            self.submit(f"stage {stage} input of {jid[:8]}", self.serve_input, jid, name, stage, b, self.gen(j))
 
     def serve_input(self, jid: str, name: str, stage: int, b: list[list[int]], gen=None):
         import base64
@@ -997,6 +1094,11 @@ class Decoy(Provider):
             log("decoy: Rules 2 needs the commitment's stage key (agent.fe commit writes decoy.json)")
             self.st["last_post"] = h
             return
+        # honest roots first, on the GPU worker (they do not depend on the job id): the job is
+        # posted on a later step, once they are ready
+        done = self.on_gpu(("decoy roots", n), lambda: [self.rt.batch(toks) for toks in seqs])
+        if done is None:
+            return
         root = input_root(seqs).hex()
         self.data.put(f"/inputs/{root}.json", json.dumps({"batches": seqs}).encode())
         # Rules 2: the job is directed to the decoy account (no accept race), and its wrong stage
@@ -1011,8 +1113,7 @@ class Decoy(Provider):
             return
         jid = r["job"]
         roots, embs = [], []
-        for toks in seqs:
-            rr, e = self.rt.batch(toks)
+        for rr, e in done:
             roots += rr
             embs.append(e)
         if key is not None:
@@ -1047,6 +1148,10 @@ def main() -> None:
     ap.add_argument("--engine", default="detgpu", choices=["detgpu", "detrt"],
                     help="detgpu: fast engine, bit-identical to the registered runtime detrt")
     ap.add_argument("--weights", default=os.path.join(DEVNET, "weights", "qwen3-1.7b"))
+    ap.add_argument("--stall", type=float, default=600.0,
+                    help="watchdog: log every thread's stack when the main loop has not finished a step for this many seconds")
+    ap.add_argument("--task-stall", type=float, default=1800.0,
+                    help="watchdog: log every thread's stack when one GPU task has run this many seconds")
     # provider
     ap.add_argument("--max-jobs", type=int, default=None,
                     help="provider: jobs accepted or claimed but not yet committed (default 4); decoy: active decoys (default 1)")

@@ -8,8 +8,10 @@ DetLinear.int_gemm from outside.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -24,13 +26,17 @@ from pearl_gateway.config import MinerRpcConfig  # noqa: E402
 from uwc_ampere import ops, pearl_glue as pg  # noqa: E402
 
 RANK = 128
+RPC_TIMEOUT = 30.0  # seconds; the gateway client's socket has no timeout of its own
 
 
 class JobMiner:
     def __init__(self, model, socket_path: str, log=print):
         self.m, self.log = model, log
-        self.client = MiningClient(MinerRpcConfig(transport="uds", socket_path=socket_path))
         self.socket_path = socket_path
+        # one gateway connection, one request at a time: two threads sharing its reader can
+        # leave one waiting forever for a reply the other consumed
+        self.lock = threading.RLock()
+        self.client = self._connect()
         self.header = None
         self.job = None
         self.keys: dict[int, bytes] = {}
@@ -58,17 +64,33 @@ class JobMiner:
             DetLinear._orig_int_gemm = DetLinear.int_gemm
         DetLinear.int_gemm = int_gemm
 
+    def _connect(self) -> MiningClient:
+        c = MiningClient(MinerRpcConfig(transport="uds", socket_path=self.socket_path))
+        c.client._socket.settimeout(RPC_TIMEOUT)
+        return c
+
+    def _call(self, fn):
+        """One gateway request; on any failure (a timeout included) the connection is replaced."""
+        with self.lock:
+            try:
+                return fn(self.client)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self.client.close()
+                with contextlib.suppress(Exception):
+                    self.client = self._connect()
+                raise
+
     def refresh(self) -> bool:
         """Re-key every mined layer when the block template changes. False if no template."""
+        with self.lock:
+            return self._refresh()
+
+    def _refresh(self) -> bool:
         try:
-            job = self.client.get_mining_info()
+            job = self._call(lambda c: c.get_mining_info())
         except Exception as e:
             self.log(f"mining: no template ({e})")
-            try:
-                self.client.close()
-            except Exception:
-                pass
-            self.client = MiningClient(MinerRpcConfig(transport="uds", socket_path=self.socket_path))
             for lin in self.linears:
                 lin.mine = False
             return False
@@ -105,7 +127,7 @@ class JobMiner:
             self.log(f"mining: a job tile won but failed local verification: {msg}")
             return
         try:
-            self.client.submit_plain_proof(proof, self.job)
+            self._call(lambda c: c.submit_plain_proof(proof, self.job))
             self.submitted += 1
             self.log(f"mining: submitted a winning tile found while serving a job (layer k={lin.k})")
         except Exception as e:
