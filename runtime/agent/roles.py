@@ -890,7 +890,8 @@ class Watcher(Agent):
                 self.save()
                 continue
             b = self.batches(j)
-            if b is None:
+            if b is None:  # inputs not available yet (e.g. a work list fetch failed): try again later
+                del self.st["jobs"][jid]
                 continue
             stage = rng.randrange(j["stages"])
             t = time.time()
