@@ -183,7 +183,8 @@ class Runtime:
             for c0 in range(0, len(items), chunk):
                 part = items[c0:c0 + chunk]
                 outs = job_outputs(self.m, torch.tensor([x[2] for x in part], dtype=torch.long), self.G)
-                done.append((part, torch.stack([stage_roots_gpu(o) for o in outs]), pooled_gpu(outs[-1])))
+                # layers split over GPUs (device="cuda:0,cuda:1"): each stage's 32-byte roots move to the last one
+                done.append((part, torch.stack([stage_roots_gpu(o).to(outs[-1].device) for o in outs]), pooled_gpu(outs[-1])))
                 del outs
         torch.cuda.synchronize()
         self.last_gpu_s = time.time() - t
@@ -237,7 +238,7 @@ class Runtime:
             for c0 in range(0, len(seqs), 16):
                 part = seqs[c0:c0 + 16]
                 outs = job_outputs(self.m, torch.tensor(part, dtype=torch.long), self.G)
-                rr = digest_bytes(torch.stack([stage_roots_gpu(o) for o in outs]))
+                rr = digest_bytes(torch.stack([stage_roots_gpu(o).to(outs[-1].device) for o in outs]))
                 hs = head_outputs(self.m, outs[-1], gen.sampling())
                 for b in range(len(part)):
                     heads.append(hs[b])
