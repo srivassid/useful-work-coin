@@ -94,13 +94,15 @@ def logits(m: DetQwen3, hq: torch.Tensor, sx: torch.Tensor, v0: int, v1: int) ->
     lm = m.lm_head
     if hq.device.type == "cpu":
         acc = hq.to(torch.float64) @ lm.Wq64[v0:v1].t()
-    else:  # torch._int_mm wants >16 rows and a multiple of 8 columns: pad both, slice the result
+    else:  # torch._int_mm wants >16 rows and a multiple of 8 columns: pad both, slice the result.
+        # The weights go in as a column-major view (as DetLinear does): on sm_86 cuBLASLt refuses a
+        # row-major second operand unless the rows are a multiple of 32. Exact either way.
         n, w = hq.shape[0], v1 - v0
         mp, wp = max(32, -(-n // 8) * 8), -(-w // 8) * 8
         qp = torch.nn.functional.pad(hq, (0, 0, 0, mp - n)) if mp != n else hq
         Wc = lm.Wq[v0:v1]
         Wc = torch.nn.functional.pad(Wc, (0, 0, 0, wp - w)) if wp != w else Wc
-        acc = torch._int_mm(qp.contiguous(), Wc.t().contiguous())[:n, :w]
+        acc = torch._int_mm(qp.contiguous(), Wc.contiguous().t())[:n, :w]
     return fmul(fmul(acc.to(F32), sx[:, None]), lm.sw[None, v0:v1])
 
 

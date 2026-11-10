@@ -75,6 +75,7 @@ def main():
     ap.add_argument("--ppl-chunks", type=int, default=16)
     ap.add_argument("--ppl-len", type=int, default=512)
     ap.add_argument("--skip-ppl", action="store_true")
+    ap.add_argument("--no-bf16", action="store_true", help="skip the bf16 transformers perplexity (it may not fit a 10 GB GPU)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     from transformers import AutoModelForCausalLM
@@ -87,7 +88,7 @@ def main():
     hf = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cpu").eval()
     print(f"{hf.config.model_type}: {sum(p.numel() for p in hf.parameters()) / 1e9:.2f}B params, loaded in {time.time() - t:.0f}s", flush=True)
     chunks = [] if a.skip_ppl else wikitext_sequences(DATASET, a.model, a.ppl_len, a.ppl_chunks)
-    if chunks:
+    if chunks and not a.no_bf16:
         hf.to(dev)
         res["ppl_bf16"] = hf_ppl(hf, chunks, dev)
         hf.to("cpu")
@@ -151,9 +152,10 @@ def main():
     if chunks:
         t = time.time()
         res["ppl_det"] = det_ppl(m, chunks)
-        rel = res["ppl_det"] / res["ppl_bf16"] - 1
-        print(f"deterministic W7A7 (Hadamard {a.hadamard}) perplexity {res['ppl_det']:.4f} vs bf16 {res['ppl_bf16']:.4f}: "
-              f"{100 * rel:+.2f}% ({time.time() - t:.0f}s)", flush=True)
+        line = f"deterministic W7A7 (Hadamard {a.hadamard}) perplexity {res['ppl_det']!r}"
+        if "ppl_bf16" in res:
+            line += f" vs bf16 {res['ppl_bf16']:.4f}: {100 * (res['ppl_det'] / res['ppl_bf16'] - 1):+.2f}%"
+        print(f"{line} ({time.time() - t:.0f}s)", flush=True)
     if a.out:
         json.dump(res, open(a.out, "w"), indent=1)
     print("ARCH GPU CHECKS PASS")
