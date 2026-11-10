@@ -1,0 +1,99 @@
+From db5205874f6c05ea611b2a69b131bae0634fded8 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Tue, 10 Nov 2026 11:06:23 +0530
+Subject: [PATCH] pearld --maxtipage: how old the best block may be for the
+ chain to count as synced
+
+Not a consensus rule. The default stays 24 hours. A node refuses block templates while its tip
+is older, so a chain that stood still for longer (the testnet, stopped at block 2554 for two
+days) could not be restarted; one node with a larger --maxtipage mines the first block, after
+which the tip is current again for everyone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuzogEfSRnjn3KNzFm
+---
+ node/blockchain/chain.go | 18 ++++++++++++++----
+ node/config.go           |  1 +
+ node/server.go           |  1 +
+ 3 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/node/blockchain/chain.go b/node/blockchain/chain.go
+index a9eea352..1c821c54 100644
+--- a/node/blockchain/chain.go
++++ b/node/blockchain/chain.go
+@@ -106,6 +106,7 @@ type BlockChain struct {
+ 	indexManager        IndexManager
+ 	hashCache           *txscript.HashCache
+ 	metrics             Metrics
++	maxTipAge           time.Duration // a best block older than this is not current (default 24h)
+ 
+ 	// chainLock protects concurrent access to the vast majority of the
+ 	// fields in this struct below this point.
+@@ -1394,13 +1395,16 @@ func (b *BlockChain) isCurrentAt(height int32, timestamp int64) bool {
+ 		return false
+ 	}
+ 
+-	// Not current if the latest best block has a timestamp before 24 hours
+-	// ago.
++	// Not current if the latest best block has a timestamp before MaxTipAge (24 hours by
++	// default) ago.
+ 	//
+ 	// The chain appears to be current if none of the checks reported
+ 	// otherwise.
+-	minus24Hours := b.timeSource.AdjustedTime().Add(-24 * time.Hour).Unix()
+-	return timestamp >= minus24Hours
++	age := b.maxTipAge
++	if age <= 0 {
++		age = 24 * time.Hour
++	}
++	return timestamp >= b.timeSource.AdjustedTime().Add(-age).Unix()
+ }
+ 
+ // IsCurrent returns whether or not the chain believes it is current.  Several
+@@ -2267,6 +2271,11 @@ type Config struct {
+ 
+ 	// Metrics records events. Nil Metrics discards them.
+ 	Metrics Metrics
++
++	// MaxTipAge: the chain is not current while its best block is older than this (zero: 24
++	// hours). A larger value lets a node build on a chain that stood still for longer, such as a
++	// testnet restarted after days without miners.
++	MaxTipAge time.Duration
+ }
+ 
+ // New returns a BlockChain instance using the provided configuration details.
+@@ -2337,6 +2346,7 @@ func New(config *Config) (*BlockChain, error) {
+ 
+ 	params := config.ChainParams
+ 	b := BlockChain{
++		maxTipAge:           config.MaxTipAge,
+ 		checkpoints:         config.Checkpoints,
+ 		checkpointsByHeight: checkpointsByHeight,
+ 		db:                  config.DB,
+diff --git a/node/config.go b/node/config.go
+index b253d0ff..af20549e 100644
+--- a/node/config.go
++++ b/node/config.go
+@@ -185,6 +185,7 @@ type config struct {
+ 	TorIsolation             bool          `long:"torisolation" description:"Enable Tor stream isolation by randomizing user credentials for each connection."`
+ 	TrickleInterval          time.Duration `long:"trickleinterval" description:"Minimum time between attempts to send new inventory to a connected peer"`
+ 	UtxoCacheMaxSizeMiB      uint          `long:"utxocachemaxsize" description:"The maximum size in MiB of the UTXO cache"`
++	MaxTipAge                time.Duration `long:"maxtipage" description:"The chain counts as synced (block templates, relay) while its best block is younger than this (default 24h); raise it to restart a chain that stood still longer"`
+ 	DbCacheFlushIntervalSecs uint32        `long:"dbcacheflushinterval" description:"The database cache flush interval in seconds"`
+ 	TxIndex                  bool          `long:"txindex" description:"Maintain a full hash-based transaction index which makes all transactions available via the getrawtransaction RPC"`
+ 	UserAgentComments        []string      `long:"uacomment" description:"Comment to add to the user agent -- See BIP 14 for more information."`
+diff --git a/node/server.go b/node/server.go
+index fe61b45b..bd4f3b9d 100644
+--- a/node/server.go
++++ b/node/server.go
+@@ -3094,6 +3094,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 		Prune:            cfg.Prune * 1024 * 1024,
+ 		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+ 		Metrics:          metrics.Recorder{},
++		MaxTipAge:        cfg.MaxTipAge,
+ 	})
+ 	if err != nil {
+ 		return nil, err
+-- 
+2.30.2
+
