@@ -916,6 +916,10 @@ class Watcher(Agent):
                 if self.send([{"kind": "CHALLENGE", "job": jid, "u1": stage, "h1": root, "amount": self.challenge_bond(j)}],
                              f"check {jid[:8]} stage {stage}"):
                     js["challenged"] = True
+                else:  # not sent (e.g. too many unconfirmed transactions): check it again on a later step
+                    del self.st["jobs"][jid]
+                    self.save()
+                    return
             self.save()
 
 
