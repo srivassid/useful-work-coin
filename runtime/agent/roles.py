@@ -171,6 +171,12 @@ class Agent:
             if p:
                 with contextlib.suppress(FileNotFoundError):
                     os.remove(p)
+            # give cached blocks back: several agents share a GPU, and PyTorch's cache otherwise
+            # grows to the largest pass each has run (a Mistral provider held 16.6 GB on the 5090)
+            with contextlib.suppress(Exception):
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     rt_lock = threading.Lock()
 
