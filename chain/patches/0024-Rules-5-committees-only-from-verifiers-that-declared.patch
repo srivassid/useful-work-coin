@@ -1,0 +1,653 @@
+From 607e1aab8604e5b2c0a4e340d9cceed7b6a341e8 Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Tue, 10 Nov 2026 21:12:10 +0530
+Subject: [PATCH] Rules 5: committees only from verifiers that declared the
+ job's model
+
+With several models' pools open (testnet Rules 4), DrawCommittee seated any staker on any job:
+verifiers holding only Qwen3 were drawn for Llama and Mistral jobs, could not compute them, paid
+the no-show penalty, and 7 wrong Llama jobs settled with no verifier able to check them.
+
+VERIFIER_MODELS (op 24): an account declares up to 16 registered models it verifies (strictly
+increasing ids; empty withdraws). From Rules 5:
+- a staker is drawn for a job only if it declared the job's model;
+- JOB_ACCEPT and POOL_CLAIM fail unless a staked verifier of the model exists;
+- a committed job for which no committee can be drawn (its verifiers left after the claim) is
+  aborted with the fee (a pool unit's verification pay, back to its category) and bond returned.
+Before Rules 5 the op fails and everything behaves as in Rules 4. Declarations are committed in
+the state root under 'v' (no entries before Rules 5, so old roots are unchanged).
+
+RPC: getjobstate adds verifiers (model -> staked verifiers that declared it), getjobaccount adds
+models. uwcctl verifiermodels <key> [model ...]. Not scheduled on any network yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuzogEfSRnjn3KNzFm
+---
+ node/cmd/uwcctl/main.go      |  11 ++
+ node/jobstate/apply.go       |  92 +++++++++++++-
+ node/jobstate/ops.go         |  53 +++++---
+ node/jobstate/pool.go        |   3 +
+ node/jobstate/rules5_test.go | 231 +++++++++++++++++++++++++++++++++++
+ node/jobstate/state.go       |  19 +++
+ node/rpcjobs.go              |  16 ++-
+ 7 files changed, 399 insertions(+), 26 deletions(-)
+ create mode 100644 node/jobstate/rules5_test.go
+
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index 992cf910..ad1ae9dd 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -6,11 +6,13 @@
+ package main
+ 
+ import (
++	"bytes"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+ 	"os"
++	"sort"
+ 	"strconv"
+ 
+ 	"github.com/pearl-research-labs/pearl/node/btcec/schnorr"
+@@ -36,6 +38,7 @@ money
+   deposit <key> <amount> [account]    credit a module account (default: the key's own)
+   stake <key> <amount>                verifier stake
+   unstake <key> <amount>
++  verifiermodels <key> [model ...]    declare the models this verifier holds (Rules 5; none: withdraw)
+   withdraw <key> <amount>             back to the key's own P2TR script (paid by a later coinbase)
+ 
+ jobs
+@@ -238,6 +241,14 @@ func main() {
+ 			kind = jobstate.OpUnstake
+ 		}
+ 		submit(key(args[0]), nil, &jobstate.Op{Kind: kind, Amount: amount(args[1])})
++	case "verifiermodels":
++		need(args, 1)
++		var ms []jobstate.Hash
++		for _, m := range args[1:] {
++			ms = append(ms, hash32(m))
++		}
++		sort.Slice(ms, func(i, j int) bool { return bytes.Compare(ms[i][:], ms[j][:]) < 0 }) // the chain wants increasing order
++		submit(key(args[0]), nil, &jobstate.Op{Kind: jobstate.OpVerifierModels, Roots: ms})
+ 	case "withdraw":
+ 		need(args, 2)
+ 		k := key(args[0])
+diff --git a/node/jobstate/apply.go b/node/jobstate/apply.go
+index d45927cc..3092af0b 100644
+--- a/node/jobstate/apply.go
++++ b/node/jobstate/apply.go
+@@ -203,6 +203,9 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		if o.Amount < minBond(p, j.Fee) {
+ 			return errors.New("bond below minimum")
+ 		}
++		if !s.HasVerifierFor(p, j.Model, j.Client, o.Actor) {
++			return errNoVerifier
++		}
+ 		if err := s.debit(o.Actor, o.Amount); err != nil {
+ 			return err
+ 		}
+@@ -313,6 +316,8 @@ func (s *State) applyOp(p Params, h int32, o *Op) error {
+ 		return s.feCommit(p, h, o)
+ 	case OpPoolClaim:
+ 		return s.poolClaim(p, h, o)
++	case OpVerifierModels:
++		return s.declareModels(p, o)
+ 	case OpCanary:
+ 		return s.canaryReveal(p, h, o)
+ 	case OpFEReveal:
+@@ -481,10 +486,11 @@ func Positions(salt Hash, stages uint32, n int) []uint32 {
+ 	return out
+ }
+ 
+-// DrawCommittee picks up to k distinct stakers (stake >= MinVerifierStake), excluding the job's
+-// client and provider, by successive stake-weighted sampling: seat i takes
+-// H(seed || job || i) mod (remaining eligible stake) and walks the cumulative stake of the
+-// remaining candidates in account order. Each pick is exactly proportional to stake.
++// DrawCommittee picks up to k distinct stakers (stake >= MinVerifierStake; from Rules 5 only
++// those that declared the job's model), excluding the job's client and provider, by successive
++// stake-weighted sampling: seat i takes H(seed || job || i) mod (remaining eligible stake) and
++// walks the cumulative stake of the remaining candidates in account order. Each pick is exactly
++// proportional to stake.
+ func DrawCommittee(s *State, p Params, j *Job, seed Hash) []AccountID {
+ 	type cand struct {
+ 		a     AccountID
+@@ -493,7 +499,7 @@ func DrawCommittee(s *State, p Params, j *Job, seed Hash) []AccountID {
+ 	var cs []cand
+ 	total := Amount(0)
+ 	for a, st := range s.Stakes {
+-		if st < p.MinVerifierStake || a == j.Client || a == j.Provider {
++		if !s.eligible(p, a, st, j.Model, j.Client, j.Provider) {
+ 			continue
+ 		}
+ 		cs = append(cs, cand{a, st})
+@@ -515,6 +521,76 @@ func DrawCommittee(s *State, p Params, j *Job, seed Hash) []AccountID {
+ 	return out
+ }
+ 
++var errNoVerifier = errors.New("no staked verifier holds this job's model")
++
++// eligible: may staker a (stake st) sit on a committee for a job of model m between client and
++// provider? From Rules 5 it must have declared m (VERIFIER_MODELS).
++func (s *State) eligible(p Params, a AccountID, st Amount, m Hash, client, provider AccountID) bool {
++	if st < p.MinVerifierStake || a == client || a == provider {
++		return false
++	}
++	if p.Rules < 5 {
++		return true
++	}
++	ms := s.VerifierModels[a]
++	i := sort.Search(len(ms), func(i int) bool { return bytes.Compare(ms[i][:], m[:]) >= 0 })
++	return i < len(ms) && ms[i] == m
++}
++
++// HasVerifierFor reports whether a committee could be drawn for a job of model m between client
++// and provider. Before Rules 5 it is always true (any staker is drawn, whatever it runs); from
++// Rules 5 a provider cannot take work that no verifier would check (JOB_ACCEPT, POOL_CLAIM).
++func (s *State) HasVerifierFor(p Params, m Hash, client, provider AccountID) bool {
++	if p.Rules < 5 {
++		return true
++	}
++	for a, st := range s.Stakes {
++		if s.eligible(p, a, st, m, client, provider) {
++			return true
++		}
++	}
++	return false
++}
++
++// declareModels (VERIFIER_MODELS, Rules >= 5) replaces the actor's list of models it verifies.
++// The list must name registered models in strictly increasing order; an empty list withdraws.
++// Declaring needs no stake: the models count once the account stakes at least MinVerifierStake.
++func (s *State) declareModels(p Params, o *Op) error {
++	if p.Rules < 5 {
++		return errors.New("VERIFIER_MODELS needs Rules 5")
++	}
++	if len(o.Roots) > MaxVerifierModels {
++		return errors.New("too many models")
++	}
++	for i, m := range o.Roots {
++		if i > 0 && bytes.Compare(o.Roots[i-1][:], m[:]) >= 0 {
++			return errors.New("models are not in strictly increasing order")
++		}
++		if s.Models[m] == nil {
++			return errors.New("unknown model")
++		}
++	}
++	if len(o.Roots) == 0 {
++		delete(s.VerifierModels, o.Actor)
++		return nil
++	}
++	if s.VerifierModels == nil {
++		s.VerifierModels = map[AccountID][]Hash{}
++	}
++	s.VerifierModels[o.Actor] = append([]Hash(nil), o.Roots...)
++	return nil
++}
++
++// abortUnverifiable ends a committed job no committee could be drawn for (Rules >= 5): the
++// client's fee (a pool unit's verification pay: back to its category, which frees the unit) and
++// the provider's bond are returned; nobody is paid or penalized.
++func (s *State) abortUnverifiable(j *Job) {
++	s.refundClient(j, j.Fee)
++	s.credit(j.Provider, j.Bond)
++	s.refundCanaryBond(j)
++	j.Status, j.PhaseEnd = StatusAborted, 0
++}
++
+ // ---------------------------------------------------------------- verdicts and timers
+ 
+ func (s *State) applyVerdict(p Params, h int32, v Verdict) {
+@@ -667,7 +743,11 @@ func (s *State) advance(p Params, h int32, prevHash Hash, j *Job) {
+ 			for _, a := range DrawCommittee(s, p, j, prevHash) {
+ 				j.Committee = append(j.Committee, Verifier{Account: a})
+ 			}
+-			if len(j.Committee) == 0 {
++			if len(j.Committee) == 0 && p.Rules >= 5 {
++				// every verifier of its model left after the claim: the work cannot be checked, so
++				// it is not paid either; nobody is at fault and everything goes back
++				s.abortUnverifiable(j)
++			} else if len(j.Committee) == 0 {
+ 				j.Status, j.PhaseEnd = StatusChallenge, h+p.ChallengeWindow
+ 			} else {
+ 				j.Status, j.PhaseEnd = StatusVerifyCommit, h+p.VerifyCommitWindow
+diff --git a/node/jobstate/ops.go b/node/jobstate/ops.go
+index 99d7e671..ce39ae45 100644
+--- a/node/jobstate/ops.go
++++ b/node/jobstate/ops.go
+@@ -27,15 +27,16 @@ const (
+ 	OpOneStep
+ 	OpDataRequest
+ 	OpDataServe
+-	OpPropose      // council member proposes an action
+-	OpApprove      // council member approves a proposal
+-	OpPoolCategory // council action: open a pool category
+-	OpPoolRetire   // council action: retire a category
+-	OpFECommit     // council action: forced-error commitment and reserve
+-	OpPoolClaim    // provider claims a pool unit
+-	OpCanary       // curator reveals a canary unit's expected stage roots
+-	OpFEReveal     // anyone opens a forced-error commitment
+-	numOpKinds     = OpFEReveal
++	OpPropose        // council member proposes an action
++	OpApprove        // council member approves a proposal
++	OpPoolCategory   // council action: open a pool category
++	OpPoolRetire     // council action: retire a category
++	OpFECommit       // council action: forced-error commitment and reserve
++	OpPoolClaim      // provider claims a pool unit
++	OpCanary         // curator reveals a canary unit's expected stage roots
++	OpFEReveal       // anyone opens a forced-error commitment
++	OpVerifierModels // a verifier declares the models it holds (Rules >= 5)
++	numOpKinds       = OpVerifierModels
+ )
+ 
+ var opNames = map[OpKind]string{
+@@ -46,6 +47,7 @@ var opNames = map[OpKind]string{
+ 	OpDataRequest: "DATA_REQUEST", OpDataServe: "DATA_SERVE",
+ 	OpPropose: "PROPOSE", OpApprove: "APPROVE", OpPoolCategory: "POOL_CATEGORY", OpPoolRetire: "POOL_RETIRE",
+ 	OpFECommit: "FE_COMMIT", OpPoolClaim: "POOL_CLAIM", OpCanary: "CANARY_REVEAL", OpFEReveal: "FE_REVEAL",
++	OpVerifierModels: "VERIFIER_MODELS",
+ }
+ 
+ func (k OpKind) String() string { return opNames[k] }
+@@ -79,6 +81,7 @@ func (k OpKind) String() string { return opNames[k] }
+ //	POOL_CLAIM     Job (category id), U1 unit, H1 unit input_root, Proof (in the work list), Amount bond
+ //	CANARY_REVEAL  Job, U1 leaf index, H1 salt, Roots (expected stage roots), Proof (in the canary tree)
+ //	FE_REVEAL      Job (commitment id), H1 salt, Data (record)
++//	VERIFIER_MODELS Roots (model ids, strictly increasing, at most MaxVerifierModels; none: withdraw from all)
+ type Op struct {
+ 	Kind      OpKind
+ 	Actor     AccountID
+@@ -134,16 +137,18 @@ func weightCode(n string) uint8 {
+ }
+ 
+ const (
+-	opVersion       = 1
+-	maxPkScript     = 10_000
+-	maxRoots        = 4096
+-	maxReveals      = 4096
+-	maxProofDepth   = 64
+-	maxInputs       = 512
+-	maxRowWords     = 1 << 18
+-	maxProposal     = 4096
+-	maxRecord       = 1 + binary.MaxVarintLen64 + 32*1024
+-	MaxOpPayloadLen = 1 << 20
++	opVersion     = 1
++	maxPkScript   = 10_000
++	maxRoots      = 4096
++	maxReveals    = 4096
++	maxProofDepth = 64
++	maxInputs     = 512
++	maxRowWords   = 1 << 18
++	maxProposal   = 4096
++	// MaxVerifierModels is how many models one verifier may declare (VERIFIER_MODELS, Rules >= 5).
++	MaxVerifierModels = 16
++	maxRecord         = 1 + binary.MaxVarintLen64 + 32*1024
++	MaxOpPayloadLen   = 1 << 20
+ )
+ 
+ // Encode serializes an op (without Actor and Ref).
+@@ -279,6 +284,11 @@ func (o *Op) Encode() []byte {
+ 		b.Write(o.H1[:])
+ 		uv(uint64(len(o.Data)))
+ 		b.Write(o.Data)
++	case OpVerifierModels:
++		uv(uint64(len(o.Roots)))
++		for _, r := range o.Roots {
++			b.Write(r[:])
++		}
+ 	case OpOneStep, OpDataServe, OpDataRequest:
+ 		b.Write(o.Job[:])
+ 		w(o.U1)
+@@ -545,6 +555,11 @@ func DecodeOp(p []byte) (*Op, error) {
+ 	case OpFEReveal:
+ 		o.Job, o.H1 = r.hash(), r.hash()
+ 		o.Data = append([]byte(nil), r.take(r.uvar(maxRecord))...)
++	case OpVerifierModels:
++		n := r.uvar(MaxVerifierModels)
++		for i := 0; i < n && r.err == nil; i++ {
++			o.Roots = append(o.Roots, r.hash())
++		}
+ 	case OpOneStep, OpDataServe, OpDataRequest:
+ 		o.Job = r.hash()
+ 		o.U1 = r.u32()
+diff --git a/node/jobstate/pool.go b/node/jobstate/pool.go
+index 6e428884..cff9761c 100644
+--- a/node/jobstate/pool.go
++++ b/node/jobstate/pool.go
+@@ -333,6 +333,9 @@ func (s *State) poolClaim(p Params, h int32, o *Op) error {
+ 	if c.Budget < vp {
+ 		return errors.New("category budget cannot pay verification")
+ 	}
++	if !s.HasVerifierFor(p, c.Spec.Model, PoolAccount, o.Actor) {
++		return errNoVerifier
++	}
+ 	id := tagHash("job", o.Ref[:])
+ 	if _, ok := s.Jobs[id]; ok {
+ 		return errors.New("duplicate job")
+diff --git a/node/jobstate/rules5_test.go b/node/jobstate/rules5_test.go
+new file mode 100644
+index 00000000..f48ec2ab
+--- /dev/null
++++ b/node/jobstate/rules5_test.go
+@@ -0,0 +1,231 @@
++package jobstate
++
++import (
++	"bytes"
++	"encoding/gob"
++	"errors"
++	"reflect"
++	"sort"
++	"testing"
++)
++
++// Rules 5: committees only from verifiers that hold the job's model (testnet, 2026-11-10: with
++// Qwen3, Llama and Mistral pools open, committees were drawn from every staker, so verifiers that
++// held only Qwen3 sat on Llama jobs, failed to show and were penalized, and 7 wrong Llama jobs
++// settled with no verifier that could check them).
++
++func sortedModels(ms ...Hash) []Hash {
++	out := append([]Hash(nil), ms...)
++	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i][:], out[j][:]) < 0 })
++	return out
++}
++
++func declare(a AccountID, ms ...Hash) *Op {
++	return &Op{Kind: OpVerifierModels, Actor: a, Roots: ms}
++}
++
++// secondModel registers another model and returns its id.
++func (w *world) secondModel() Hash {
++	reg := &Op{Kind: OpModelReg, Actor: w.client, H1: w.randHash(), H2: w.randHash(), U1: 4, U2: 0, Cfg: smallCfg}
++	mustOK(w.t, w.block(nil, []*Op{reg}, nil))
++	return tagHash("model", reg.Ref[:])
++}
++
++func TestRules5VerifierModelsWireFormat(t *testing.T) {
++	for _, n := range []int{0, 1, 3, MaxVerifierModels} {
++		o := &Op{Kind: OpVerifierModels}
++		for i := 0; i < n; i++ {
++			o.Roots = append(o.Roots, Hash{byte(i + 1)})
++		}
++		d, err := DecodeOp(o.Encode())
++		if err != nil || d.Kind != OpVerifierModels || len(d.Roots) != n || (n > 0 && !reflect.DeepEqual(d.Roots, o.Roots)) {
++			t.Fatalf("%d models: %v %+v", n, err, d)
++		}
++	}
++	o := &Op{Kind: OpVerifierModels}
++	for i := 0; i <= MaxVerifierModels; i++ {
++		o.Roots = append(o.Roots, Hash{byte(i + 1)})
++	}
++	if _, err := DecodeOp(o.Encode()); err == nil {
++		t.Fatal("more than MaxVerifierModels models decoded")
++	}
++	if OpVerifierModels.String() != "VERIFIER_MODELS" {
++		t.Fatal(OpVerifierModels.String())
++	}
++}
++
++func TestRules5Declarations(t *testing.T) {
++	w := newPoolWorld(t, 701, 2)
++	v := w.verifiers[0]
++	m2 := w.secondModel()
++	both := sortedModels(w.model, m2)
++	w.p.Rules = 4
++	if r := w.block(nil, []*Op{declare(v, w.model)}, nil); r.OpErrors[0] == nil || w.st.VerifierModels != nil {
++		t.Fatal("VERIFIER_MODELS applied before Rules 5")
++	}
++	w.p.Rules = 5
++	root := w.st.Root()
++	mustOK(t, w.block(nil, []*Op{declare(v, both...)}, nil))
++	if !reflect.DeepEqual(w.st.VerifierModels[v], both) {
++		t.Fatalf("declared %v", w.st.VerifierModels[v])
++	}
++	if w.st.Root() == root {
++		t.Fatal("the state root does not commit declarations")
++	}
++	tooMany := make([]Hash, MaxVerifierModels+1)
++	for name, op := range map[string]*Op{
++		"decreasing":    declare(v, both[1], both[0]),
++		"duplicate":     declare(v, w.model, w.model),
++		"unknown model": declare(v, w.randHash()),
++		"too many":      declare(v, tooMany...),
++	} {
++		if r := w.block(nil, []*Op{op}, nil); r.OpErrors[0] == nil {
++			t.Fatalf("%s: applied", name)
++		}
++		if !reflect.DeepEqual(w.st.VerifierModels[v], both) {
++			t.Fatalf("%s: a failed declaration changed the list", name)
++		}
++	}
++	mustOK(t, w.block(nil, []*Op{declare(v, m2)}, nil)) // a new list replaces the old one
++	if !reflect.DeepEqual(w.st.VerifierModels[v], []Hash{m2}) {
++		t.Fatalf("replaced list %v", w.st.VerifierModels[v])
++	}
++	mustOK(t, w.block(nil, []*Op{declare(v)}, nil)) // an empty list withdraws
++	if _, ok := w.st.VerifierModels[v]; ok {
++		t.Fatal("an empty declaration left an entry")
++	}
++}
++
++func TestRules5CommitteeOnlyFromDeclaredVerifiers(t *testing.T) {
++	w := newWorld(t, 702, 6)
++	m2 := w.secondModel()
++	w.p.Rules = 5
++	holders := map[AccountID]bool{w.verifiers[0]: true, w.verifiers[3]: true}
++	mustOK(t, w.block(nil, []*Op{declare(w.verifiers[0], w.model), declare(w.verifiers[3], sortedModels(w.model, m2)...),
++		declare(w.verifiers[1], m2), declare(w.verifiers[2], m2)}, nil)) // 4 and 5 declare nothing
++	for i := 0; i < 12; i++ {
++		j := w.startJob(5_000_000, 8, 3, 2, w.newTrace(8))
++		if len(j.Committee) != 2 {
++			t.Fatalf("job %d: committee of %d, want the 2 holders of its model", i, len(j.Committee))
++		}
++		for _, v := range j.Committee {
++			if !holders[v.Account] {
++				t.Fatalf("job %d: %v sits without holding the model", i, v.Account)
++			}
++		}
++	}
++	// Rules 4: every staker is drawn, declared or not (the testnet's behaviour until Rules 5)
++	w.p.Rules = 4
++	j := w.startJob(5_000_000, 8, 6, 2, w.newTrace(8))
++	if len(j.Committee) != 6 {
++		t.Fatalf("Rules 4 committee of %d, want all 6 stakers", len(j.Committee))
++	}
++}
++
++func TestRules5NoWorkWithoutAVerifier(t *testing.T) {
++	w := newPoolWorld(t, 703, 2)
++	w.income = 500_000
++	w.run(2)
++	m2 := w.secondModel()
++	w.p.Rules = 5
++	sp := w.spec(4)
++	sp.Grant = 300_000
++	cat := w.openCategory(sp)
++	prov := acct(70)
++	w.block([]Deposit{{prov, 1e9}}, []*Op{{Kind: OpStake, Actor: prov, Amount: 2 * w.p.MinVerifierStake}}, nil)
++	before := w.bal(prov)
++	// nobody declared the pool's model; a verifier of another model, and the provider itself,
++	// do not count
++	mustOK(t, w.block(nil, []*Op{declare(w.verifiers[0], m2), declare(prov, w.model)}, nil))
++	r := w.block(nil, []*Op{w.claimOp(cat, prov, 0)}, nil)
++	if !errors.Is(r.OpErrors[0], errNoVerifier) || w.bal(prov) != before || len(w.st.Categories[cat].Units) != 0 {
++		t.Fatalf("claim with no verifier of the model: %v", r.OpErrors[0])
++	}
++	post := &Op{Kind: OpJobPost, Actor: w.client, Model: w.model, H1: w.randHash(), U1: 8, Amount: 5_000_000,
++		Deadline: w.h + 50, K: 2, N: 2, U2: 4}
++	mustOK(t, w.block(nil, []*Op{post}, nil))
++	id := tagHash("job", post.Ref[:])
++	acc := &Op{Kind: OpJobAccept, Actor: prov, Job: id, Amount: minBond(w.p, 5_000_000)}
++	if r := w.block(nil, []*Op{acc}, nil); !errors.Is(r.OpErrors[0], errNoVerifier) || w.st.Jobs[id].Status != StatusPosted {
++		t.Fatalf("accept with no verifier of the model: %v", r.OpErrors[0])
++	}
++	// a staked verifier declares the model: both go through
++	mustOK(t, w.block(nil, []*Op{declare(w.verifiers[1], w.model)}, nil))
++	mustOK(t, w.block(nil, []*Op{w.claimOp(cat, prov, 0), {Kind: OpJobAccept, Actor: prov, Job: id, Amount: minBond(w.p, 5_000_000)}}, nil))
++	// a declaration counts only with stake
++	w2 := newPoolWorld(t, 704, 0)
++	w2.p.Rules = 5
++	lone := acct(120)
++	mustOK(t, w2.block([]Deposit{{lone, 1e8}}, []*Op{declare(lone, w2.model)}, nil))
++	if w2.st.HasVerifierFor(w2.p, w2.model, PoolAccount, acct(70)) {
++		t.Fatal("an unstaked declaration counts as a verifier")
++	}
++	mustOK(t, w2.block(nil, []*Op{{Kind: OpStake, Actor: lone, Amount: w2.p.MinVerifierStake}}, nil))
++	if !w2.st.HasVerifierFor(w2.p, w2.model, PoolAccount, acct(70)) {
++		t.Fatal("a staked declaration does not count")
++	}
++}
++
++func TestRules5UnverifiableJobIsAborted(t *testing.T) {
++	w := newPoolWorld(t, 705, 1)
++	w.income = 500_000
++	w.run(2)
++	w.p.Rules = 5
++	sp := w.spec(2)
++	sp.Grant = 300_000
++	cat := w.openCategory(sp)
++	v, prov := w.verifiers[0], acct(70)
++	w.block([]Deposit{{prov, 1e9}}, []*Op{declare(v, w.model)}, nil)
++	provBefore, budgetBefore := w.bal(prov), w.st.Categories[cat].Budget
++	o := w.claimOp(cat, prov, 0)
++	mustOK(t, w.block(nil, []*Op{o}, nil))
++	id := tagHash("job", o.Ref[:])
++	tr := w.newTrace(8)
++	// the only verifier of the model withdraws between the claim and the draw
++	mustOK(t, w.block(nil, []*Op{{Kind: OpTraceCommit, Actor: prov, Job: id, H1: tr.commit(), H2: w.randHash()},
++		declare(v)}, nil))
++	for w.st.Jobs[id].Status == StatusCommitted {
++		w.block(nil, nil, nil)
++	}
++	j := w.st.Jobs[id]
++	if j.Status != StatusAborted || len(j.Committee) != 0 {
++		t.Fatalf("status %v with %d seats, want aborted with none", j.Status, len(j.Committee))
++	}
++	if w.bal(prov) != provBefore {
++		t.Fatalf("provider balance %d, want %d (bond returned)", w.bal(prov), provBefore)
++	}
++	if b := w.st.Categories[cat].Budget; b < budgetBefore {
++		t.Fatalf("category budget %d, below %d before the claim", b, budgetBefore)
++	}
++	if _, held := w.st.Categories[cat].Units[0]; held {
++		t.Fatal("the unit is still held")
++	}
++	// the unit can be claimed again once a verifier holds the model
++	mustOK(t, w.block(nil, []*Op{declare(v, w.model)}, nil))
++	mustOK(t, w.block(nil, []*Op{w.claimOp(cat, prov, 0)}, nil))
++}
++
++// The node keeps the job state in gob snapshots (blockchain/jobs.go): declarations survive one,
++// and a snapshot from before Rules 5 (no field) decodes to a state with the same root.
++func TestRules5StateSnapshot(t *testing.T) {
++	w := newWorld(t, 706, 2)
++	plain := w.st.Clone()
++	w.p.Rules = 5
++	mustOK(t, w.block(nil, []*Op{declare(w.verifiers[0], w.model)}, nil))
++	for _, st := range []*State{plain, w.st} {
++		var buf bytes.Buffer
++		if err := gob.NewEncoder(&buf).Encode(st); err != nil {
++			t.Fatal(err)
++		}
++		got := NewState()
++		if err := gob.NewDecoder(&buf).Decode(got); err != nil {
++			t.Fatal(err)
++		}
++		if got.Root() != st.Root() || !reflect.DeepEqual(got.VerifierModels, st.VerifierModels) {
++			t.Fatal("a gob snapshot changed the state")
++		}
++	}
++	if len(plain.VerifierModels) != 0 {
++		t.Fatal("a state from before Rules 5 has declarations")
++	}
++}
+diff --git a/node/jobstate/state.go b/node/jobstate/state.go
+index 9060f523..8b16f38d 100644
+--- a/node/jobstate/state.go
++++ b/node/jobstate/state.go
+@@ -24,6 +24,11 @@ type State struct {
+ 	FECommits  map[Hash]*FECommit // forced-error commitments and their reserves
+ 	Stats      Stats
+ 
++	// VerifierModels (Rules >= 5): the models each verifier declared with VERIFIER_MODELS, in
++	// increasing order. Committees for a job are drawn only from stakers that declared its model.
++	// nil in states from before Rules 5 (and in their snapshots), which then hash as before.
++	VerifierModels map[AccountID][]Hash
++
+ 	reward Amount // miner's share of the current block's subsidy, set only inside ApplyBlock
+ }
+ 
+@@ -59,6 +64,12 @@ func (s *State) Clone() *State {
+ 		f := *v
+ 		c.FECommits[k] = &f
+ 	}
++	if s.VerifierModels != nil {
++		c.VerifierModels = make(map[AccountID][]Hash, len(s.VerifierModels))
++		for k, v := range s.VerifierModels {
++			c.VerifierModels[k] = append([]Hash(nil), v...)
++		}
++	}
+ 	for k, v := range s.Accounts {
+ 		c.Accounts[k] = v
+ 	}
+@@ -309,6 +320,14 @@ func (s *State) Root() Hash {
+ 	for id, f := range s.FECommits {
+ 		add('f', id[:], encodeFECommit(f))
+ 	}
++	for a, ms := range s.VerifierModels { // Rules 5: no entries before, so old roots are unchanged
++		var e enc
++		e.u(uint64(len(ms)))
++		for _, m := range ms {
++			e.w(m)
++		}
++		add('v', a[:], e.Bytes())
++	}
+ 	var c enc
+ 	st := s.Stats
+ 	c.w(s.NextSeq, s.TotalIn, s.PaidOut, st.SettledJobs, st.SettledStages, st.PoolUnits, st.PoolPaid, st.Checks,
+diff --git a/node/rpcjobs.go b/node/rpcjobs.go
+index 32577062..c2bd852b 100644
+--- a/node/rpcjobs.go
++++ b/node/rpcjobs.go
+@@ -110,6 +110,15 @@ func handleGetJobState(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
+ 	root := st.Root()
+ 	best := s.cfg.Chain.BestSnapshot()
+ 	np := s.cfg.ChainParams.JobModule.At(best.Height + 1) // rules for the next block
++	// staked verifiers per declared model (Rules 5: committees come only from these)
++	verifiers := map[string]int{}
++	for a, ms := range st.VerifierModels {
++		if st.Stakes[a] >= np.MinVerifierStake {
++			for _, m := range ms {
++				verifiers[hx(m[:])]++
++			}
++		}
++	}
+ 	return map[string]interface{}{
+ 		"params": map[string]interface{}{"rules": np.Rules, "challengebondmin": np.ChallengeBondMin,
+ 			"challengebondbp": np.ChallengeBondBP, "watchfee": np.WatchFee, "minbondbp": np.MinBondBP},
+@@ -122,6 +131,7 @@ func handleGetJobState(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
+ 		"treasury":   st.Accounts[jobstate.TreasuryAccount],
+ 		"holdings":   st.Holdings(),
+ 		"stakers":    len(st.Stakes),
++		"verifiers":  verifiers,
+ 		"categories": cats,
+ 		"proposals":  props,
+ 		"fecommits":  fes,
+@@ -288,8 +298,12 @@ func handleGetJobAccount(s *rpcServer, cmd interface{}, closeChan <-chan struct{
+ 			wds = append(wds, map[string]interface{}{"amount": w.Amount, "due": w.Due, "pkscript": hx(w.PkScript)})
+ 		}
+ 	}
++	models := []string{}
++	for _, m := range st.VerifierModels[a] {
++		models = append(models, hx(m[:]))
++	}
+ 	return map[string]interface{}{"account": hx(a[:]), "balance": st.Accounts[a], "stake": st.Stakes[a],
+-		"unbonding": unb, "withdrawals": wds}, nil
++		"unbonding": unb, "withdrawals": wds, "models": models}, nil
+ }
+ 
+ func handleGetCategory(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
+-- 
+2.30.2
+

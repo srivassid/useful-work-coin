@@ -50,6 +50,8 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+MAX_VERIFIER_MODELS = 16  # jobstate.MaxVerifierModels (VERIFIER_MODELS, Rules 5)
+
 # CUDA errors that poison the process's context: unlike out of memory, nothing after them works
 STICKY_CUDA = ("illegal memory access", "CUDA_ERROR_ILLEGAL_ADDRESS", "unspecified launch failure",
                "CUDA_ERROR_LAUNCH_FAILED", "misaligned address", "illegal instruction", "device-side assert")
@@ -241,6 +243,7 @@ class Agent:
         """Load every model's runtime (in the background at start: a seat must not wait for it)."""
         for rkey in dict.fromkeys(m["rkey"] for m in self.models.values()):
             self.runtime_for(rkey)
+        self.models_loaded = True  # a verifier declares its models only once they can be run
 
     lock = threading.Lock()
 
@@ -260,6 +263,14 @@ class Agent:
         except ChainError as e:
             log(f"{what}: {e}")
             return None
+
+    def verified(self, s: dict, model: str) -> bool:
+        """Could the chain draw a committee for a job of this model? From Rules 5 only staked
+        verifiers that declared the model sit on its committees, and work with none is refused
+        (JOB_ACCEPT, POOL_CLAIM): a provider does not send a claim that would only fail."""
+        if (s.get("params") or {}).get("rules", 0) < 5:
+            return True
+        return (s.get("verifiers") or {}).get(model, 0) > 0
 
     def challenge_bond(self, j: dict) -> int:
         """The bond a CHALLENGE on j needs (jobstate.ChallengeBond, from the next block's rules)."""
@@ -500,7 +511,8 @@ class Provider(Agent):
             for jid, e in self.chain.jobs("posted").items():
                 if e["client"] != self.account and jid not in self.st["jobs"]:
                     j = self.chain.job(jid)
-                    if j and j["model"] == self.model_id and j["deadline"] > h + 5 and self.input_batches(j) is not None:
+                    if j and j["model"] == self.model_id and j["deadline"] > h + 5 and self.verified(s, j["model"]) \
+                            and self.input_batches(j) is not None:
                         bond = (j["fee"] * 5000 + 9999) // 10000
                         if not self.can_bond(bond, h):
                             break
@@ -562,7 +574,11 @@ class Provider(Agent):
         # and a unit computed with another model's runtime commits wrong roots
         cats = [(cid, c) for cid, c in s["categories"].items()
                 if not c["retired"] and not c.get("closed") and c.get("model") == self.model_id
-                and self.work_list(c["workroot"]) is not None]
+                and self.verified(s, c["model"]) and self.work_list(c["workroot"]) is not None]
+        if not cats and any(c.get("model") == self.model_id and not c["retired"] and not c.get("closed")
+                            for c in s["categories"].values()) and self.st.get("unverified_h", -10**9) < s["height"] - 100:
+            self.st["unverified_h"] = s["height"]
+            log(f"no staked verifier holds model {self.model_id[:8]} (Rules 5): its pool units cannot be claimed")
         random.shuffle(cats)
         cats.sort(key=lambda x: not (self.a.prefer and x[0].startswith(self.a.prefer)))
         for cid, c in cats:
@@ -806,6 +822,21 @@ class Verifier(Agent):
     commit H(salt) and H(roots, account, salt), reveal in the next window."""
     role = "verifier"
 
+    def declare_models(self, acct: dict):
+        """Rules 5: committees are drawn only from verifiers that declared the job's model
+        (VERIFIER_MODELS). Declare every model this verifier loaded, once they are loaded (a seat it
+        cannot compute costs the no-show penalty), and again whenever the chain's list differs."""
+        want = sorted(self.models)[:MAX_VERIFIER_MODELS]
+        if not getattr(self, "models_loaded", False) or acct.get("models") is None or acct["models"] == want:
+            return
+        h = self.chain.height()
+        if h - self.st.get("declare_h", -10**9) < 10:  # sent recently (or the chain is not on Rules 5 yet)
+            return
+        self.st["declare_h"] = h
+        if (self.chain.state().get("params") or {}).get("rules", 0) < 5:
+            return
+        self.send([{"kind": "VERIFIER_MODELS", "roots": want}], f"declare models {' '.join(m[:8] for m in want)}")
+
     def step(self):
         acct = self.chain.account(self.account)
         if acct["stake"] < self.a.stake and acct["balance"] >= self.a.stake - acct["stake"] and not self.st.get("staking"):
@@ -814,6 +845,7 @@ class Verifier(Agent):
                 self.save()
         elif acct["stake"] >= self.a.stake:
             self.st["staking"] = False
+        self.declare_models(acct)
         self.challenger_games()
         for status in ("verify-commit", "verify-reveal"):
             for jid in self.chain.jobs(status):

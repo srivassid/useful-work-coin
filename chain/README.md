@@ -38,6 +38,7 @@ exactly as on unmodified Pearl.
 | 0021 | Rules 4: Llama and Mistral models (`ModelCfg.Arch`, MODEL_REG suffix `A`+arch; QN/KN rows are copies for Arch 1) |
 | 0022 | Testnet: Rules 4 (Llama and Mistral models) from block 2700 (replayed the 2554-block testnet with this binary: same tip and state root) |
 | 0023 | `pearld --maxtipage` (node option, not consensus): restart a chain whose tip is older than 24 hours (the testnet after two days stopped) |
+| 0024 | Rules 5: committees only from verifiers that declared the job's model (`VERIFIER_MODELS`); no claim or accept without one; unverifiable jobs aborted; not scheduled on any network yet |
 
 Design: `spec/job-module.md`, `spec/stage-program.md`, `spec/pool-and-watchers.md`. Results:
 `spec/step3-results.md`, `spec/step4-results.md`, `spec/step5-results.md`, `spec/step6-results.md`.
