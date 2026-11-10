@@ -1,7 +1,7 @@
 # Rules 4: Llama and Mistral models
 
-Status (2026-11-10): runtime and consensus code done and tested on CPU; GPU paths written but
-not yet run on a GPU; no network schedules Rules 4 yet.
+Status (2026-11-10): runtime and consensus code done; CPU tests and RTX 5090 checks on three
+real checkpoints pass (below); no 3080 run yet; no network schedules Rules 4 yet.
 
 ## What changes
 
@@ -49,16 +49,31 @@ were registered with (git `f4e7dc3`); new registrations get the new hash.
   top-1 agreement 0.91 vs 0.86, the W7A7 quantization noise); `detrt.fast` equals `run_stage`
   on the tiny Llama.
 
+## RTX 5090 checks (`tests/test_arch_gpu.py`, results/rules4/)
+
+Every existing GPU test still passes with this code on Qwen3-1.7B (test_detgpu, test_detgen_fast,
+test_provider_batch, test_agent_engines, test_sha_gpu, test_attention_mma). On real checkpoints
+(Hadamard block 128, WikiText-2 test, 16 x 512 tokens):
+
+| model | layers / groups | GPU memory | detgpu == reference | fast generation == reference | perplexity bf16 | W7A7 | change |
+|---|---|---|---|---|---|---|---|
+| Llama 3.2 3B | 28 / 7 | 4.5 GiB | all groups, 4 shapes | greedy and t=0.8, head outputs equal | 11.966 | 12.029 | +0.53% |
+| Mistral 7B Instruct v0.2 | 32 / 8 | 7.1 GiB | all groups, 4 shapes | greedy and t=0.8, head outputs equal | 9.980 | 9.946 | -0.33% |
+| Llama 3.1 8B | 32 / 8 | 9.0 GiB | all groups, 4 shapes | greedy and t=0.8, head outputs equal | 9.504 | 9.605 | +1.07% |
+
+The I = 14336 models exercise the rows over 48 KB of shared memory. Output and token digests
+are in the JSON files for a later 3080 comparison (Qwen3-8B was +1.0% at W7A7 in step 1, so
+Llama 3.1 8B's +1.07% is in line; a larger Hadamard block may lower it).
+
 ## Still to do
 
-1. GPU (box 71 or the 5090, short session): `detgpu` fused `qkv_post` with `qknorm=0`, and rows
-   over 48 KB of shared memory (I = 14336 for Mistral 7B and Llama 3.1 8B) in `quant_act`,
-   `rmsnorm_quant`, `swiglu_quant`: run `tests/test_detgpu.py`, `tests/test_detgen_fast.py` and
-   `tests/test_agent_engines.py` on a Llama checkpoint, and a 3080-vs-5090 bit-identity check.
+1. 3080 run of `tests/test_arch_gpu.py` (box 71) and comparison of the digests with the 5090.
 2. Models: the fast GPU paths need head_dim 128, so Llama 3.2 3B, Llama 3.1 8B and Mistral 7B
    v0.3 (not Llama 3.2 1B, head_dim 64). Memory on a 10 GB 3080: the embedding is held in fp32
    (V x D x 4 bytes: 1.6 GB for Llama 3.2 3B, 2.1 GB for Llama 3.1 8B), so 3B and Mistral 7B
-   fit, Llama 3.1 8B does not without moving the embedding table off the GPU. Llama and
+   fit, Llama 3.1 8B (9.0 GiB before activations) does not. Fix to consider: keep the
+   embedding table in bf16 on the GPU (the rows come from a bf16 checkpoint, and bf16 to fp32 is
+   exact, so outputs stay bit-identical), which saves 1 GiB on the 8B. Llama and
    Mistral weights on Hugging Face are gated (licence acceptance and a token).
 3. W7A7 quality per model (perplexity vs bf16, Hadamard block choice), as step 1 did for Qwen3.
 4. Schedule Rules 4 on the testnet (`UWCTestNetRules4Height`), rebuild and deploy `pearld` /

@@ -1,0 +1,11 @@
+llama: 8.03B params, loaded in 1s
+bf16 perplexity over 16 x 512 tokens: 9.5037
+deterministic runtime: arch 1, qk_norm False, D 4096 I 14336 L 32 V 128256, built in 152s, GPU memory 9.0 GiB
+wiki 4x128: all 8 groups bit-identical (reference 0.4s, detgpu 0.10s), sha256 6a474cea31d6b4eb
+random 3x128: all 8 groups bit-identical (reference 0.2s, detgpu 0.02s), sha256 4c38914d766a56a0
+random 1x512: all 8 groups bit-identical (reference 0.5s, detgpu 0.03s), sha256 60a14bf1cc7b3ed3
+random 2x300: all 8 groups bit-identical (reference 0.4s, detgpu 0.04s), sha256 0fe692378ccd416b
+generation greedy: 3 prompts x 40 tokens, fast == reference (fast 0.3s), head outputs equal, tokens sha256 bc37c0de9d81f2eb
+generation t0.8: 3 prompts x 40 tokens, fast == reference (fast 0.3s), head outputs equal, tokens sha256 01a194d867cd5120
+deterministic W7A7 (Hadamard 128) perplexity 9.6054 vs bf16 9.5037: +1.07% (8s)
+ARCH GPU CHECKS PASS

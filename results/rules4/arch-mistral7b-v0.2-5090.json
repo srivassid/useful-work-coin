@@ -1,0 +1,21 @@
+{
+ "model": "/home/sid/.cache/huggingface/hub/models--mistralai--Mistral-7B-Instruct-v0.2/snapshots/63a8b081895390a26e140280378bc85ec8bce07a/",
+ "gpu": "NVIDIA GeForce RTX 5090",
+ "hadamard": 128,
+ "groups": 8,
+ "ppl_bf16": 9.979641471182514,
+ "arch": 1,
+ "qk_norm": false,
+ "rope_sha": "39ed04f7c2b7fc16e6603d0ff32260ee414980ecf2cc181917ac670430956a87",
+ "stages": {
+  "wiki 4x128": "7c7ff049673c5c6f",
+  "random 3x128": "5b4f2f64416590a7",
+  "random 1x512": "ab6a94002c91376d",
+  "random 2x300": "dcb2efb18fc5eb29"
+ },
+ "gen": {
+  "greedy": "41c3b72ca944b4b9",
+  "t0.8": "324f2d9fa4ec7827"
+ },
+ "ppl_det": 9.946418838254978
+}

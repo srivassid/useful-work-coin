@@ -1,0 +1,11 @@
+mistral: 7.24B params, loaded in 1s
+bf16 perplexity over 16 x 512 tokens: 9.9796
+deterministic runtime: arch 1, qk_norm False, D 4096 I 14336 L 32 V 32000, built in 143s, GPU memory 7.1 GiB
+wiki 4x128: all 8 groups bit-identical (reference 0.4s, detgpu 0.07s), sha256 7c7ff049673c5c6f
+random 3x128: all 8 groups bit-identical (reference 0.2s, detgpu 0.02s), sha256 5b4f2f64416590a7
+random 1x512: all 8 groups bit-identical (reference 0.5s, detgpu 0.03s), sha256 ab6a94002c91376d
+random 2x300: all 8 groups bit-identical (reference 0.5s, detgpu 0.04s), sha256 dcb2efb18fc5eb29
+generation greedy: 3 prompts x 40 tokens, fast == reference (fast 0.3s), head outputs equal, tokens sha256 41c3b72ca944b4b9
+generation t0.8: 3 prompts x 40 tokens, fast == reference (fast 0.3s), head outputs equal, tokens sha256 324f2d9fa4ec7827
+deterministic W7A7 (Hadamard 128) perplexity 9.9464 vs bf16 9.9796: -0.33% (7s)
+ARCH GPU CHECKS PASS

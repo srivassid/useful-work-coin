@@ -1,0 +1,21 @@
+{
+ "model": "/home/sid/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/",
+ "gpu": "NVIDIA GeForce RTX 5090",
+ "hadamard": 128,
+ "groups": 8,
+ "ppl_bf16": 9.503715349011104,
+ "arch": 1,
+ "qk_norm": false,
+ "rope_sha": "6bae3e356e8dd6b76324ca893ccc2f0802c323ce69ae5810259afb3cb783a67e",
+ "stages": {
+  "wiki 4x128": "6a474cea31d6b4eb",
+  "random 3x128": "4c38914d766a56a0",
+  "random 1x512": "60a14bf1cc7b3ed3",
+  "random 2x300": "0fe692378ccd416b"
+ },
+ "gen": {
+  "greedy": "bc37c0de9d81f2eb",
+  "t0.8": "01a194d867cd5120"
+ },
+ "ppl_det": 9.60535363432514
+}
