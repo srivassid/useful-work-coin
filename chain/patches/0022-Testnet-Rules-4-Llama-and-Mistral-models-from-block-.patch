@@ -1,0 +1,42 @@
+From aa8decba87308eb67cbefbc4c6897824d4090bdc Mon Sep 17 00:00:00 2001
+From: Siddhartha Srivastava <siddhartha@delphai.com>
+Date: Tue, 10 Nov 2026 10:55:24 +0530
+Subject: [PATCH] Testnet: Rules 4 (Llama and Mistral models) from block 2700
+
+Replayed the 2554-block testnet with this binary from an empty datadir: same tip and state
+root (0e9bedbd...).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuzogEfSRnjn3KNzFm
+---
+ node/chaincfg/uwc_testnet.go | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/node/chaincfg/uwc_testnet.go b/node/chaincfg/uwc_testnet.go
+index ef70a4e8..24c2f364 100644
+--- a/node/chaincfg/uwc_testnet.go
++++ b/node/chaincfg/uwc_testnet.go
+@@ -46,7 +46,11 @@ func uwcTestNetJobParams() *jobstate.Params {
+ 	// Generation jobs (spec/generation.md): head stages, generation models.
+ 	r3 := r2
+ 	r3.Rules = 3
+-	p.Upgrades = []jobstate.Upgrade{{Height: UWCTestNetRules2Height, Params: r2}, {Height: UWCTestNetRules3Height, Params: r3}}
++	// Llama and Mistral models (spec/rules4-llama-mistral.md): ModelCfg.Arch.
++	r4 := r3
++	r4.Rules = 4
++	p.Upgrades = []jobstate.Upgrade{{Height: UWCTestNetRules2Height, Params: r2}, {Height: UWCTestNetRules3Height, Params: r3},
++		{Height: UWCTestNetRules4Height, Params: r4}}
+ 	return &p
+ }
+ 
+@@ -92,3 +96,7 @@ var UWCTestNetParams = func() Params {
+ 	p.JobModule = uwcTestNetJobParams()
+ 	return p
+ }()
++
++// UWCTestNetRules4Height is where the testnet adopts Rules 4, Llama and Mistral models (it stood at
++// block 2553 when this was scheduled; every node must run a Rules-4 binary before then).
++const UWCTestNetRules4Height = 2700
+-- 
+2.30.2
+

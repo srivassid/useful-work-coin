@@ -35,7 +35,8 @@ exactly as on unmodified Pearl.
 | 0018 | **Rules 3: generation jobs**: a head stage per batch (final norm, lm_head scores in 1024-token chunks, chunk bests, Gumbel-max or greedy sample), generated tokens read by layer stage 0 from the head stage, output root over head output roots (head stages open with an output-root path), generation models commit norm + lm_head; encodings and state gain suffixes only when set (spec/generation.md) |
 | 0019 | uwcctl `jobgen`, `modelreg` with `"gen"`, `out_proof` in JSON reveals, `onestep` for generation stages; `getjob` reports `gen` and `tempmilli` |
 | 0020 | Testnet: Rules 3 (generation jobs) from block 2120 (replayed the 2073-block testnet with this binary: same tip) |
-| 0021 | Rules 4: Llama and Mistral models (`ModelCfg.Arch`, MODEL_REG suffix `A`+arch; QN/KN rows are copies for Arch 1); not scheduled on any network yet |
+| 0021 | Rules 4: Llama and Mistral models (`ModelCfg.Arch`, MODEL_REG suffix `A`+arch; QN/KN rows are copies for Arch 1) |
+| 0022 | Testnet: Rules 4 (Llama and Mistral models) from block 2700 (replayed the 2554-block testnet with this binary: same tip and state root) |
 
 Design: `spec/job-module.md`, `spec/stage-program.md`, `spec/pool-and-watchers.md`. Results:
 `spec/step3-results.md`, `spec/step4-results.md`, `spec/step5-results.md`, `spec/step6-results.md`.
