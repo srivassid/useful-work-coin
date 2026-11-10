@@ -452,7 +452,8 @@ class Provider(Agent):
         active = [jid for jid, e in mine.items() if e["status"] not in ("settled", "expired", "failed", "aborted")]
         # the GPU is busy only until a job is committed: limit jobs not yet committed, counting
         # claims and accepts sent but not yet in a block
-        computing = [jid for jid in active if mine[jid]["status"] == "accepted"]
+        computing = [jid for jid in active if mine[jid]["status"] == "accepted"
+                     and not self.st["jobs"].get(jid, {}).get("foreign_model")]  # left to expire: no GPU work
         self.pending_bonds = 0  # bonds of claims and accepts sent but not yet mined
         for jid, js in self.st["jobs"].items():
             sent = js.get("claimed", js.get("accepted"))
