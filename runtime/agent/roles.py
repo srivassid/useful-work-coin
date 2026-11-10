@@ -66,9 +66,11 @@ class Agent:
         info = self.chain.key_info(self.key)
         self.account = info["account"]
         self.data = Data(a.data, signer=lambda d: self.chain.run("sign", self.key, d.hex()).strip())
-        self.model = json.load(open(a.model))
-        self.model_id = json.load(open(a.model.replace(".json", ".reg.json")))["model"]
-        self.G = self.model["layer_groups"]
+        # --model a.json,b.json (and --weights in the same order): verifiers and watchers serve
+        # committee seats and checks for every model listed; providers and clients use the first.
+        # Committees are drawn from all stakers whatever the model, so a seat on a job of a model
+        # an agent does not hold is skipped (a no-show penalty) rather than answered wrongly.
+        self.init_models(a.model, a.weights)
         # public work lists by work root (comma-separated --units files)
         self.lists = {}
         for path in (a.units or "").split(","):
@@ -87,7 +89,6 @@ class Agent:
         self.path = os.path.join(a.devnet, "agent", f"{self.role}-{self.account[:8]}.json")
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.st = json.load(open(self.path)) if os.path.exists(self.path) else {"jobs": {}}
-        self._rt = None
         # long computations (whole jobs) run here, so the main loop can always answer reveals
         # and game rounds before their deadlines
         self.worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -173,14 +174,51 @@ class Agent:
 
     rt_lock = threading.Lock()
 
+    def init_models(self, model_arg: str, weights_arg: str | None):
+        paths = [p for p in str(model_arg).split(",") if p]
+        weights = [w for w in str(weights_arg or "").split(",")]
+        self.models: dict[str, dict] = {}
+        self._runtimes: dict[tuple, object] = {}
+        self._skipped_models: set[str] = set()
+        for i, p in enumerate(paths):
+            info = json.load(open(p))
+            mid = json.load(open(p.replace(".json", ".reg.json")))["model"]
+            # registrations of one checkpoint with the same settings share a runtime (the same
+            # numerics: e.g. one model registered again under a newer runtime hash)
+            rkey = (info["model_dir"], info["rotation_block"], info["cfg"]["MaxPos"])
+            self.models[mid] = {"path": p, "info": info, "weights": weights[i] if i < len(weights) else "", "rkey": rkey}
+        self.use(next(iter(self.models)))
+
+    def use(self, model_id: str) -> bool:
+        """Make model_id the current model (self.model, self.model_id, self.G, self.rt); False if
+        this agent does not hold it (logged once per model)."""
+        m = self.models.get(model_id)
+        if m is None:
+            if model_id not in self._skipped_models:
+                self._skipped_models.add(model_id)
+                log(f"model {model_id[:8]} is not one of this agent's models: its jobs are skipped")
+            return False
+        self.model, self.model_id, self.G = m["info"], model_id, m["info"]["layer_groups"]
+        self.model_path, self.weights_path, self._rkey = m["path"], m["weights"], m["rkey"]
+        return True
+
+    def runtime_for(self, rkey: tuple):
+        with self.rt_lock:
+            if rkey not in self._runtimes:
+                from .compute import Runtime
+                path = next(m["path"] for m in self.models.values() if m["rkey"] == rkey)
+                sock = os.path.join(self.a.devnet, "pearlgw.sock") if getattr(self.a, "mine", False) else None
+                self._runtimes[rkey] = Runtime(path, self.a.device, mine_socket=sock, engine=self.a.engine)
+            return self._runtimes[rkey]
+
     @property
     def rt(self):
-        with self.rt_lock:
-            if self._rt is None:
-                from .compute import Runtime
-                sock = os.path.join(self.a.devnet, "pearlgw.sock") if getattr(self.a, "mine", False) else None
-                self._rt = Runtime(self.a.model, self.a.device, mine_socket=sock, engine=self.a.engine)
-            return self._rt
+        return self.runtime_for(self._rkey)
+
+    def load_models(self):
+        """Load every model's runtime (in the background at start: a seat must not wait for it)."""
+        for rkey in dict.fromkeys(m["rkey"] for m in self.models.values()):
+            self.runtime_for(rkey)
 
     lock = threading.Lock()
 
@@ -319,7 +357,7 @@ class Agent:
         if got is None:
             return
         prev, head, trace_rows = got
-        req = {"job": j["id"], "model": self.a.model, "weights": self.a.weights, "rows": os.path.join(d, "rows.bin"),
+        req = {"job": j["id"], "model": self.model_path, "weights": self.weights_path, "rows": os.path.join(d, "rows.bin"),
                "prev_outputs": "", "batches": b, "salts": js["salts"], "roots": js["roots"]}
         if prev is not None:
             write_rows(os.path.join(d, "prev.bin"), prev)
@@ -342,7 +380,7 @@ class Agent:
         """Play every game in which this account is the disputant (flagging verifier or watcher)."""
         for jid in self.chain.jobs("disputed"):
             j = self.chain.job(jid)
-            if j and j.get("disputes") and j["disputes"][0]["challenger"] == self.account:
+            if j and j.get("disputes") and j["disputes"][0]["challenger"] == self.account and self.use(j["model"]):
                 self.play(j, as_provider=False)
 
     def work_list(self, root: str) -> dict | None:
@@ -382,8 +420,8 @@ class Agent:
         log(f"{self.role} {self.account[:12]} starting")
         faulthandler.register(signal.SIGUSR1, all_threads=True)  # kill -USR1 <pid>: every thread's stack
         threading.Thread(target=self.watchdog, name="watchdog", daemon=True).start()
-        if self.role != "client":  # load the model in the background; reveals need no model
-            self.busy = self.submit("load model", lambda: self.rt)
+        if self.role != "client":  # load the models in the background; reveals need no model
+            self.busy = self.submit("load models", self.load_models)
         while True:
             try:
                 self.step()
@@ -757,6 +795,8 @@ class Verifier(Agent):
                         self.save()
                     continue
                 if status == "verify-commit" and not seat["committed"] and not js.get("committed"):
+                    if not self.use(j["model"]):
+                        continue
                     b = self.batches(j)
                     if b is None:
                         continue
@@ -833,6 +873,10 @@ class Watcher(Agent):
                 self.save()
                 continue
             j = self.chain.job(jid)
+            if not self.use(j["model"]):
+                js["skipped"] = "model"
+                self.save()
+                continue
             b = self.batches(j)
             if b is None:
                 continue
