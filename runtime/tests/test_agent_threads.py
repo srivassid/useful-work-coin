@@ -198,3 +198,51 @@ def test_watchdog_logs_stalled_loop_and_long_task():
     assert "WATCHDOG: the main loop has not finished a step" in text
     assert "WATCHDOG: the GPU worker has run 'generation job deadbeef'" in text
     assert "--- thread MainThread" in text and "--- thread watchdog" not in text
+
+
+def test_sticky_cuda_error_exits_the_agent():
+    """A CUDA error that poisons the context (the 5090's package provider, 2026-11-10: an illegal
+    memory access after an out-of-memory, then 7 hours of failed passes while it went on claiming
+    units) exits the agent so its supervisor restarts it; out of memory is retried as before."""
+    from agent import roles
+    from agent.roles import Provider
+    assert roles.sticky_cuda_error(RuntimeError("CUDA error: an illegal memory access was encountered"))
+    try:
+        try:
+            raise RuntimeError("CUDA error: unspecified launch failure")
+        except RuntimeError as inner:
+            raise ValueError("pass failed") from inner
+    except ValueError as e:
+        assert roles.sticky_cuda_error(e)                   # found through the cause chain
+    assert not roles.sticky_cuda_error(RuntimeError("CUDA out of memory. Tried to allocate 24.00 MiB"))
+
+    p = agent(Provider, poll=0)
+    p.role, p.account = "client", "aa" * 32                  # client: run() loads no model
+    errors = [RuntimeError("CUDA out of memory. Tried to allocate 24.00 MiB"),
+              RuntimeError("CUDA error: an illegal memory access was encountered")]
+    steps = []
+
+    def step():
+        steps.append(1)
+        raise errors[len(steps) - 1]
+
+    class Exited(Exception):
+        pass
+
+    def fake_exit(code):
+        raise Exited(code)
+    p.step = step
+    old, roles.os._exit = roles.os._exit, fake_exit
+    old_reg, roles.faulthandler.register = roles.faulthandler.register, lambda *a, **k: None  # no real stderr here
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            try:
+                p.run()
+            except Exited as e:
+                assert e.args == (roles.STICKY_EXIT,)
+            else:
+                raise AssertionError("run() returned")
+    finally:
+        roles.os._exit, roles.faulthandler.register = old, old_reg
+    assert len(steps) == 2                                   # the out of memory step was retried
+    assert "GPU context is broken (CUDA error: an illegal memory access" in out.getvalue()

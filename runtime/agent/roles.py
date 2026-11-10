@@ -50,6 +50,22 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+# CUDA errors that poison the process's context: unlike out of memory, nothing after them works
+STICKY_CUDA = ("illegal memory access", "CUDA_ERROR_ILLEGAL_ADDRESS", "unspecified launch failure",
+               "CUDA_ERROR_LAUNCH_FAILED", "misaligned address", "illegal instruction", "device-side assert")
+STICKY_EXIT = 75
+
+
+def sticky_cuda_error(e: BaseException | None) -> bool:
+    seen = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if any(m in str(e) for m in STICKY_CUDA):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
 class Agent:
     role = "agent"
     # True: every GPU use runs on the worker thread (roles whose worker runs passes while the
@@ -431,8 +447,16 @@ class Agent:
         while True:
             try:
                 self.step()
-            except Exception:
+            except Exception as e:
                 traceback.print_exc()
+                if sticky_cuda_error(e):
+                    # every later kernel in this process fails the same way: a provider would go on
+                    # claiming units and losing their bonds (the 5090's package provider, 2026-11-10:
+                    # 7 hours, 2348 failed passes). Exit so a supervisor (uwc-miner) restarts it.
+                    log(f"GPU context is broken ({str(e).splitlines()[0][:120]}): exiting so the agent can be restarted")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os._exit(STICKY_EXIT)
             self._beat = time.time()
             time.sleep(self.a.poll)
 
