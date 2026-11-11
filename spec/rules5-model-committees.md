@@ -1,6 +1,6 @@
 # Rules 5: committees from verifiers that hold the job's model
 
-Status: implemented and tested (chain patch 0024, agents); **not scheduled on any network yet**.
+Status: implemented and tested (chain patch 0024, agents); testnet from block 4280 (patch 0025).
 
 ## The problem (testnet, Rules 4, 2026-11-10)
 

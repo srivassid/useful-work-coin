@@ -837,14 +837,25 @@ class Verifier(Agent):
             return
         self.send([{"kind": "VERIFIER_MODELS", "roots": want}], f"declare models {' '.join(m[:8] for m in want)}")
 
+    def top_up_stake(self, acct: dict):
+        """Top the stake back up after penalties; a STAKE not mined (or refused) within 20 blocks
+        is sent again (a bare flag here once kept verifiers from ever topping up a second time)."""
+        h = self.chain.height()
+        staking = self.st.get("staking")
+        if staking is True:  # state from before the height was kept
+            staking = None
+        if acct["stake"] < self.a.stake and acct["balance"] >= self.a.stake - acct["stake"] and \
+                (staking is None or h - staking >= 20):
+            if self.send([{"kind": "STAKE", "amount": self.a.stake - acct["stake"]}], "stake"):
+                self.st["staking"] = h
+                self.save()
+        elif acct["stake"] >= self.a.stake and staking is not None:
+            self.st["staking"] = None
+            self.save()
+
     def step(self):
         acct = self.chain.account(self.account)
-        if acct["stake"] < self.a.stake and acct["balance"] >= self.a.stake - acct["stake"] and not self.st.get("staking"):
-            if self.send([{"kind": "STAKE", "amount": self.a.stake - acct["stake"]}], "stake"):
-                self.st["staking"] = True
-                self.save()
-        elif acct["stake"] >= self.a.stake:
-            self.st["staking"] = False
+        self.top_up_stake(acct)
         self.declare_models(acct)
         self.challenger_games()
         for status in ("verify-commit", "verify-reveal"):

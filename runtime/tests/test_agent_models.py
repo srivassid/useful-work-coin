@@ -133,6 +133,33 @@ def test_verifier_declares_its_models_on_rules5():
         assert len(sent) == 2                                # Rules 4: the op would fail; nothing sent
 
 
+def test_verifier_tops_its_stake_up_again():
+    """Penalties wear the stake down: the verifier tops it up each time, resending a STAKE that
+    was not mined within 20 blocks (state saved by older agents holds staking=True)."""
+    with tempfile.TemporaryDirectory() as d:
+        a, _ = agent(write_model(d, "qwen", "aa" * 32, "/m/Q", 7))
+        sent, chain = [], types.SimpleNamespace(h=100)
+        chain.height = lambda: chain.h
+        a.chain, a.st, a.a.stake = chain, {"jobs": {}, "staking": True}, 100
+        a.path = os.path.join(d, "state.json")
+        a.send = lambda ops, what: sent.append(ops) or {"txid": "t"}
+        a.top_up_stake({"stake": 75, "balance": 1000})
+        assert sent == [[{"kind": "STAKE", "amount": 25}]]
+        chain.h += 5
+        a.top_up_stake({"stake": 75, "balance": 1000})       # not mined yet: wait
+        assert len(sent) == 1
+        chain.h += 20
+        a.top_up_stake({"stake": 75, "balance": 1000})       # still not in: send again
+        assert len(sent) == 2
+        a.top_up_stake({"stake": 100, "balance": 975})       # topped up
+        assert a.st["staking"] is None and len(sent) == 2
+        chain.h += 1
+        a.top_up_stake({"stake": 95, "balance": 975})        # a later penalty: top up at once
+        assert sent[-1] == [{"kind": "STAKE", "amount": 5}]
+        a.top_up_stake({"stake": 90, "balance": 2})          # cannot afford it: nothing
+        assert len(sent) == 3
+
+
 def test_provider_skips_models_without_verifiers_on_rules5():
     from agent import roles
     with tempfile.TemporaryDirectory() as d:
