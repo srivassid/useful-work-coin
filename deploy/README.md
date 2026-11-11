@@ -40,3 +40,23 @@ New pool category (box 71, council keys in ~/.uwc/testnet/keys):
 
 The train split has about 19,600 chunks of 128 tokens; wiki-train8x128 (category 5e35742f, 2026-11-08)
 uses chunks 0-3999.
+
+## Job gateway and web page (`uwc-gateway`, https://165-232-182-224.sslip.io)
+
+Caddy proxies the domain to the gateway on 127.0.0.1:18693. The gateway serves the web page at `/`
+(sign up, chat, text completion, embeddings, batches, your jobs) and the OpenAI-compatible API
+under `/v1`. Its files are in `/opt/uwc/gateway/`:
+- `models.json`: the served models (see the doc at the top of `runtime/agent/gateway.py`): Qwen3
+  1.7B (chat, embeddings), Llama 3.2 3B Instruct and Mistral 7B Instruct v0.2 (chat), Llama 3.1 8B
+  (base: completions only), each with its model json and `.reg.json` (`models/`) and its
+  `tokenizer.json` and `tokenizer_config.json` (`tokenizers/`, for the chat template);
+- `env`: `UWC_GATEWAY_SIGNUP_CODE`; `faucet.json`: the key that funds new API keys; `state/`: the
+  database, the API keys' chain keys, requests and results.
+
+The venv needs `tokenizers`, `numpy` and `jinja2`. Update the code with:
+
+    rsync -a runtime/agent/{gateway.py,gateway_page.html,roots.py} root@165.232.182.224:/opt/uwc/app/agent/ && \
+      ssh root@165.232.182.224 systemctl restart uwc-gateway
+
+A model is served only while a provider of it is running and a staked verifier has declared it
+(Rules 5); otherwise its jobs expire and are posted again with a higher fee, then fail.

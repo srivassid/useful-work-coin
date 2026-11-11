@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UWC Jobs</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #16191d; --muted: #5d6670; --line: #dde1e6;
+  --accent: #2f5bd3; --accent-ink: #ffffff; --soft: #eef2fc;
+  --ok: #1f7a46; --ok-soft: #e3f3ea; --warn: #8a5a00; --warn-soft: #fbf0d9; --bad: #a3262a; --bad-soft: #f9e3e3;
+  --code: #f0f2f5; --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111317; --panel: #1a1d22; --ink: #e8eaed; --muted: #9aa3ad; --line: #2c3138;
+    --accent: #7b9cff; --accent-ink: #0d1117; --soft: #1e2533;
+    --ok: #6fcf97; --ok-soft: #16281e; --warn: #e6b450; --warn-soft: #2b2414; --bad: #f28b82; --bad-soft: #2d1a1a; --code: #22262c;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { background: var(--panel); border-bottom: 1px solid var(--line); }
+.wrap { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; flex-wrap: wrap; }
+.brand { font-weight: 650; font-size: 17px; }
+.brand small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+.net { color: var(--muted); font-size: 13px; }
+.net b { color: var(--ink); font-weight: 600; }
+main { padding: 20px 0 48px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 16px; }
+h2 { font-size: 16px; margin: 0 0 12px; }
+h3 { font-size: 14px; margin: 16px 0 8px; }
+p { margin: 0 0 10px; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+input, select, textarea { width: 100%; font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+textarea { min-height: 96px; resize: vertical; }
+input:focus, select:focus, textarea:focus, button:focus-visible, .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button { font: inherit; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink); border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+button.ghost { background: transparent; color: var(--accent); }
+button:disabled { opacity: .55; cursor: default; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+.row > * { flex: 1 1 160px; }
+.row > .fit { flex: 0 0 auto; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.stat { background: var(--soft); border-radius: 8px; padding: 10px 12px; }
+.stat .k { font-size: 12px; color: var(--muted); }
+.stat .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; overflow-x: auto; }
+.tab { background: none; border: none; color: var(--muted); padding: 10px 12px; border-bottom: 2px solid transparent; border-radius: 0; white-space: nowrap; }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+.hidden { display: none !important; }
+.msg { padding: 10px 12px; border-radius: 8px; margin: 8px 0; white-space: pre-wrap; word-wrap: break-word; }
+.msg.user { background: var(--soft); margin-left: 15%; }
+.msg.assistant { background: var(--code); margin-right: 15%; }
+.msg .meta { font-size: 12px; color: var(--muted); margin-top: 6px; white-space: normal; }
+.badge { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--code); color: var(--muted); }
+.badge.final, .badge.done, .badge.settled { background: var(--ok-soft); color: var(--ok); }
+.badge.verified, .badge.committed, .badge.challenge, .badge.posted, .badge.pending, .badge.accepted { background: var(--warn-soft); color: var(--warn); }
+.badge.failed, .badge.disputed, .badge.expired, .badge.aborted { background: var(--bad-soft); color: var(--bad); }
+.note { background: var(--warn-soft); color: var(--warn); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.error { background: var(--bad-soft); color: var(--bad); border-radius: 8px; padding: 10px 12px; font-size: 13px; white-space: pre-wrap; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+.keybox { background: var(--code); padding: 10px; border-radius: 8px; word-break: break-all; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+td.num { font-variant-numeric: tabular-nums; }
+.tablewrap { overflow-x: auto; }
+ol.trust { margin: 6px 0 0; padding-left: 20px; font-size: 13px; color: var(--muted); }
+pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
+@media (max-width: 600px) { .msg.user { margin-left: 0; } .msg.assistant { margin-right: 0; } }
+</style>
+</head>
+<body>
+<header><div class="wrap top">
+  <div class="brand">UWC Jobs<small>testnet</small></div>
+  <div class="net" id="net">connecting…</div>
+</div></header>
+<main class="wrap">
+
+<section class="card" id="signup">
+  <h2>Get started</h2>
+  <p class="muted">Create an API key to post AI jobs to the network. Testnet coins from the faucet pay for them. Each key gets its own account on the chain.</p>
+  <div class="row">
+    <div><label for="su-name">Name for this key</label><input id="su-name" maxlength="80" placeholder="e.g. my laptop"></div>
+    <div id="su-code-wrap"><label for="su-code">Signup code</label><input id="su-code" autocomplete="off"></div>
+    <div class="fit"><button id="su-go">Create key</button></div>
+  </div>
+  <div id="su-out"></div>
+  <h3>Already have a key?</h3>
+  <div class="row">
+    <div><label for="have-key">API key</label><input id="have-key" placeholder="uwc_sk_…" autocomplete="off"></div>
+    <div class="fit"><button class="ghost" id="use-key">Use this key</button></div>
+  </div>
+</section>
+
+<section class="card hidden" id="account">
+  <div class="row" style="align-items:center">
+    <h2 style="margin:0">Your account</h2>
+    <div class="fit"><button class="ghost" id="acct-refresh">Refresh</button> <button class="ghost" id="sign-out">Forget key</button></div>
+  </div>
+  <div class="stats" style="margin-top:12px">
+    <div class="stat"><div class="k">Jobs balance</div><div class="v" id="a-jobs">–</div></div>
+    <div class="stat"><div class="k">Spent</div><div class="v" id="a-spent">–</div></div>
+    <div class="stat"><div class="k">Wallet (for fees)</div><div class="v" id="a-wallet">–</div></div>
+  </div>
+  <p class="small muted" style="margin-top:10px">Account <span class="mono" id="a-acct"></span>. Coins sent to <span class="mono" id="a-addr"></span> move into the jobs balance by themselves.</p>
+</section>
+
+<section class="card hidden" id="work">
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="chat" aria-selected="true">Chat</button>
+    <button class="tab" role="tab" data-tab="complete" aria-selected="false">Complete text</button>
+    <button class="tab" role="tab" data-tab="embed" aria-selected="false">Embeddings</button>
+    <button class="tab" role="tab" data-tab="batch" aria-selected="false">Batch</button>
+    <button class="tab" role="tab" data-tab="jobs" aria-selected="false">My jobs</button>
+  </div>
+
+  <div data-panel="chat">
+    <div class="row">
+      <div><label for="c-model">Model</label><select id="c-model"></select></div>
+      <div class="fit" style="flex-basis:120px"><label for="c-max">Max tokens</label><input id="c-max" type="number" min="1" value="256"></div>
+      <div class="fit" style="flex-basis:120px"><label for="c-temp">Temperature</label><input id="c-temp" type="number" min="0" max="4" step="0.1" value="0.7"></div>
+    </div>
+    <div id="c-log" aria-live="polite"></div>
+    <label for="c-in">Message</label>
+    <textarea id="c-in" placeholder="Ask something…"></textarea>
+    <div class="row" style="margin-top:8px">
+      <div class="small muted" id="c-cost"></div>
+      <div class="fit"><button class="ghost" id="c-clear">New chat</button> <button id="c-send">Send</button></div>
+    </div>
+  </div>
+
+  <div data-panel="complete" class="hidden">
+    <div class="row">
+      <div><label for="p-model">Model</label><select id="p-model"></select></div>
+      <div class="fit" style="flex-basis:120px"><label for="p-max">Max tokens</label><input id="p-max" type="number" min="1" value="128"></div>
+      <div class="fit" style="flex-basis:120px"><label for="p-temp">Temperature</label><input id="p-temp" type="number" min="0" max="4" step="0.1" value="0.7"></div>
+    </div>
+    <label for="p-in">Text to continue</label>
+    <textarea id="p-in" placeholder="Once upon a time"></textarea>
+    <div class="row" style="margin-top:8px"><div class="small muted" id="p-cost"></div><div class="fit"><button id="p-send">Continue</button></div></div>
+    <div id="p-out"></div>
+  </div>
+
+  <div data-panel="embed" class="hidden">
+    <div class="row"><div><label for="e-model">Model</label><select id="e-model"></select></div></div>
+    <label for="e-in">Texts, one per line</label>
+    <textarea id="e-in" placeholder="The first text&#10;The second text"></textarea>
+    <div class="row" style="margin-top:8px"><div class="small muted" id="e-cost"></div><div class="fit"><button id="e-send">Get embeddings</button></div></div>
+    <div id="e-out"></div>
+  </div>
+
+  <div data-panel="batch" class="hidden">
+    <p class="muted small">Many inputs in one request. A file can be plain text (one input per line) or JSON lines: a string, <code>{"input": "…"}</code>, <code>{"prompt": "…"}</code> or <code>{"messages": [...]}</code> per line. At most <span id="b-maxn">256</span> inputs.</p>
+    <div class="row">
+      <div><label for="b-type">Kind</label><select id="b-type"><option value="chat">Chat (one user message each)</option><option value="completion">Complete text</option><option value="embeddings">Embeddings</option></select></div>
+      <div><label for="b-model">Model</label><select id="b-model"></select></div>
+      <div class="fit" style="flex-basis:120px"><label for="b-max">Max tokens</label><input id="b-max" type="number" min="1" value="128"></div>
+    </div>
+    <label for="b-file">File</label><input id="b-file" type="file" accept=".txt,.jsonl,.json,text/plain">
+    <label for="b-in">…or paste inputs</label><textarea id="b-in"></textarea>
+    <div class="row" style="margin-top:8px"><div class="small muted" id="b-cost"></div><div class="fit"><button id="b-send">Submit batch</button></div></div>
+    <div id="b-out"></div>
+  </div>
+
+  <div data-panel="jobs" class="hidden">
+    <div class="row" style="align-items:center"><p class="muted small" style="margin:0">Your last 50 requests. Each one is one or more jobs on the chain.</p><div class="fit"><button class="ghost" id="j-refresh">Refresh</button></div></div>
+    <div class="tablewrap"><table><thead><tr><th>When</th><th>Kind</th><th>Model</th><th>Inputs</th><th>Status</th><th>Trust</th><th class="num">Fee</th><th></th></tr></thead><tbody id="j-rows"></tbody></table></div>
+    <div id="j-detail"></div>
+  </div>
+</section>
+
+<section class="card small muted">
+  <h2 style="color:var(--ink)">How a job is checked</h2>
+  <p>A provider's GPU computes each request as a job on the chain, and the chain pays it from your jobs balance. An answer's <b>trust</b> grows as the job moves on:</p>
+  <ol class="trust">
+    <li><b>committed</b>: the results match what the provider committed on chain (about a minute).</li>
+    <li><b>verified</b>: a committee of staked verifiers that hold the model recomputed sampled stages and agreed.</li>
+    <li><b>final</b>: the challenge window passed with no successful challenge; the provider is paid.</li>
+  </ol>
+  <p style="margin-top:10px">If a provider loses a dispute, the job is posted again for free. <b>Inputs are public</b> on the network's data service: only send text that may be published.</p>
+</section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} },
+};
+let KEY = store.get("uwc_key");
+let MODELS = [], INFO = {};
+let chat = [];
+
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return e;
+}
+const coins = (x) => (x == null ? "–" : (Math.round(x * 10000) / 10000).toLocaleString());
+const badge = (s) => el("span", { class: "badge " + s, text: s });
+const errBox = (msg) => el("div", { class: "error", text: msg });
+
+async function api(method, path, body) {
+  const h = { "Content-Type": "application/json" };
+  if (KEY) h.Authorization = "Bearer " + KEY;
+  const r = await fetch(path, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
+  let j = null;
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((j && j.error && j.error.message) || ("HTTP " + r.status));
+  return j;
+}
+
+async function health() {
+  try {
+    const r = await fetch("/healthz").then((x) => x.json());
+    $("net").replaceChildren("block ", el("b", { text: r.height.toLocaleString() }));
+  } catch (e) { $("net").textContent = "network unreachable"; }
+}
+
+async function loadModels() {
+  INFO = await fetch("/v1/models").then((x) => x.json());
+  MODELS = INFO.data;
+  $("su-code-wrap").classList.toggle("hidden", !INFO.signup_code_required);
+  $("b-maxn").textContent = INFO.max_inputs;
+  fill("c-model", MODELS.filter((m) => m.chat));
+  fill("p-model", MODELS.filter((m) => m.completions));
+  fill("e-model", MODELS.filter((m) => m.embeddings));
+  fillBatch();
+}
+function fill(id, list) {
+  const s = $(id);
+  s.replaceChildren(...list.map((m) => el("option", { value: m.id, text: `${m.label || m.id} · ${m.price_per_1k_tokens_coins} coins / 1k tokens` })));
+}
+function fillBatch() {
+  const t = $("b-type").value;
+  fill("b-model", MODELS.filter((m) => (t === "chat" ? m.chat : t === "completion" ? m.completions : m.embeddings)));
+  $("b-max").disabled = t === "embeddings";
+}
+const model = (id) => MODELS.find((m) => m.id === id) || {};
+
+// a rough estimate: about 4 characters per token, at least the minimum fee per job
+function estimate(id, chars, maxNew, n) {
+  const m = model(id);
+  if (!m.price_per_1k_tokens_coins) return "";
+  const per = Math.max(INFO.min_fee_coins || 0, (chars / 4 + (maxNew || 0)) * m.price_per_1k_tokens_coins / 1000);
+  return `About ${coins(per * (n || 1))} coins`;
+}
+
+function showAccount(on) {
+  $("signup").classList.toggle("hidden", on);
+  $("account").classList.toggle("hidden", !on);
+  $("work").classList.toggle("hidden", !on);
+}
+async function refreshAccount() {
+  try {
+    const a = await api("GET", "/v1/account");
+    $("a-jobs").textContent = coins(a.jobs_balance_coins);
+    $("a-spent").textContent = coins(a.spent_coins);
+    $("a-wallet").textContent = coins(a.wallet_coins);
+    $("a-acct").textContent = a.account.slice(0, 16) + "…";
+    $("a-addr").textContent = a.address;
+    showAccount(true);
+  } catch (e) {
+    if (/API key/.test(e.message)) { KEY = null; store.del("uwc_key"); showAccount(false); }
+    else $("a-jobs").textContent = "?";
+  }
+}
+
+$("su-go").onclick = async () => {
+  const out = $("su-out");
+  out.replaceChildren();
+  $("su-go").disabled = true;
+  try {
+    const k = await api("POST", "/v1/keys", { name: $("su-name").value || "web", signup_code: $("su-code").value });
+    KEY = k.api_key;
+    store.set("uwc_key", KEY);
+    out.append(el("div", { class: "note" },
+      el("b", { text: "Your API key is shown only once. Copy it somewhere safe." }), el("div", { class: "keybox mono", text: KEY }),
+      `The faucet sent ${k.faucet_coins} coins; they arrive with the next block (about a minute).`));
+    setTimeout(() => { refreshAccount(); }, 1500);
+  } catch (e) { out.append(errBox(e.message)); }
+  $("su-go").disabled = false;
+};
+$("use-key").onclick = () => { const k = $("have-key").value.trim(); if (k) { KEY = k; store.set("uwc_key", k); refreshAccount(); } };
+$("sign-out").onclick = () => { KEY = null; store.del("uwc_key"); showAccount(false); };
+$("acct-refresh").onclick = refreshAccount;
+
+for (const t of document.querySelectorAll(".tab")) {
+  t.onclick = () => {
+    for (const x of document.querySelectorAll(".tab")) x.setAttribute("aria-selected", x === t ? "true" : "false");
+    for (const p of document.querySelectorAll("[data-panel]")) p.classList.toggle("hidden", p.dataset.panel !== t.dataset.tab);
+    store.set("uwc_tab", t.dataset.tab);
+    if (t.dataset.tab === "jobs") loadJobs();
+  };
+}
+
+// server-sent events from POST /v1/chat/completions or /v1/completions with "stream": true
+async function stream(path, body, onText, onDone) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + KEY }, body: JSON.stringify({ ...body, stream: true }) });
+  if (!r.ok) { let m = "HTTP " + r.status; try { m = (await r.json()).error.message; } catch (e) {} throw new Error(m); }
+  const rd = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await rd.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+      if (!line.startsWith("data: ")) continue;
+      const d = line.slice(6);
+      if (d === "[DONE]") return;
+      const j = JSON.parse(d);
+      if (j.error) throw new Error(j.error.message);
+      const c = j.choices && j.choices[0];
+      if (!c) continue;
+      const t = c.text != null ? c.text : (c.delta && c.delta.content) || "";
+      if (t) onText(t);
+      if (c.finish_reason) onDone(j);
+    }
+  }
+}
+function metaLine(j) {
+  const u = j.uwc || {};
+  const jobs = (u.jobs || []).map((x) => x.job.slice(0, 8)).join(", ");
+  return el("div", { class: "meta" }, badge(u.trust || "none"), ` fee ${coins(u.fee_coins)} coins · job ${jobs} · `,
+    `${(j.usage || {}).completion_tokens || 0} tokens`);
+}
+
+function drawChat() {
+  $("c-log").replaceChildren(...chat.map((m) => {
+    const d = el("div", { class: "msg " + m.role, text: m.content });
+    if (m.meta) d.append(m.meta);
+    return d;
+  }));
+}
+$("c-clear").onclick = () => { chat = []; drawChat(); };
+$("c-in").oninput = () => { $("c-cost").textContent = estimate($("c-model").value, JSON.stringify(chat).length + $("c-in").value.length, +$("c-max").value); };
+$("c-in").onkeydown = (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("c-send").click(); };
+$("c-send").onclick = async () => {
+  const text = $("c-in").value.trim();
+  if (!text) return;
+  chat.push({ role: "user", content: text });
+  const ans = { role: "assistant", content: "" };
+  chat.push(ans);
+  $("c-in").value = "";
+  drawChat();
+  const node = $("c-log").lastChild;
+  node.textContent = "Waiting for a provider…";
+  $("c-send").disabled = true;
+  try {
+    await stream("/v1/chat/completions", {
+      model: $("c-model").value, messages: chat.slice(0, -1).map(({ role, content }) => ({ role, content })),
+      max_tokens: +$("c-max").value, temperature: +$("c-temp").value,
+    }, (t) => { ans.content += t; node.textContent = ans.content; },
+       (j) => { ans.meta = metaLine(j); drawChat(); refreshAccount(); });
+  } catch (e) { chat.pop(); drawChat(); $("c-log").append(errBox(e.message)); }
+  $("c-send").disabled = false;
+};
+
+$("p-in").oninput = () => { $("p-cost").textContent = estimate($("p-model").value, $("p-in").value.length, +$("p-max").value); };
+$("p-send").onclick = async () => {
+  const prompt = $("p-in").value;
+  if (!prompt) return;
+  const out = $("p-out");
+  const box = el("div", { class: "msg assistant" }, el("span", { class: "muted", text: prompt }), el("span"));
+  out.replaceChildren(box);
+  box.lastChild.textContent = " …";
+  let txt = "";
+  $("p-send").disabled = true;
+  try {
+    await stream("/v1/completions", { model: $("p-model").value, prompt, max_tokens: +$("p-max").value, temperature: +$("p-temp").value },
+      (t) => { txt += t; box.lastChild.textContent = txt; },
+      (j) => { box.append(metaLine(j)); refreshAccount(); });
+  } catch (e) { out.append(errBox(e.message)); }
+  $("p-send").disabled = false;
+};
+
+const lines = (s) => s.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+$("e-in").oninput = () => { const l = lines($("e-in").value); $("e-cost").textContent = l.length ? `${l.length} texts · ` + estimate($("e-model").value, l.join("").length, 0) : ""; };
+$("e-send").onclick = async () => {
+  const input = lines($("e-in").value);
+  if (!input.length) return;
+  const out = $("e-out");
+  out.replaceChildren(el("p", { class: "muted", text: "Posted; waiting for a provider…" }));
+  $("e-send").disabled = true;
+  try {
+    const r = await api("POST", "/v1/jobs", { model: $("e-model").value, input });
+    const v = await waitFor(r.id, (v) => out.replaceChildren(el("p", { class: "muted" }, "Request ", el("span", { class: "mono", text: r.id.slice(0, 8) }), " ", badge(v.status))));
+    const rows = v.data.map((d, i) => el("tr", {}, el("td", { text: input[i].slice(0, 60) }), el("td", { class: "mono", text: d.embedding.slice(0, 4).map((x) => x.toFixed(4)).join(", ") + ", …" })));
+    out.replaceChildren(el("p", {}, badge(v.trust), ` ${v.data.length} vectors of ${v.data[0].embedding.length} numbers · fee ${coins(v.fee_coins)} coins `, dl(v.id, "Download")),
+      el("div", { class: "tablewrap" }, el("table", {}, el("tbody", {}, ...rows))));
+    refreshAccount();
+  } catch (e) { out.append(errBox(e.message)); }
+  $("e-send").disabled = false;
+};
+
+async function waitFor(id, onTick) {
+  for (;;) {
+    const v = await api("GET", "/v1/jobs/" + id);
+    if (v.status === "done") return v;
+    if (v.status === "failed") throw new Error("The request failed: " + (v.error || "unknown"));
+    if (onTick) onTick(v);
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+}
+function dl(id, label) {
+  const b = el("button", { class: "ghost", text: label || "Download results" });
+  b.onclick = async () => {
+    const r = await fetch(`/v1/jobs/${id}/results`, { headers: { Authorization: "Bearer " + KEY } });
+    if (!r.ok) { alertBox(b, "Not ready yet"); return; }
+    const url = URL.createObjectURL(await r.blob());
+    const a = el("a", { href: url, download: `uwc-${id}.jsonl` });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+  return b;
+}
+function alertBox(after, msg) { after.after(el("span", { class: "small muted", text: " " + msg })); }
+
+function parseBatch(text, type) {
+  const out = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const l = raw.trim();
+    if (!l) continue;
+    if (l.startsWith("{") || l.startsWith("[") || l.startsWith('"')) {
+      let j;
+      try { j = JSON.parse(l); } catch (e) { out.push(l); continue; }
+      if (typeof j === "string") out.push(j);
+      else if (Array.isArray(j)) out.push(type === "chat" ? j : JSON.stringify(j));
+      else if (j.messages && type === "chat") out.push(j.messages);
+      else out.push(j.input || j.prompt || j.text || j.content || JSON.stringify(j));
+    } else out.push(l);
+  }
+  return out;
+}
+let batchText = "";
+$("b-type").onchange = () => { fillBatch(); batchCost(); };
+$("b-file").onchange = async () => { const f = $("b-file").files[0]; batchText = f ? await f.text() : ""; batchCost(); };
+$("b-in").oninput = batchCost;
+$("b-model").onchange = batchCost;
+function batchInputs() { return parseBatch(batchText + "\n" + $("b-in").value, $("b-type").value); }
+function batchCost() {
+  const xs = batchInputs(), t = $("b-type").value;
+  $("b-cost").textContent = xs.length ? `${xs.length} inputs · ` + estimate($("b-model").value, JSON.stringify(xs).length, t === "embeddings" ? 0 : +$("b-max").value * xs.length) : "";
+}
+$("b-send").onclick = async () => {
+  const inputs = batchInputs(), out = $("b-out");
+  if (!inputs.length) return;
+  out.replaceChildren();
+  $("b-send").disabled = true;
+  try {
+    const r = await api("POST", "/v1/batches", { type: $("b-type").value, model: $("b-model").value, inputs, max_tokens: +$("b-max").value });
+    const status = el("p", { class: "muted" });
+    out.append(status);
+    const v = await waitFor(r.id, (v) => {
+      const done = v.jobs.filter((j) => j.delivered).length;
+      status.replaceChildren("Request ", el("span", { class: "mono", text: r.id.slice(0, 8) }), ` · ${v.inputs} inputs in ${v.jobs.length || "…"} jobs · ${done} delivered `, badge(v.status));
+    });
+    status.replaceChildren(badge(v.trust), ` ${v.inputs} results · fee ${coins(v.fee_coins)} coins `, dl(v.id));
+    refreshAccount();
+  } catch (e) { out.append(errBox(e.message)); }
+  $("b-send").disabled = false;
+};
+
+$("j-refresh").onclick = loadJobs;
+async function loadJobs() {
+  const tb = $("j-rows");
+  try {
+    const r = await api("GET", "/v1/jobs");
+    tb.replaceChildren(...r.data.map((v) => {
+      const open = el("button", { class: "ghost", text: "Details" });
+      open.onclick = () => detail(v.id);
+      return el("tr", {}, el("td", { text: new Date(v.created * 1000).toLocaleString() }), el("td", { text: v.kind }),
+        el("td", { text: v.model }), el("td", { class: "num", text: v.inputs }), el("td", {}, badge(v.status)),
+        el("td", {}, badge(v.trust)), el("td", { class: "num", text: coins(v.fee_coins) }), el("td", {}, open));
+    }));
+    if (!r.data.length) tb.replaceChildren(el("tr", {}, el("td", { colspan: "8", class: "muted", text: "No requests yet." })));
+  } catch (e) { tb.replaceChildren(el("tr", {}, el("td", { colspan: "8" }, errBox(e.message)))); }
+}
+async function detail(id) {
+  const box = $("j-detail");
+  try {
+    const v = await api("GET", "/v1/jobs/" + id);
+    const jobs = v.jobs.map((j) => el("tr", {}, el("td", { class: "mono", text: j.job.slice(0, 16) + "…" }), el("td", { class: "num", text: j.inputs }),
+      el("td", {}, badge(j.status)), el("td", { class: "num", text: coins(j.fee_coins) }), el("td", { class: "num", text: j.attempt }),
+      el("td", { class: "small muted", text: j.note || (j.delivered ? "results delivered" : "") })));
+    const parts = [el("h3", {}, "Request ", el("span", { class: "mono", text: v.id }))];
+    if (v.error) parts.push(errBox(v.error));
+    parts.push(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, el("tr", {}, ...["Job on chain", "Inputs", "Chain status", "Fee", "Attempt", ""].map((h) => el("th", { text: h })))), el("tbody", {}, ...jobs))));
+    if (v.choices && v.choices.length === 1) parts.push(el("pre", { text: v.choices[0].text != null ? v.choices[0].text : v.choices[0].message.content }));
+    if (v.status === "done") parts.push(dl(v.id));
+    box.replaceChildren(...parts);
+  } catch (e) { box.replaceChildren(errBox(e.message)); }
+}
+
+(async () => {
+  health(); setInterval(health, 30000);
+  try { await loadModels(); } catch (e) { $("net").textContent = "gateway unreachable"; }
+  if (KEY) refreshAccount(); else showAccount(false);
+  const t = store.get("uwc_tab");
+  if (t) { const b = document.querySelector(`.tab[data-tab="${t}"]`); if (b) b.click(); }
+})();
+</script>
+</body>
+</html>

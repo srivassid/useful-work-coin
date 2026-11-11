@@ -317,3 +317,134 @@ def test_chat_stream(world):
     last = chunks[-1]
     assert last["choices"][0]["finish_reason"] == "stop" and last["uwc"]["trust"] == "committed"
 
+
+
+# ------------------------------------------------------------------ several models, batches, the page
+
+TOKDIR = os.path.expanduser(os.environ.get("UWC_TOKENIZER_DIR", "~/Documents/useful-work-coin/tokenizers"))
+
+
+@pytest.mark.parametrize("name", ["llama3b", "mistral"])
+def test_chat_templates_match_transformers(name):
+    """The gateway renders a model's own chat template as transformers' apply_chat_template does."""
+    tj, cj = os.path.join(TOKDIR, f"{name}.json"), os.path.join(TOKDIR, f"{name}.config.json")
+    if not (os.path.exists(tj) and os.path.exists(cj)):
+        pytest.skip("needs the Llama/Mistral tokenizers (UWC_TOKENIZER_DIR)")
+    transformers = pytest.importorskip("transformers")
+    hf = transformers.PreTrainedTokenizerFast(tokenizer_file=tj, **{k: v for k, v in json.load(open(cj)).items()
+                                                                    if k in ("bos_token", "eos_token", "chat_template")})
+    cfg = json.load(open(cj))
+    for msgs in ([{"role": "user", "content": "What is the capital of France?"}],
+                 [{"role": "system", "content": "Answer briefly."}, {"role": "user", "content": "Hi"},
+                  {"role": "assistant", "content": "Hello."}, {"role": "user", "content": "Name a colour."}]):
+        if name == "mistral" and msgs[0]["role"] == "system":
+            msgs = msgs[1:]  # v0.2's template has no system role
+        want = hf.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        got = gwmod.render_chat_template(cfg["chat_template"], msgs, cfg["bos_token"], cfg["eos_token"])
+        assert got == want
+
+
+@pytest.fixture()
+def multi(world, tmp_path):
+    """The world's gateway serving two models: the chat model and a base model (completions only)."""
+    gw0, fake, url0, data_url = world
+    base = tmp_path / "b.json"
+    json.dump({"layer_groups": 3, "cfg": {"MaxPos": 256, "D": 64}, "gen": True}, open(base, "w"))
+    json.dump({"model": "bb" * 32}, open(tmp_path / "b.reg.json", "w"))
+    models = tmp_path / "models.json"
+    json.dump([{"name": "qwen3-1.7b", "model": gw0.a.model, "tokenizer": TOKENIZER, "template": "qwen3", "price_per_1k": 1.5,
+                "label": "Qwen3 1.7B"},
+               {"name": "base-model", "model": str(base), "tokenizer": TOKENIZER, "template": "none", "price_per_1k": 6}],
+              open(models, "w"))
+    a = argparse.Namespace(**{**vars(gw0.a), "home": str(tmp_path / "gw2"), "models": str(models), "max_gen_batch": 2})
+    gw = gwmod.Gateway(a)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), gwmod.handler(gw))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield gw, fake, f"http://127.0.0.1:{srv.server_address[1]}", data_url
+    srv.shutdown()
+
+
+def provide_gen_many(fake, data_url, jid, replies: list[list[int]], G: int):
+    """A generation job of several sequences: each sequence's generated part is its reply."""
+    from detgen.head import SENTINEL, gen_output_root, head_output_root
+    j = fake.jobs[jid]
+    rows = json.loads(urllib.request.urlopen(f"{data_url}/inputs/{j['inputroot']}.json").read())["batches"]
+    T = j["seqlen"]
+    assert j["stages"] == len(rows) * (G + 1) and all(len(r) == T for r in rows)
+    heads = np.zeros((len(rows), T - 1, 2), dtype=np.int32)
+    for k, (row, rep) in enumerate(zip(rows, replies)):
+        P = row.index(SENTINEL)
+        heads[k, P - 1:, 0] = (rep + [0] * T)[:T - P]
+    buf = io.BytesIO()
+    np.save(buf, heads)
+    urllib.request.urlopen(urllib.request.Request(f"{data_url}/outputs/{jid}.npy", data=buf.getvalue(), method="PUT")).read()
+    j.update(status="verify-commit", outputroot=gen_output_root([head_output_root(h) for h in heads]).hex())
+    return rows
+
+
+def test_models_completions_and_batches(multi):
+    gw, fake, url, data_url = multi
+    st, ms = call(url, "GET", "/v1/models")
+    assert st == 200 and [m["id"] for m in ms["data"]] == ["qwen3-1.7b", "base-model"] and ms["signup_code_required"]
+    by = {m["id"]: m for m in ms["data"]}
+    assert by["qwen3-1.7b"]["chat"] and by["qwen3-1.7b"]["embeddings"]
+    assert not by["base-model"]["chat"] and by["base-model"]["completions"] and not by["base-model"]["embeddings"]
+    key = call(url, "POST", "/v1/keys", {"name": "m", "signup_code": "letmein"})[1]["api_key"]
+    msgs = [{"role": "user", "content": "hi"}]
+    assert call(url, "POST", "/v1/chat/completions", {"model": "base-model", "messages": msgs}, key)[0] == 400
+    assert call(url, "POST", "/v1/jobs", {"model": "base-model", "input": "x"}, key)[0] == 400
+    assert call(url, "POST", "/v1/batches", {"model": "qwen3-1.7b", "type": "chat", "inputs": []}, key)[0] == 400
+
+    # a completion on the base model: its own price, job and model id
+    rid = gw.submit_completion(gw.auth(f"Bearer {key}"), {"model": "base-model", "prompt": "Once upon a time", "max_tokens": 8})
+    gw.tick()
+    (jid,) = fake.jobs
+    assert fake.jobs[jid]["stages"] == 4 and fake.jobs[jid]["fee"] == gw.fee_for(fake.jobs[jid]["seqlen"], gw.models["base-model"])
+    eot = gw.tok.token_to_id("<|endoftext|>")
+    story = gw.tok.encode(" there was a cat", add_special_tokens=False).ids
+    provide_gen_many(fake, data_url, jid, [story + [eot]], 3)
+    gw.tick()
+    v = call(url, "GET", f"/v1/jobs/{rid}", key=key)[1]
+    assert v["status"] == "done" and v["model"] == "base-model" and v["kind"] == "completion"
+    assert v["choices"][0]["text"] == " there was a cat" and v["choices"][0]["finish_reason"] == "stop"
+
+    # a batch of 3 chat inputs: 2 jobs (max_gen_batch 2), results in input order, as JSON lines
+    before = set(fake.jobs)
+    st, b = call(url, "POST", "/v1/batches", {"model": "qwen3-1.7b", "type": "chat", "max_tokens": 6,
+                                              "inputs": ["One?", [{"role": "user", "content": "Two?"}], "Three?"]}, key)
+    assert st == 202 and b["inputs"] == 3 and b["kind"] == "chat"
+    assert call(url, "GET", f"/v1/jobs/{b['id']}/results", key=key)[0] == 409
+    gw.tick()
+    new = [j for j in fake.jobs if j not in before]
+    assert len(new) == 2
+    end = gw.tok.token_to_id("<|im_end|>")
+    answers = {}
+    for jid in new:
+        idx = json.loads(gw.store.one("SELECT indexes FROM jobs WHERE job = ?", jid)["indexes"])
+        reps = [gw.tok.encode(f"answer {i}", add_special_tokens=False).ids + [end] for i in idx]
+        provide_gen_many(fake, data_url, jid, reps, 7)
+        answers.update({i: f"answer {i}" for i in idx})
+    gw.tick()
+    v = call(url, "GET", f"/v1/jobs/{b['id']}", key=key)[1]
+    assert v["status"] == "done" and [c["message"]["content"] for c in v["choices"]] == [answers[i] for i in range(3)]
+    req = urllib.request.Request(f"{url}/v1/jobs/{b['id']}/results")
+    req.add_header("Authorization", f"Bearer {key}")
+    with urllib.request.urlopen(req) as resp:
+        assert resp.headers["Content-Type"] == "application/x-ndjson"
+        lines = [json.loads(x) for x in resp.read().decode().splitlines()]
+    assert [x["text"] for x in lines] == ["answer 0", "answer 1", "answer 2"] and lines[0]["finish_reason"] == "stop"
+    # the list view leaves results out
+    lst = call(url, "GET", "/v1/jobs", key=key)[1]["data"]
+    assert {x["id"] for x in lst} == {rid, b["id"]} and all("choices" not in x for x in lst if x["inputs"] > 1)
+
+    # a batch of embeddings is an embeddings request
+    st, e = call(url, "POST", "/v1/batches", {"model": "qwen3-1.7b", "type": "embeddings", "inputs": ["a", "b"]}, key)
+    assert st == 202 and e["kind"] == "embed" and e["inputs"] == 2
+
+
+def test_the_page(world):
+    gw, fake, url, data_url = world
+    with urllib.request.urlopen(url + "/") as resp:
+        page = resp.read().decode()
+        assert resp.headers["Content-Type"].startswith("text/html") and "Content-Security-Policy" in resp.headers
+    assert "<title>" in page and "/v1/batches" in page and "/v1/chat/completions" in page
