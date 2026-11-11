@@ -511,8 +511,9 @@ class Provider(Agent):
             for jid, e in self.chain.jobs("posted").items():
                 if e["client"] != self.account and jid not in self.st["jobs"]:
                     j = self.chain.job(jid)
+                    # a job directed to another provider (Rules 2, e.g. a decoy) cannot be ours
                     if j and j["model"] == self.model_id and j["deadline"] > h + 5 and self.verified(s, j["model"]) \
-                            and self.input_batches(j) is not None:
+                            and j.get("directed", self.account) == self.account and self.input_batches(j) is not None:
                         bond = (j["fee"] * 5000 + 9999) // 10000
                         if not self.can_bond(bond, h):
                             break
@@ -1154,6 +1155,13 @@ class Decoy(Provider):
                     self.save()
             if j["provider"] != self.account:
                 continue
+            if not js.get("outputs_up") and os.path.exists(self.decoy_out(jid)):
+                try:
+                    self.data.put(f"/outputs/{jid}.npy", open(self.decoy_out(jid), "rb").read())
+                    js["outputs_up"] = True
+                    self.save()
+                except Exception as e:  # tried again next step
+                    log(f"decoy {jid[:8]}: outputs upload: {e}")
             if j["status"] == "accepted" and not js.get("committed"):
                 sc = self.commit_of(js)
                 if self.send([{"kind": "TRACE_COMMIT", "job": jid, "h1": sc.root.hex(), "h2": js["outputroot"]}],
@@ -1181,6 +1189,9 @@ class Decoy(Provider):
         if len(active) < (self.a.max_jobs or 1) and h - self.st.get("last_post", -10**9) >= self.a.every and \
                 self.a.post > len(self.st["jobs"]):
             self.post_decoy(h)
+
+    def decoy_out(self, jid: str) -> str:
+        return os.path.join(os.path.dirname(self.path), f"decoy-out-{jid}.npy")
 
     def reveals_only(self, j: dict, js: dict):
         sc = self.commit_of(js)
@@ -1258,9 +1269,10 @@ class Decoy(Provider):
             wrong = random.randrange(len(roots))
         roots[wrong] = secrets.token_bytes(32)  # the forced error
         salts = [secrets.token_bytes(32) for _ in roots]
-        buf = io.BytesIO()
-        np.save(buf, np.stack(embs))
-        self.data.put(f"/outputs/{jid}.npy", buf.getvalue())
+        # record the job before anything else can fail, or the next step would post it again; the
+        # outputs go up once the decoy's accept is mined (the data service takes a job's outputs
+        # only from its provider)
+        np.save(self.decoy_out(jid), np.stack(embs))
         self.st["jobs"][jid] = {"posted": h, "wrong": wrong, "roots": [x.hex() for x in roots],
                                 "salts": [x.hex() for x in salts], "outputroot": output_root(embs).hex()}
         self.st["last_post"] = h
