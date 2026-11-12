@@ -64,6 +64,25 @@ answer is back, about 5 minutes on a quiet network) to *verified* (about 10 minu
 *final* when the challenge window closes, about 5 hours. End-to-end test on 2026-11-12: one chat
 request on each instruct model and a completion on Llama 3.1 8B, 0.5 coins each.
 
+### Coin market: buy coins with bitcoin or ether
+
+The jobs page's **Buy coins** and **Sell coins** tabs (`runtime/agent/market.py`, gateway
+`--market`) let miners sell coins to API users. Payment goes straight to the seller; the gateway
+never holds bitcoin or ether, only the coins on sale, in escrow:
+
+1. A seller opens an offer (coins, a US$ price per coin, their own BTC and/or ETH address) and
+   sends the coins, plus one for transaction fees, to the offer's own escrow address.
+2. A buyer orders coins in BTC or ETH. The gateway prices the order at the live rate (Coinbase,
+   CoinGecko as a fallback) and adds a few satoshi or gwei so that the amount is unique.
+3. The gateway watches the seller's address on mempool.space or Blockscout. After 1 bitcoin or
+   12 Ethereum confirmations it deposits the coins from escrow into the buyer's jobs balance.
+4. Closing an offer sends the unsold coins back to the seller's refund address.
+
+Orders are paid within an hour; a late payment is still honoured for a day while the offer has
+the coins. Only the exact amount or more counts. API: `GET /v1/market`, `POST /v1/market/offers`,
+`POST /v1/market/offers/<id>/close`, `POST /v1/market/orders`, `GET /v1/market/orders/<id>`,
+`GET /v1/market/mine`.
+
 Live mining stats: <https://aicoin-miners.vercel.app> (miners active in the last hour and day,
 blocks, work rate), fed by `web/stats/exporter.py`, which publishes public chain data only.
 Server setup: `deploy/mainnet/`.

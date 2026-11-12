@@ -7,7 +7,7 @@ User=uwc
 Group=uwc
 WorkingDirectory=/opt/uwc/app
 Environment=HOME=/opt/uwc/gateway-main PYTHONPATH=/opt/uwc/app
-ExecStart=/opt/uwc/venv/bin/python -m agent.gateway --net /opt/uwc/main --data http://127.0.0.1:8692 --home /opt/uwc/gateway-main/state --models /opt/uwc/gateway-main/models.json --bind 127.0.0.1:8693 --cors-origin *
+ExecStart=/opt/uwc/venv/bin/python -m agent.gateway --net /opt/uwc/main --data http://127.0.0.1:8692 --home /opt/uwc/gateway-main/state --models /opt/uwc/gateway-main/models.json --bind 127.0.0.1:8693 --cors-origin * --market
 Restart=on-failure
 RestartSec=5
 MemoryMax=800M

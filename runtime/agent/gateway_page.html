@@ -57,9 +57,9 @@ button:disabled { opacity: .55; cursor: default; }
 .msg.assistant { background: var(--code); margin-right: 15%; }
 .msg .meta { font-size: 12px; color: var(--muted); margin-top: 6px; white-space: normal; }
 .badge { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--code); color: var(--muted); }
-.badge.final, .badge.done, .badge.settled { background: var(--ok-soft); color: var(--ok); }
-.badge.verified, .badge.committed, .badge.challenge, .badge.posted, .badge.pending, .badge.accepted { background: var(--warn-soft); color: var(--warn); }
-.badge.failed, .badge.disputed, .badge.expired, .badge.aborted { background: var(--bad-soft); color: var(--bad); }
+.badge.final, .badge.done, .badge.settled, .badge.paid, .badge.active { background: var(--ok-soft); color: var(--ok); }
+.badge.verified, .badge.committed, .badge.challenge, .badge.posted, .badge.pending, .badge.accepted, .badge.awaiting_payment, .badge.seen, .badge.confirmed, .badge.delivering, .badge.funding, .badge.closing { background: var(--warn-soft); color: var(--warn); }
+.badge.failed, .badge.disputed, .badge.expired, .badge.aborted, .badge.late_unfilled, .badge.check { background: var(--bad-soft); color: var(--bad); }
 .note { background: var(--warn-soft); color: var(--warn); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
 .error { background: var(--bad-soft); color: var(--bad); border-radius: 8px; padding: 10px 12px; font-size: 13px; white-space: pre-wrap; }
 code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
@@ -69,6 +69,11 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line
 th { color: var(--muted); font-weight: 500; }
 td.num { font-variant-numeric: tabular-nums; }
 .tablewrap { overflow-x: auto; }
+.paybox { background: var(--soft); border-radius: 8px; padding: 12px; margin-top: 12px; }
+.paybox .big { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.copy { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+.copy .mono { word-break: break-all; flex: 1 1 auto; }
+.copy button { flex: 0 0 auto; padding: 4px 10px; font-size: 13px; }
 ol.trust { margin: 6px 0 0; padding-left: 20px; font-size: 13px; color: var(--muted); }
 pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
 @media (max-width: 600px) { .msg.user { margin-left: 0; } .msg.assistant { margin-right: 0; } }
@@ -83,7 +88,7 @@ pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: au
 
 <section class="card" id="signup">
   <h2>Get started</h2>
-  <p class="muted">Create an API key to post AI jobs to the network. Each key gets its own account on the chain: fund it by sending coins to the key's address (from <code>./uwc-miner send</code>), and they move into its jobs balance within a few blocks.</p>
+  <p class="muted">Create an API key to post AI jobs to the network. Each key gets its own account on the chain: fund it by sending coins to the key's address (from <code>./uwc-miner send</code>), or buy coins from miners with bitcoin or ether in the <b>Buy coins</b> tab.</p>
   <div class="row">
     <div><label for="su-name">Name for this key</label><input id="su-name" maxlength="80" placeholder="e.g. my laptop"></div>
     <div id="su-code-wrap"><label for="su-code">Signup code</label><input id="su-code" autocomplete="off"></div>
@@ -117,6 +122,8 @@ pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: au
     <button class="tab" role="tab" data-tab="embed" aria-selected="false">Embeddings</button>
     <button class="tab" role="tab" data-tab="batch" aria-selected="false">Batch</button>
     <button class="tab" role="tab" data-tab="jobs" aria-selected="false">My jobs</button>
+    <button class="tab market-only" role="tab" data-tab="buy" aria-selected="false">Buy coins</button>
+    <button class="tab market-only" role="tab" data-tab="sell" aria-selected="false">Sell coins</button>
   </div>
 
   <div data-panel="chat">
@@ -172,6 +179,35 @@ pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: au
     <div class="tablewrap"><table><thead><tr><th>When</th><th>Kind</th><th>Model</th><th>Inputs</th><th>Status</th><th>Trust</th><th class="num">Fee</th><th></th></tr></thead><tbody id="j-rows"></tbody></table></div>
     <div id="j-detail"></div>
   </div>
+
+  <div data-panel="buy" class="hidden">
+    <p class="muted small">Miners sell coins here for bitcoin or ether. You pay the seller directly; their coins wait in escrow on the gateway and move into your jobs balance once your payment is confirmed. The gateway never holds your bitcoin or ether.</p>
+    <div class="row" style="align-items:center"><div class="small muted" id="m-rates"></div><div class="fit"><button class="ghost" id="m-refresh">Refresh</button></div></div>
+    <div class="tablewrap"><table><thead><tr><th>Seller</th><th class="num">Price per coin</th><th class="num">Available</th><th>Pays in</th><th></th></tr></thead><tbody id="m-offers"></tbody></table></div>
+    <div id="m-buy"></div>
+    <h3>Your orders</h3>
+    <div class="tablewrap"><table><thead><tr><th>When</th><th class="num">Coins</th><th class="num">Amount</th><th>Status</th><th></th></tr></thead><tbody id="m-orders"></tbody></table></div>
+    <div id="m-order"></div>
+  </div>
+
+  <div data-panel="sell" class="hidden">
+    <p class="muted small">Sell coins for bitcoin or ether. Buyers pay your own addresses directly. After you open an offer, send its coins to the escrow address it shows (with <code>./uwc-miner send</code>), plus one coin for transaction fees. The gateway hands coins to a buyer only after their payment to you is confirmed on chain. Closing the offer returns whatever is left to your refund address.</p>
+    <div class="row">
+      <div><label for="s-coins">Coins to sell</label><input id="s-coins" type="number" min="1" step="1" placeholder="10000"></div>
+      <div><label for="s-price">Price per coin (US$)</label><input id="s-price" type="number" min="0" step="any" placeholder="0.001"></div>
+    </div>
+    <div class="row">
+      <div><label for="s-btc">Your bitcoin address (optional)</label><input id="s-btc" placeholder="bc1…" autocomplete="off"></div>
+      <div><label for="s-eth">Your Ethereum address (optional)</label><input id="s-eth" placeholder="0x…" autocomplete="off"></div>
+    </div>
+    <label for="s-refund">Refund address for unsold coins (default: this key's address)</label><input id="s-refund" placeholder="uwc1p…" autocomplete="off">
+    <div class="row" style="margin-top:8px"><div class="small muted" id="s-sum"></div><div class="fit"><button id="s-go">Open offer</button></div></div>
+    <div id="s-out"></div>
+    <h3>Your offers</h3>
+    <div id="s-offers"></div>
+    <h3>Your sales</h3>
+    <div class="tablewrap"><table><thead><tr><th>When</th><th class="num">Coins</th><th class="num">Amount</th><th>Status</th><th>Payment</th></tr></thead><tbody id="s-sales"></tbody></table></div>
+  </div>
 </section>
 
 <section class="card small muted">
@@ -182,6 +218,7 @@ pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: au
     <li><b>verified</b>: a committee of staked verifiers that hold the model recomputed sampled stages and agreed.</li>
     <li><b>final</b>: the challenge window passed with no successful challenge; the provider is paid.</li>
   </ol>
+  <p style="margin-top:10px" class="market-only"><b>Buying coins</b>: send exactly the amount an order shows, from a wallet you control. An exchange that takes its withdrawal fee out of the amount sends too little, and the payment won't count. Coins arrive after 1 bitcoin confirmation (about 10 minutes) or 12 Ethereum confirmations (about 3 minutes).</p>
   <p style="margin-top:10px">If a provider loses a dispute, the job is posted again for free. <b>Inputs are public</b> on the network's data service: only send text that may be published.</p>
 </section>
 </main>
@@ -232,6 +269,7 @@ async function loadModels() {
   MODELS = INFO.data;
   $("su-code-wrap").classList.toggle("hidden", !INFO.signup_code_required);
   $("b-maxn").textContent = INFO.max_inputs;
+  for (const x of document.querySelectorAll(".market-only")) x.classList.toggle("hidden", !INFO.market);
   fill("c-model", MODELS.filter((m) => m.chat));
   fill("p-model", MODELS.filter((m) => m.completions));
   fill("e-model", MODELS.filter((m) => m.embeddings));
@@ -303,6 +341,7 @@ for (const t of document.querySelectorAll(".tab")) {
     for (const p of document.querySelectorAll("[data-panel]")) p.classList.toggle("hidden", p.dataset.panel !== t.dataset.tab);
     store.set("uwc_tab", t.dataset.tab);
     if (t.dataset.tab === "jobs") loadJobs();
+    if (t.dataset.tab === "buy" || t.dataset.tab === "sell") loadMarket();
   };
 }
 
@@ -505,6 +544,119 @@ async function detail(id) {
     box.replaceChildren(...parts);
   } catch (e) { box.replaceChildren(errBox(e.message)); }
 }
+
+// ---------------------------------------------------------------- coin market
+const usd = (x) => "$" + (x >= 1 ? x.toLocaleString(undefined, { maximumFractionDigits: 2 }) : x >= 1e-6 ? String(+x.toPrecision(3)) : x.toPrecision(3));
+const when = (t) => new Date(t * 1000).toLocaleString();
+function copyRow(label, value) {
+  const b = el("button", { class: "ghost", text: "Copy" });
+  b.onclick = async () => { try { await navigator.clipboard.writeText(value); b.textContent = "Copied"; } catch (e) { b.textContent = "Select and copy"; } };
+  return el("div", {}, el("div", { class: "small muted", text: label }), el("div", { class: "copy" }, el("span", { class: "mono", text: value }), b));
+}
+let MARKET = null, orderTimer = null;
+async function loadMarket() {
+  try {
+    MARKET = await fetch("/v1/market").then((x) => x.json());
+    const r = MARKET.rates_usd;
+    $("m-rates").textContent = r ? `1 BTC = ${usd(r.BTC)} · 1 ETH = ${usd(r.ETH)} · orders from ${usd(MARKET.min_order_usd)}` : "Exchange rates are unavailable right now.";
+    $("m-offers").replaceChildren(...MARKET.offers.map((o) => {
+      const b = el("button", { text: "Buy" });
+      b.onclick = () => buyForm(o);
+      return el("tr", {}, el("td", { text: `${o.seller || "seller"} · ${o.seller_sales} sales` }), el("td", { class: "num", text: usd(o.price_usd) }),
+        el("td", { class: "num", text: coins(o.available_coins) }), el("td", { text: o.currencies.join(", ") }), el("td", {}, b));
+    }));
+    if (!MARKET.offers.length) $("m-offers").replaceChildren(el("tr", {}, el("td", { colspan: "5", class: "muted", text: "No coins for sale right now." })));
+  } catch (e) { $("m-offers").replaceChildren(el("tr", {}, el("td", { colspan: "5" }, errBox(e.message)))); }
+  loadMine();
+}
+$("m-refresh").onclick = loadMarket;
+function buyForm(o) {
+  const n = el("input", { type: "number", min: "1", step: "1", value: String(Math.min(o.available_coins, Math.ceil(MARKET.min_order_usd / o.price_usd))) });
+  const cur = el("select", {}, ...o.currencies.map((c) => el("option", { value: c, text: c === "BTC" ? "Bitcoin (BTC)" : "Ether (ETH)" })));
+  const sum = el("div", { class: "small muted" });
+  const go = el("button", { text: "Create order" });
+  const out = el("div");
+  const upd = () => {
+    const u = (+n.value || 0) * o.price_usd, r = MARKET.rates_usd && MARKET.rates_usd[cur.value];
+    sum.textContent = `${usd(u)}` + (r ? ` ≈ ${(u / r).toPrecision(4)} ${cur.value}` : "");
+  };
+  n.oninput = upd; cur.onchange = upd; upd();
+  go.onclick = async () => {
+    go.disabled = true; out.replaceChildren();
+    try { const ord = await api("POST", "/v1/market/orders", { offer: o.id, coins: +n.value, currency: cur.value }); $("m-buy").replaceChildren(); showOrder(ord.id); loadMine(); }
+    catch (e) { out.append(errBox(e.message)); }
+    go.disabled = false;
+  };
+  $("m-buy").replaceChildren(el("div", { class: "paybox" },
+    el("b", { text: `Buy from ${o.seller || "this seller"} at ${usd(o.price_usd)} per coin` }),
+    el("div", { class: "row" }, el("div", {}, el("label", { text: "Coins" }), n), el("div", {}, el("label", { text: "Pay with" }), cur)),
+    el("div", { class: "row", style: "margin-top:8px" }, sum, el("div", { class: "fit" }, go)), out));
+}
+async function showOrder(id) {
+  clearTimeout(orderTimer);
+  const box = $("m-order");
+  let o;
+  try { o = await api("GET", "/v1/market/orders/" + id); } catch (e) { box.replaceChildren(errBox(e.message)); return; }
+  const left = Math.max(0, Math.round((o.expires - Date.now() / 1000) / 60));
+  const parts = [el("h3", {}, "Order ", el("span", { class: "mono", text: o.id }), " ", badge(o.status))];
+  if (o.status === "awaiting_payment") {
+    parts.push(el("div", { class: "paybox" },
+      el("div", { class: "big", text: `Send exactly ${o.amount} ${o.currency}` }),
+      el("div", { class: "small muted", text: `for ${coins(o.coins)} coins (${usd(o.usd)} at 1 ${o.currency} = ${usd(o.rate_usd)}). Pay within ${left} minutes.` }),
+      copyRow("Amount", o.amount), copyRow(`Seller's ${o.currency} address`, o.pay_to),
+      el("p", { class: "small" }, el("a", { href: o.uri, text: "Open in your wallet" }), el("span", { class: "muted", text: " · the last digits make the amount unique to this order: don't round it" }))));
+  } else if (o.status === "seen" || o.status === "confirmed" || o.status === "delivering") {
+    parts.push(el("p", {}, `Payment seen: ${o.confirmations} of ${o.confirmations_needed} confirmations. The coins move into your jobs balance after that.`));
+  } else if (o.status === "paid") {
+    parts.push(el("p", {}, `${coins(o.coins)} coins delivered to your jobs balance.`));
+    refreshAccount();
+  } else if (o.status === "expired") {
+    parts.push(el("p", { class: "muted" }, "No payment arrived in time. If you paid after it expired, the coins still come through within a day while the offer has them."));
+  }
+  if (o.txid) parts.push(el("p", { class: "small muted" }, "Payment ", el("span", { class: "mono", text: o.txid })));
+  if (o.error) parts.push(errBox(o.error));
+  box.replaceChildren(...parts);
+  if (["awaiting_payment", "seen", "confirmed", "delivering"].includes(o.status)) orderTimer = setTimeout(() => showOrder(id), 15000);
+}
+async function loadMine() {
+  if (!KEY) return;
+  let m;
+  try { m = await api("GET", "/v1/market/mine"); } catch (e) { return; }
+  const row = (o, extra) => el("tr", {}, el("td", { text: when(o.created) }), el("td", { class: "num", text: coins(o.coins) }),
+    el("td", { class: "num", text: `${o.amount} ${o.currency}` }), el("td", {}, badge(o.status)), el("td", {}, extra));
+  $("m-orders").replaceChildren(...m.orders.map((o) => { const b = el("button", { class: "ghost", text: "View" }); b.onclick = () => showOrder(o.id); return row(o, b); }));
+  if (!m.orders.length) $("m-orders").replaceChildren(el("tr", {}, el("td", { colspan: "5", class: "muted", text: "No orders yet." })));
+  $("s-sales").replaceChildren(...m.sales.map((o) => row(o, el("span", { class: "mono small", text: o.txid ? o.txid.slice(0, 14) + "…" : "–" }))));
+  if (!m.sales.length) $("s-sales").replaceChildren(el("tr", {}, el("td", { colspan: "5", class: "muted", text: "No sales yet." })));
+  $("s-offers").replaceChildren(...m.offers.map((f) => {
+    const parts = [el("div", {}, badge(f.status), ` ${coins(f.coins)} coins at ${usd(f.price_usd)} · sold ${coins(f.sold_coins)} · available ${coins(f.available_coins)} · pays to ${[f.btc_address, f.eth_address].filter(Boolean).join(", ")}`)];
+    if (f.status === "funding" || f.status === "active") {
+      if (f.send_coins > 0) parts.push(el("div", { class: "small muted", text: `Escrow holds ${coins(f.escrow_balance_coins)} coins. Send ${coins(f.send_coins)} more (the coins on sale plus one for fees):` }),
+        copyRow("Escrow address", f.escrow_address), copyRow("Command", `./uwc-miner send ${f.send_coins} ${f.escrow_address}`));
+      else parts.push(el("div", { class: "small muted", text: `Fully funded: escrow holds ${coins(f.escrow_balance_coins)} coins.` }));
+      const c = el("button", { class: "ghost", text: "Close offer" });
+      c.onclick = async () => { c.disabled = true; try { await api("POST", `/v1/market/offers/${f.id}/close`); loadMine(); } catch (e) { c.after(errBox(e.message)); } };
+      parts.push(c);
+    }
+    if (f.status === "closing") parts.push(el("div", { class: "small muted", text: "Closing: the coins left return to " + f.refund_address + " once no order is waiting." }));
+    if (f.refund_tx) parts.push(el("div", { class: "small muted" }, "Refunded in ", el("span", { class: "mono", text: f.refund_tx })));
+    if (f.note) parts.push(errBox(f.note));
+    return el("div", { class: "paybox" }, ...parts);
+  }));
+  if (!m.offers.length) $("s-offers").replaceChildren(el("p", { class: "muted small", text: "No offers yet." }));
+}
+const sellSum = () => { const n = +$("s-coins").value || 0, p = +$("s-price").value || 0; $("s-sum").textContent = n && p ? `${coins(n)} coins for ${usd(n * p)} in all` : ""; };
+$("s-coins").oninput = sellSum; $("s-price").oninput = sellSum;
+$("s-go").onclick = async () => {
+  const out = $("s-out"); out.replaceChildren(); $("s-go").disabled = true;
+  try {
+    const f = await api("POST", "/v1/market/offers", { coins: +$("s-coins").value, price_usd: +$("s-price").value,
+      btc_address: $("s-btc").value.trim(), eth_address: $("s-eth").value.trim(), refund_address: $("s-refund").value.trim() });
+    out.append(el("div", { class: "note" }, `Offer opened. Now send ${coins(f.send_coins)} coins to its escrow address (shown below); it goes on sale once they arrive.`));
+    loadMine();
+  } catch (e) { out.append(errBox(e.message)); }
+  $("s-go").disabled = false;
+};
 
 (async () => {
   health(); setInterval(health, 30000);

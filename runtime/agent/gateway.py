@@ -34,6 +34,9 @@ Endpoints (Authorization: Bearer <api key>, except where noted):
   POST /v1/batches          many chat, completion or embedding inputs as one request (answered at once)
   GET  /v1/jobs, /v1/jobs/<id>   status, trust, jobs and (when done) the results
   GET  /v1/jobs/<id>/results     a finished request's results as JSON lines (a download)
+  GET  /v1/market, POST /v1/market/offers, /v1/market/orders, ...
+                            buy coins for BTC or ETH from miners, paid straight to them,
+                            with the coins in escrow (--market; see agent/market.py)
   GET  /healthz             chain height (no auth)
   GET  /                    the web page: sign up, chat, embeddings, batches, your jobs
 Inputs are public on the data service: only send text that may be published.
@@ -58,6 +61,7 @@ import numpy as np
 
 from .chain import Chain, ChainError
 from .data import Data
+from .market import Market, MarketError
 from .roots import SENTINEL, gen_output_root, head_output_root, input_root, output_root
 
 COIN = 100_000_000
@@ -251,6 +255,7 @@ class Gateway:
         self.faucet_lock = threading.Lock()
         self.wake = threading.Event()
         self.last_deposit = 0.0
+        self.market = Market(self, a) if getattr(a, "market", False) else None
 
     # -------------------------------------------------------------- keys and accounts
 
@@ -779,13 +784,30 @@ def handler(gw: Gateway):
             if method == "GET" and path == "/v1/models":
                 return 200, {"object": "list", "data": [m.describe() for m in gw.models.values()],
                              "signup_code_required": bool(gw.a.signup_code), "faucet_coins": gw.a.faucet_coins
-                             if gw.a.faucet_key else 0, "min_fee_coins": gw.a.min_fee, "max_inputs": MAX_INPUTS}
+                             if gw.a.faucet_key else 0, "min_fee_coins": gw.a.min_fee, "max_inputs": MAX_INPUTS,
+                             "market": gw.market is not None}
+            if path.startswith("/v1/market") and gw.market is None:
+                raise ApiError(404, "this gateway has no coin market", "not_found")
+            if method == "GET" and path == "/v1/market":
+                return 200, gw.market.overview()
             if method == "POST" and path == "/v1/keys":
                 b = self.body()
                 return 201, gw.create_key(str(b.get("name") or "unnamed"), self.client_ip(), b.get("signup_code"))
             key = gw.auth(self.headers.get("Authorization"))
             if method == "GET" and path == "/v1/account":
                 return 200, gw.account(key)
+            if path.startswith("/v1/market/"):
+                parts = path.split("/")[3:]
+                if method == "GET" and parts == ["mine"]:
+                    return 200, gw.market.mine(key)
+                if method == "POST" and parts == ["offers"]:
+                    return 201, gw.market.open_offer(key, self.body())
+                if method == "POST" and len(parts) == 3 and parts[0] == "offers" and parts[2] == "close":
+                    return 200, gw.market.close_offer(key, parts[1])
+                if method == "POST" and parts == ["orders"]:
+                    return 201, gw.market.new_order(key, self.body())
+                if method == "GET" and len(parts) == 2 and parts[0] == "orders":
+                    return 200, gw.market.order(key, parts[1])
             if method == "POST" and path in ("/v1/embeddings", "/v1/jobs"):
                 b = self.body()
                 fmt = b.get("encoding_format") or "float"
@@ -931,7 +953,7 @@ def handler(gw: Gateway):
                 if status is None:
                     return  # streamed
                 self.send_json(status, obj)
-            except ApiError as e:
+            except (ApiError, MarketError) as e:
                 self.send_json(e.status, {"error": {"message": e.message, "type": e.code, "code": e.code}})
             except ChainError as e:
                 self.send_json(503, {"error": {"message": f"the node refused: {e}", "type": "service_unavailable"}})
@@ -979,11 +1001,21 @@ def main() -> None:
     ap.add_argument("--cors-origin", default=None, help="Access-Control-Allow-Origin for a browser UI")
     ap.add_argument("--max-new", type=int, default=256, help="chat: default max_tokens")
     ap.add_argument("--temperature", type=float, default=0.7, help="chat: default temperature")
+    ap.add_argument("--market", action="store_true", help="run the coin market: buy coins from miners for BTC or ETH")
+    ap.add_argument("--market-min-usd", type=float, default=2, help="smallest order, in US dollars")
+    ap.add_argument("--market-order-minutes", type=float, default=60, help="minutes a buyer has to pay")
+    ap.add_argument("--market-btc-confs", type=int, default=1, help="bitcoin confirmations before coins are delivered")
+    ap.add_argument("--market-eth-confs", type=int, default=12, help="ether confirmations before coins are delivered")
+    ap.add_argument("--market-max-offers", type=int, default=5, help="open offers per key")
+    ap.add_argument("--market-max-orders", type=int, default=3, help="unpaid orders per key")
+    ap.add_argument("--market-poll", type=float, default=30, help="seconds between explorer checks")
     a = ap.parse_args()
     if not a.models and not (a.model and a.tokenizer):
         ap.error("give --models, or --model and --tokenizer")
     gw = Gateway(a)
     threading.Thread(target=gw.run_worker, daemon=True).start()
+    if gw.market:
+        threading.Thread(target=gw.market.run, daemon=True).start()
     host, port = a.bind.rsplit(":", 1)
     srv = ThreadingHTTPServer((host, int(port)), handler(gw))
     srv.daemon_threads = True
