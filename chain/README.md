@@ -40,6 +40,7 @@ exactly as on unmodified Pearl.
 | 0023 | `pearld --maxtipage` (node option, not consensus): restart a chain whose tip is older than 24 hours (the testnet after two days stopped) |
 | 0024 | Rules 5: committees only from verifiers that declared the job's model (`VERIFIER_MODELS`); no claim or accept without one; unverifiable jobs aborted |
 | 0025 | Testnet: Rules 5 from block 4280 |
+| 0026 | Mainnet: `--uwcmainnet` (magic UWCM, port 8690, RPC 8691, addresses `uwc1…`), Rules 5 from block 0, coinbase maturity 100, a 21M-coin (1%) dev fund that block 1 must pay |
 
 Design: `spec/job-module.md`, `spec/stage-program.md`, `spec/pool-and-watchers.md`. Results:
 `spec/step3-results.md`, `spec/step4-results.md`, `spec/step5-results.md`, `spec/step6-results.md`.

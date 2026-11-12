@@ -1,4 +1,4 @@
-"""uwc-miner: everything a Useful-Work Coin testnet miner runs, started from one command.
+"""uwc-miner: everything a Useful-Work Coin miner runs, started from one command.
 
   ./uwc-miner                      mine on every NVIDIA GPU (makes a wallet on first run)
   ./uwc-miner --jobs               also run AI jobs on the first GPU (downloads the model once)
@@ -12,7 +12,7 @@
 Inside, it runs the node (pearld: the chain, peers), the gateway (block templates in, proofs to
 blocks out), one noise miner per GPU and, with --jobs, a job agent (provider) that mines on its
 own job GEMMs and pauses the noise miner on its GPU while a job pass runs. All state is under
---datadir (default ~/.uwc-miner/testnet); the wallet key is wallet.json there.
+--datadir (default ~/.uwc-miner/<network>); the wallet key is wallet.json there.
 """
 from __future__ import annotations
 
@@ -588,9 +588,11 @@ def cmd_check(a, cfg):
 
 
 def main():
-    cfg = json.load(open(os.path.join(SHARE, "testnet.json")))
+    # the package's network: share/mainnet.json in a mainnet package, share/testnet.json otherwise
+    netfile = next(f for f in ("mainnet.json", "testnet.json") if os.path.exists(os.path.join(SHARE, f)))
+    cfg = json.load(open(os.path.join(SHARE, netfile)))
     ap = argparse.ArgumentParser(prog="uwc-miner", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--datadir", default="~/.uwc-miner/testnet")
+    ap.add_argument("--datadir", default=f"~/.uwc-miner/{netfile[:-5]}")
     sub = ap.add_subparsers(dest="cmd")
     r = sub.add_parser("run", help="mine (the default)")
     for p in (ap, r):
@@ -604,9 +606,9 @@ def main():
         p.add_argument("--peer", action="append", help="extra peer host:port (repeatable)")
         p.add_argument("--no-seeds", action="store_true", help="do not connect to the built-in seed nodes")
         p.add_argument("--nolisten", action="store_true", help="accept no incoming peer connections")
-        p.add_argument("--port", type=int, default=None, help="P2P listen port (18690)")
+        p.add_argument("--port", type=int, default=None, help=f"P2P listen port ({cfg['p2p_port']})")
         p.add_argument("--listen", default=None, help="P2P listen address (all interfaces)")
-        p.add_argument("--rpc-port", type=int, default=None, help="the node's local RPC port (18691); remembered in --datadir")
+        p.add_argument("--rpc-port", type=int, default=None, help=f"the node's local RPC port ({cfg['rpc_port']}); remembered in --datadir")
         p.add_argument("--data", default=None, help="job data service URL")
         p.add_argument("--status-every", type=float, default=30)
     sub.add_parser("wallet", help="address and balances")

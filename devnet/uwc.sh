@@ -4,4 +4,5 @@ D=$(cd "$(dirname "$0")" && pwd)
 source "$D/env"
 export UWC_RPC=127.0.0.1:${RPC_PORT:-18671} UWC_RPC_USER="$RPC_USER" UWC_RPC_PASS="$RPC_PASS"
 [ "${NET:-uwcdevnet}" = uwctestnet ] && export UWC_NET=testnet
+[ "${NET:-uwcdevnet}" = uwcmainnet ] && export UWC_NET=mainnet
 exec "$D/bin/uwcctl" "$@"

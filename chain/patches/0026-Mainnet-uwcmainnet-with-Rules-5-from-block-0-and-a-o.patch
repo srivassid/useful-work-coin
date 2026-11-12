@@ -1,0 +1,372 @@
+From 0591d3bb425632d927dde90eafa46d2596b4ef81 Mon Sep 17 00:00:00 2001
+From: Sid <sid7513@gmail.com>
+Date: Thu, 12 Nov 2026 11:50:45 +0530
+Subject: [PATCH] Mainnet: --uwcmainnet with Rules 5 from block 0 and a
+ one-time dev fund in block 1
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017Li1NuzogEfSRnjn3KNzFm
+---
+ node/blockchain/devfund_test.go  | 51 ++++++++++++++++++
+ node/blockchain/validate.go      | 15 ++++++
+ node/chaincfg/params.go          | 11 ++++
+ node/chaincfg/uwc_mainnet.go     | 91 ++++++++++++++++++++++++++++++++
+ node/chaincfg/uwc_params_test.go | 17 +++++-
+ node/cmd/uwcctl/main.go          |  7 ++-
+ node/config.go                   |  8 ++-
+ node/mining/mining.go            |  4 ++
+ node/params.go                   |  6 +++
+ node/wire/protocol.go            |  4 ++
+ 10 files changed, 210 insertions(+), 4 deletions(-)
+ create mode 100644 node/blockchain/devfund_test.go
+ create mode 100644 node/chaincfg/uwc_mainnet.go
+
+diff --git a/node/blockchain/devfund_test.go b/node/blockchain/devfund_test.go
+new file mode 100644
+index 00000000..708af047
+--- /dev/null
++++ b/node/blockchain/devfund_test.go
+@@ -0,0 +1,51 @@
++package blockchain
++
++import (
++	"testing"
++
++	"github.com/pearl-research-labs/pearl/node/btcutil"
++	"github.com/pearl-research-labs/pearl/node/chaincfg"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++// The mainnet's dev fund (chaincfg.DevFund): block 1's coinbase must pay exactly the fund's amount
++// to its script, on top of subsidy and fees, and no other block may pay it.
++func TestDevFund(t *testing.T) {
++	params := uwcTestParams()
++	fund := newJKey(77)
++	params.DevFund = &chaincfg.DevFund{Height: 1, Amount: 5_000_000_000, PkScript: fund.script}
++	chain, teardown, err := chainSetup("devfund", params)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer teardown()
++	chain.TstSetCoinbaseMaturity(1)
++	c, done := newJChain(t)
++	done()
++	c.chain = chain
++	pay := func(amount int64, script []byte) func(*wire.MsgTx, *JobTemplate) {
++		return func(cb *wire.MsgTx, _ *JobTemplate) { cb.AddTxOut(wire.NewTxOut(amount, script)) }
++	}
++	expectRule(t, c.mine(nil, nil), "block 1 without the dev fund")
++	expectRule(t, c.mine(nil, pay(params.DevFund.Amount+1, fund.script)), "block 1 overpaying the dev fund")
++	expectRule(t, c.mine(nil, pay(params.DevFund.Amount, c.miner.script)), "block 1 paying the fund's amount elsewhere")
++	if err := c.mine(nil, pay(params.DevFund.Amount, fund.script)); err != nil {
++		t.Fatalf("block 1 paying the dev fund: %v", err)
++	}
++	expectRule(t, c.mine(nil, pay(params.DevFund.Amount, fund.script)), "block 2 paying the dev fund again")
++	c.mustMine()
++
++	// the mainnet's own parameters
++	mp := &chaincfg.UWCMainNetParams
++	if mp.DevFund == nil || mp.DevFund.Height != 1 || mp.DevFund.Amount != 21_000_000*100_000_000 || len(mp.DevFund.PkScript) != 34 {
++		t.Fatalf("mainnet dev fund %+v", mp.DevFund)
++	}
++	if got, want := mp.DevFund.Amount*100/2_100_000_000/100_000_000, int64(1); got != want {
++		t.Fatalf("dev fund is %d%% of supply, want %d%%", got, want)
++	}
++	// mainnet addresses decode (the node's --miningaddr, uwcctl send)
++	a, err := btcutil.DecodeAddress("uwc1peacvdmudg3hc56kaw9usgkd4ja6cjg69fgw647ld7uujpx2w3v4snjs0yw", mp)
++	if err != nil || !a.IsForNet(mp) {
++		t.Fatalf("mainnet address: %v", err)
++	}
++}
+diff --git a/node/blockchain/validate.go b/node/blockchain/validate.go
+index fb8d1814..e1327d05 100644
+--- a/node/blockchain/validate.go
++++ b/node/blockchain/validate.go
+@@ -1091,6 +1091,21 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
+ 		}
+ 		expectedGrainOut += withdrawn // module payouts are funded by earlier deposits
+ 	}
++	if df := b.chainParams.DevFund; df != nil && node.height == df.Height {
++		paid := false
++		for _, txOut := range transactions[0].MsgTx().TxOut {
++			if txOut.Value == df.Amount && bytes.Equal(txOut.PkScript, df.PkScript) {
++				paid = true
++				break
++			}
++		}
++		if !paid {
++			str := fmt.Sprintf("coinbase transaction for block %d does not pay the dev fund of %v",
++				node.height, df.Amount)
++			return ruleError(ErrBadCoinbaseValue, str)
++		}
++		expectedGrainOut += df.Amount
++	}
+ 	if totalGrainOut > expectedGrainOut {
+ 		str := fmt.Sprintf("coinbase transaction for block pays %v "+
+ 			"which is more than expected value of %v",
+diff --git a/node/chaincfg/params.go b/node/chaincfg/params.go
+index 619badb8..f97350e6 100644
+--- a/node/chaincfg/params.go
++++ b/node/chaincfg/params.go
+@@ -174,6 +174,10 @@ type Params struct {
+ 	// due withdrawals (see node/jobstate and spec/job-module.md). Nil for Pearl networks.
+ 	JobModule *jobstate.Params
+ 
++	// DevFund, when non-nil, is a one-time payment the coinbase of block DevFund.Height must make
++	// (an output of exactly Amount to PkScript), on top of the subsidy and fees.
++	DevFund *DevFund
++
+ 	// Net defines the magic bytes used to identify the network.
+ 	Net wire.PearlNet
+ 
+@@ -1090,3 +1094,10 @@ func init() {
+ 	mustRegister(&RegressionNetParams)
+ 	mustRegister(&SimNetParams)
+ }
++
++// DevFund is a one-time coinbase payment at a fixed height (Useful-Work Coin mainnet).
++type DevFund struct {
++	Height   int32
++	Amount   int64
++	PkScript []byte
++}
+diff --git a/node/chaincfg/uwc_mainnet.go b/node/chaincfg/uwc_mainnet.go
+new file mode 100644
+index 00000000..678a3fd8
+--- /dev/null
++++ b/node/chaincfg/uwc_mainnet.go
+@@ -0,0 +1,91 @@
++package chaincfg
++
++import (
++	"encoding/hex"
++	"time"
++
++	"github.com/pearl-research-labs/pearl/node/jobstate"
++	"github.com/pearl-research-labs/pearl/node/wire"
++)
++
++// Useful-Work Coin main network. It starts with the rules the testnet ended with (Rules 5 from
++// block 0, no scheduled upgrades), the testnet's reply windows, a coinbase maturity of 100 blocks,
++// its own network magic, ports and address prefix ("uwc1..."), and a dev fund paid once in block 1.
++
++var uwcMainNetCouncil = []string{
++	"46cf088fbc9dcde9492d00b2dc9cb8a03f7aaf72ee066cdc5e124d392c3a55e3",
++	"7abdfc09d1254a87a5faff023fc5a04a5e4ca969e978c097b9ae18ca486b3910",
++	"a3e34ef7eedcd55b6b19f9824a77d60d9f2a2319d00654988dc2b98869e1cad6",
++}
++
++// UWCMainNetDevFundCoins is the dev fund: 1% of the 2.1 billion coin supply, paid once.
++const UWCMainNetDevFundCoins = 21_000_000
++
++// uwcMainNetDevFundScript is the dev fund's P2TR output script.
++const uwcMainNetDevFundScript = "512035e1f79dc674e3e68a2b88d007411ed7448737fa6f2f5317e8d28bcdfc610ce5"
++
++func uwcMainNetJobParams() *jobstate.Params {
++	p := *uwcTestNetJobParams()
++	p.Council = nil
++	for _, h := range uwcMainNetCouncil {
++		b, err := hex.DecodeString(h)
++		if err != nil || len(b) != 32 {
++			panic("chaincfg: bad UWC mainnet council account " + h)
++		}
++		var a jobstate.AccountID
++		copy(a[:], b)
++		p.Council = append(p.Council, a)
++	}
++	// the testnet's final rules from the start
++	p.Rules, p.ChallengeBondBP = 5, 1000
++	p.Upgrades = nil
++	return &p
++}
++
++var uwcMainNetGenesisBlock = func() wire.MsgBlock {
++	b := wire.MsgBlock{
++		MsgHeader: wire.MsgHeader{
++			BlockHeader: wire.BlockHeader{
++				Version:    1,
++				MerkleRoot: genesisMerkleRoot,
++				Timestamp:  time.Unix(1794463200, 0), // 2026-11-12 06:00:00 UTC (in the past at launch)
++				Bits:       0x1a020000,               // 2^201: about one block a minute at 550 TMAC/s
++			},
++		},
++		Transactions: []*wire.MsgTx{&genesisCoinbaseTx},
++	}
++	h := b.BlockHash()
++	b.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: &wire.CertificateV1{
++		Hash: h, ProofData: []byte{0x75, 0x77, 0x63, 0x6d}, // "uwcm"; genesis is not verified
++	}}
++	return b
++}()
++
++var uwcMainNetGenesisHash = uwcMainNetGenesisBlock.BlockHash()
++
++// UWCMainNetParams are the parameters of the Useful-Work Coin main network.
++var UWCMainNetParams = func() Params {
++	p := UWCTestNetParams
++	p.Name = "uwc-mainnet"
++	p.Net = wire.UWCMainNet
++	p.DefaultPort = "8690"
++	p.GenesisBlock = &uwcMainNetGenesisBlock
++	p.GenesisHash = &uwcMainNetGenesisHash
++	p.CoinbaseMaturity = 100
++	p.Bech32HRPSegwit = "uwc"
++	p.PrivateKeyID = 0x80
++	p.HDCoinType = HDCoinTypePearl + 1
++	p.JobModule = uwcMainNetJobParams()
++	script, err := hex.DecodeString(uwcMainNetDevFundScript)
++	if err != nil {
++		panic("chaincfg: bad UWC mainnet dev fund script")
++	}
++	p.DevFund = &DevFund{Height: 1, Amount: UWCMainNetDevFundCoins * 100_000_000, PkScript: script}
++	return p
++}()
++
++// The mainnet's address prefix (uwc1...) must be known for addresses to decode; the dev and test
++// networks share the sim network's (rprl1...).
++func init() {
++	mustRegister(&UWCMainNetParams)
++}
+diff --git a/node/chaincfg/uwc_params_test.go b/node/chaincfg/uwc_params_test.go
+index 4a351e14..ade533d7 100644
+--- a/node/chaincfg/uwc_params_test.go
++++ b/node/chaincfg/uwc_params_test.go
+@@ -3,7 +3,7 @@ package chaincfg
+ import "testing"
+ 
+ func TestUWCNetworks(t *testing.T) {
+-	for _, p := range []*Params{&UWCDevNetParams, &UWCTestNetParams} {
++	for _, p := range []*Params{&UWCDevNetParams, &UWCTestNetParams, &UWCMainNetParams} {
+ 		if p.JobModule == nil || !p.JobModule.ValidUpgrades() {
+ 			t.Fatalf("%s: job module missing or upgrades out of order", p.Name)
+ 		}
+@@ -23,4 +23,19 @@ func TestUWCNetworks(t *testing.T) {
+ 			t.Fatal("testnet reply windows must be at least 30 blocks")
+ 		}
+ 	}
++	mp := UWCMainNetParams
++	for _, o := range []*Params{&UWCDevNetParams, &UWCTestNetParams, &MainNetParams} {
++		if *mp.GenesisHash == *o.GenesisHash || mp.Net == o.Net || mp.DefaultPort == o.DefaultPort || mp.Bech32HRPSegwit == o.Bech32HRPSegwit {
++			t.Fatalf("mainnet shares its genesis, magic, port or address prefix with %s", o.Name)
++		}
++	}
++	if j := mp.JobModule; j.Rules != 5 || len(j.Upgrades) != 0 || j.ChallengeBondBP != 1000 || j.ChallengeWindow != tp.ChallengeWindow {
++		t.Fatalf("mainnet job rules %d, %d upgrades, challenge bond %d", j.Rules, len(j.Upgrades), j.ChallengeBondBP)
++	}
++	if mp.CoinbaseMaturity != 100 || mp.JobModule.CouncilThreshold != 2 || len(mp.JobModule.Council) != 3 {
++		t.Fatal("mainnet maturity or council")
++	}
++	if mp.JobModule.Council[0] == UWCTestNetParams.JobModule.Council[0] {
++		t.Fatal("mainnet reuses the testnet council")
++	}
+ }
+diff --git a/node/cmd/uwcctl/main.go b/node/cmd/uwcctl/main.go
+index ad1ae9dd..fd9d2e4d 100644
+--- a/node/cmd/uwcctl/main.go
++++ b/node/cmd/uwcctl/main.go
+@@ -59,10 +59,13 @@ council (actions are proposed by one member and approved by others)
+ queries
+   state | jobs [status] | job <id> | account <account|key> | category <id>`
+ 
+-// netParams is the devnet's unless UWC_NET=testnet (addresses and coinbase maturity differ).
++// netParams is the devnet's unless UWC_NET=testnet or mainnet (addresses and coinbase maturity differ).
+ var netParams = func() *chaincfg.Params {
+-	if os.Getenv("UWC_NET") == "testnet" {
++	switch os.Getenv("UWC_NET") {
++	case "testnet":
+ 		return &chaincfg.UWCTestNetParams
++	case "mainnet":
++		return &chaincfg.UWCMainNetParams
+ 	}
+ 	return &chaincfg.UWCDevNetParams
+ }()
+diff --git a/node/config.go b/node/config.go
+index af20549e..209f74ef 100644
+--- a/node/config.go
++++ b/node/config.go
+@@ -177,6 +177,7 @@ type config struct {
+ 	SimNet                   bool          `long:"simnet" description:"Use the simulation test network"`
+ 	UWCDevNet                bool          `long:"uwcdevnet" description:"Use the Useful-Work Coin development network"`
+ 	UWCTestNet               bool          `long:"uwctestnet" description:"Use the Useful-Work Coin test network"`
++	UWCMainNet               bool          `long:"uwcmainnet" description:"Use the Useful-Work Coin main network"`
+ 	SigNet                   bool          `long:"signet" description:"Use the signet test network"`
+ 	SigNetChallenge          string        `long:"signetchallenge" description:"Connect to a custom signet network defined by this challenge instead of using the global default signet test network -- Can be specified multiple times"`
+ 	SigNetSeedNode           []string      `long:"signetseednode" description:"Specify a seed node for the signet network instead of using the global default signet network seed nodes"`
+@@ -507,7 +508,7 @@ func loadConfig() (*config, []string, error) {
+ 	// Load additional config from file.
+ 	var configFileError error
+ 	parser := newConfigParser(&cfg, &serviceOpts, flags.Default)
+-	if !(preCfg.RegressionTest || preCfg.SimNet || preCfg.SigNet || preCfg.UWCDevNet || preCfg.UWCTestNet) ||
++	if !(preCfg.RegressionTest || preCfg.SimNet || preCfg.SigNet || preCfg.UWCDevNet || preCfg.UWCTestNet || preCfg.UWCMainNet) ||
+ 		preCfg.ConfigFile != defaultConfigFile {
+ 
+ 		if _, err := os.Stat(preCfg.ConfigFile); os.IsNotExist(err) {
+@@ -596,6 +597,11 @@ func loadConfig() (*config, []string, error) {
+ 		activeNetParams = &uwcTestNetParams
+ 		cfg.DisableDNSSeed = true
+ 	}
++	if cfg.UWCMainNet {
++		numNets++
++		activeNetParams = &uwcMainNetParams
++		cfg.DisableDNSSeed = true
++	}
+ 	if cfg.SigNet {
+ 		numNets++
+ 		activeNetParams = &sigNetParams
+diff --git a/node/mining/mining.go b/node/mining/mining.go
+index d2dae1c6..9a428d7b 100644
+--- a/node/mining/mining.go
++++ b/node/mining/mining.go
+@@ -642,6 +642,10 @@ mempoolLoop:
+ 		}
+ 		cb.AddTxOut(wire.NewTxOut(0, blockchain.JobStateRootScript(tpl.Root)))
+ 	}
++	// Useful-Work Coin mainnet: the one-time dev fund payment (blockchain/validate.go).
++	if df := g.chainParams.DevFund; df != nil && nextBlockHeight == df.Height {
++		coinbaseTx.MsgTx().AddTxOut(wire.NewTxOut(df.Amount, df.PkScript))
++	}
+ 
+ 	// Add the witness commitment to the coinbase transaction.
+ 	witnessCommitment := AddWitnessCommitment(coinbaseTx, blockTxns)
+diff --git a/node/params.go b/node/params.go
+index 290a5753..c770eef5 100644
+--- a/node/params.go
++++ b/node/params.go
+@@ -65,6 +65,12 @@ var uwcDevNetParams = params{
+ 	rpcPort: "18671",
+ }
+ 
++// uwcMainNetParams contains parameters specific to the Useful-Work Coin main network.
++var uwcMainNetParams = params{
++	Params:  &chaincfg.UWCMainNetParams,
++	rpcPort: "8691",
++}
++
+ // uwcTestNetParams contains parameters specific to the Useful-Work Coin test network.
+ var uwcTestNetParams = params{
+ 	Params:  &chaincfg.UWCTestNetParams,
+diff --git a/node/wire/protocol.go b/node/wire/protocol.go
+index f0b4badb..53ca5c8b 100644
+--- a/node/wire/protocol.go
++++ b/node/wire/protocol.go
+@@ -155,6 +155,9 @@ const (
+ 
+ 	// UWCTestNet is the Useful-Work Coin test network.
+ 	UWCTestNet PearlNet = 0x55574354 // "UWCT" in ASCII
++
++	// UWCMainNet is the Useful-Work Coin main network.
++	UWCMainNet PearlNet = 0x5557434D // "UWCM" in ASCII
+ )
+ 
+ // netStrings is a map of networks back to their constant names for
+@@ -168,6 +171,7 @@ var netStrings = map[PearlNet]string{
+ 	SimNet:     "SimNet",
+ 	UWCDevNet:  "UWCDevNet",
+ 	UWCTestNet: "UWCTestNet",
++	UWCMainNet: "UWCMainNet",
+ }
+ 
+ // String returns the PearlNet in human-readable form.
+-- 
+2.30.2
+

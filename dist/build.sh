@@ -13,7 +13,9 @@ set -euo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
 GOBIN=$(cd "$1" && pwd); NETDIR=$(cd "$2" && pwd); OUTDIR=$(mkdir -p "$3" && cd "$3" && pwd)
 PEARL=${PEARL:-$R/ext/pearl}
-V=${VERSION:-testnet-$(date +%Y%m%d)}
+NETJSON=${NETJSON:-$R/dist/testnet.json}  # dist/mainnet.json for a mainnet package
+NETNAME=$(basename "$NETJSON" .json)
+V=${VERSION:-$NETNAME-$(date +%Y%m%d)}
 OUT=$OUTDIR/uwc-miner-$V
 export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH
 UV=${UV:-uv}  # a uv new enough for --torch-backend cu130 (0.13 works)
@@ -40,8 +42,8 @@ printf '../../../../app\n../../../../app/runtime\n' > "$SP/uwc_app.pth"
 "$P" -m compileall -q "$OUT/app" || true
 echo "[$(date +%T)] binaries and network files"
 for b in pearld uwcctl prlctl; do cp "$GOBIN/$b" "$OUT/bin/"; strip "$OUT/bin/$b" 2>/dev/null || true; done
-cp "$R/dist/testnet.json" "$OUT/share/"
-MODEL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["name"])' "$R/dist/testnet.json")
+cp "$NETJSON" "$OUT/share/"
+MODEL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"]["name"])' "$NETJSON")
 cp "$NETDIR/models/$MODEL.json" "$NETDIR/models/$MODEL.reg.json" "$OUT/share/models/"
 cp "$NETDIR"/pool/*.json "$OUT/share/pool/"
 cp "$R/dist/uwc-miner" "$OUT/"

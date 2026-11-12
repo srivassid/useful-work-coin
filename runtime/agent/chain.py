@@ -22,8 +22,9 @@ class Chain:
                     env[k] = os.path.expandvars(v)
         env.update(UWC_RPC=f"127.0.0.1:{env.get('RPC_PORT', '18671')}", UWC_RPC_USER=env["RPC_USER"],
                    UWC_RPC_PASS=env["RPC_PASS"])
-        if env.get("NET") == "uwctestnet":
-            env["UWC_NET"] = "testnet"
+        net = {"uwctestnet": "testnet", "uwcmainnet": "mainnet"}.get(env.get("NET", ""))
+        if net:
+            env["UWC_NET"] = net
         self.env = env
         self.bin = os.path.join(self.dir, "bin", "uwcctl")
 
