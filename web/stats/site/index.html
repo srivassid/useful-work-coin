@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AICoin Miners Live</title>
+<meta name="description" content="Live count of who is mining the AICoin (Useful-Work Coin) mainnet, from the seed node's view of the chain.">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f6f4;
+  --surface-1: #fcfcfb;
+  --border: #e4e3de;
+  --grid: #ecebe7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #7a7974;
+  --series-1: #2a78d6;
+  --series-1-track: #dbe8f8;
+  --good: #008300;
+  --warn: #b26b00;
+  --chip-bg: #eef3fb;
+  --chip-proj: #efeeea;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211;
+    --surface-1: #1a1a19;
+    --border: #2d2d2b;
+    --grid: #262624;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8f8e86;
+    --series-1: #3987e5;
+    --series-1-track: #1f3350;
+    --good: #3fb950;
+    --warn: #e0a030;
+    --chip-bg: #1d2b40;
+    --chip-proj: #2a2a28;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211;
+  --surface-1: #1a1a19;
+  --border: #2d2d2b;
+  --grid: #262624;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #8f8e86;
+  --series-1: #3987e5;
+  --series-1-track: #1f3350;
+  --good: #3fb950;
+  --warn: #e0a030;
+  --chip-bg: #1d2b40;
+  --chip-proj: #2a2a28;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text-primary);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 980px; margin: 0 auto; padding: 28px 16px 48px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+.live { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
+.dot.pulse { animation: pulse 2s ease-out infinite; }
+.dot.stale { background: var(--warn); animation: none; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 60%, transparent); } 100% { box-shadow: 0 0 0 8px transparent; } }
+@media (prefers-reduced-motion: reduce) { .dot.pulse { animation: none; } }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+.hero { margin-top: 20px; display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 2fr); gap: 16px; }
+.hero-num { font-size: 72px; line-height: 1; font-weight: 650; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+.label { font-size: 13px; color: var(--text-secondary); }
+.sub { margin-top: 10px; color: var(--text-secondary); font-size: 14px; }
+.tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.tile .value { font-size: 24px; font-weight: 620; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .note { font-size: 12px; color: var(--text-muted); }
+section { margin-top: 16px; }
+h2 { font-size: 15px; margin: 0 0 4px; font-weight: 620; }
+.chart-wrap { position: relative; margin-top: 12px; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+.axis text { fill: var(--text-muted); font-size: 11px; }
+.tip {
+  position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px; font-size: 12px; box-shadow: 0 4px 16px rgb(0 0 0 / .12);
+  white-space: nowrap; display: none; z-index: 2;
+}
+.tip b { font-variant-numeric: tabular-nums; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: left; font-weight: 500; color: var(--text-secondary); font-size: 12px; padding: 8px 8px; border-bottom: 1px solid var(--border); }
+td { padding: 9px 8px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.addr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+.chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 99px; margin-left: 6px; background: var(--chip-bg); color: var(--text-secondary); }
+.chip.proj { background: var(--chip-proj); }
+.share { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.meter { width: 90px; height: 8px; border-radius: 99px; background: var(--series-1-track); overflow: hidden; }
+.meter > i { display: block; height: 100%; background: var(--series-1); border-radius: 99px; }
+.scroll { overflow-x: auto; margin-top: 8px; }
+tr.new td { animation: flash 2.5s ease-out; }
+@keyframes flash { from { background: var(--chip-bg); } to { background: transparent; } }
+.muted { color: var(--text-muted); }
+.idle { color: var(--text-muted); }
+footer { margin-top: 24px; font-size: 13px; color: var(--text-muted); }
+footer a { color: var(--text-secondary); }
+.warn-banner { display: none; margin-top: 16px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--warn); color: var(--text-primary); font-size: 14px; }
+.cols { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+@media (max-width: 760px) {
+  .hero, .cols { grid-template-columns: minmax(0, 1fr); }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .hero-num { font-size: 60px; }
+  .hide-sm, .meter { display: none; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>AICoin mainnet · miners</h1>
+    <span class="live"><span id="dot" class="dot"></span><span id="status">Connecting…</span></span>
+  </header>
+
+  <div id="banner" class="warn-banner"></div>
+
+  <div class="hero">
+    <div class="card">
+      <div class="label">Miners active in the last hour</div>
+      <div class="hero-num" id="active1h">–</div>
+      <div class="sub" id="activeSub">&nbsp;</div>
+    </div>
+    <div class="tiles">
+      <div class="card tile"><div class="label">Miners, last 24 hours</div><div class="value" id="active24h">–</div><div class="note" id="active24hNote">&nbsp;</div></div>
+      <div class="card tile"><div class="label">Block height</div><div class="value" id="height">–</div><div class="note" id="tipAge">&nbsp;</div></div>
+      <div class="card tile"><div class="label">Blocks, last hour</div><div class="value" id="blocks1h">–</div><div class="note">target 60</div></div>
+      <div class="card tile"><div class="label">Network work rate</div><div class="value" id="rate">–</div><div class="note">estimated, last 120 blocks</div></div>
+      <div class="card tile"><div class="label">Difficulty</div><div class="value" id="diff">–</div><div class="note">&nbsp;</div></div>
+      <div class="card tile"><div class="label">Nodes on the seed</div><div class="value" id="peers">–</div><div class="note">connected to 165.232.182.224</div></div>
+    </div>
+  </div>
+
+  <section class="card">
+    <h2>Active miners per hour</h2>
+    <div class="label">Distinct addresses that mined a block in each hour of the last 24 (UTC shown in your time zone)</div>
+    <div class="chart-wrap" id="chartWrap">
+      <svg id="chart" role="img" aria-label="Active miners per hour, last 24 hours"></svg>
+      <div class="tip" id="tip"></div>
+    </div>
+  </section>
+
+  <div class="cols">
+    <section class="card">
+      <h2>Miners</h2>
+      <div class="label">Every address that mined a block in the last 7 days</div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Address</th><th class="num">Last hour</th><th class="num">24 hours</th><th class="num">Share, 24h</th><th class="num hide-sm">Last block</th></tr></thead>
+          <tbody id="miners"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Latest blocks</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Height</th><th>Miner</th><th class="num">Age</th></tr></thead>
+          <tbody id="recent"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    A “miner” here is a mining address: one person can mine to several addresses, and a pool shows
+    as one. <span class="chip proj" style="margin-left:0">project</span> marks the project's own machines.
+    Data comes from the seed node every 10 seconds; peer IP addresses are never published.
+    <a href="https://github.com/srivassid/AICoin">Start mining</a> ·
+    <a href="https://github.com/srivassid/useful-work-coin">Source</a> ·
+    <a id="raw" href="#">Raw data</a>
+  </footer>
+</main>
+
+<script>
+const STATS_URL = "https://165-232-182-224.sslip.io/stats.json";
+const POLL_MS = 10000;
+document.getElementById("raw").href = STATS_URL;
+
+let data = null, lastFetchOk = 0, lastHeight = null;
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => n == null ? "–" : n.toLocaleString();
+const short = (a) => a.length > 22 ? a.slice(0, 10) + "…" + a.slice(-6) : a;
+
+function ago(sec) {
+  if (sec == null) return "–";
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + "s ago";
+  if (sec < 3600) return Math.floor(sec / 60) + "m " + (sec % 60) + "s ago";
+  if (sec < 86400) return Math.floor(sec / 3600) + "h " + Math.floor(sec % 3600 / 60) + "m ago";
+  return Math.floor(sec / 86400) + "d ago";
+}
+function compact(n) {
+  if (n == null) return "–";
+  const u = [["E", 1e18], ["P", 1e15], ["T", 1e12], ["G", 1e9], ["M", 1e6], ["k", 1e3]];
+  for (const [s, v] of u) if (n >= v) return (n / v).toFixed(n / v >= 100 ? 0 : 1) + " " + s;
+  return n.toFixed(0);
+}
+function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function chip(m) {
+  return m.label ? `<span class="chip proj">${esc(m.label)}</span>` : `<span class="chip">outside</span>`;
+}
+
+async function poll() {
+  try {
+    const r = await fetch(STATS_URL + "?t=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    data = await r.json();
+    lastFetchOk = Date.now();
+    render();
+  } catch (e) {
+    tick();
+  }
+}
+
+function render() {
+  const d = data, s = d.summary;
+  $("active1h").textContent = fmt(s["1h"].miners);
+  const out = s["1h"].outside_miners, proj = s["1h"].miners - out;
+  $("activeSub").textContent = s["1h"].miners === 0 ? "Nobody has mined a block in the last hour."
+    : `${out} outside the project${proj ? `, ${proj} project-run` : ""}`;
+  $("active24h").textContent = fmt(s["24h"].miners);
+  $("active24hNote").textContent = `${s["24h"].outside_miners} outside the project`;
+  $("height").textContent = fmt(d.height);
+  $("blocks1h").textContent = fmt(s["1h"].blocks);
+  $("rate").textContent = compact(d.network_rate) + "/s";
+  $("diff").textContent = d.difficulty == null ? "–" : d.difficulty.toLocaleString(undefined, { maximumFractionDigits: 1 });
+  $("peers").textContent = fmt(d.seed_peers);
+  renderChart(d.hours);
+  renderMiners(d);
+  renderRecent(d);
+  lastHeight = d.height;
+  tick();
+}
+
+function renderMiners(d) {
+  const total24 = d.summary["24h"].blocks || 1;
+  const rows = d.miners.map((m) => {
+    const pct = 100 * m.blocks_24h / total24;
+    return `<tr>
+      <td><span class="addr" title="${esc(m.address)}">${esc(short(m.address))}</span>${chip(m)}</td>
+      <td class="num ${m.blocks_1h ? "" : "idle"}">${fmt(m.blocks_1h)}</td>
+      <td class="num">${fmt(m.blocks_24h)}</td>
+      <td class="num"><span class="share"><span>${pct.toFixed(pct < 10 ? 1 : 0)}%</span><span class="meter"><i style="width:${pct}%"></i></span></span></td>
+      <td class="num hide-sm muted" data-t="${m.last_time}">${ago(Date.now() / 1000 - m.last_time)}</td>
+    </tr>`;
+  });
+  $("miners").innerHTML = rows.join("") || `<tr><td colspan="5" class="muted">No blocks yet.</td></tr>`;
+}
+
+function renderRecent(d) {
+  $("recent").innerHTML = d.recent.slice(0, 15).map((b) => {
+    const isNew = lastHeight != null && b.height > lastHeight;
+    const m = d.miners.find((x) => x.address === b.address) || { label: null };
+    return `<tr class="${isNew ? "new" : ""}">
+      <td class="num" style="text-align:left">${fmt(b.height)}</td>
+      <td><span class="addr" title="${esc(b.address)}">${esc(short(b.address))}</span>${chip(m)}</td>
+      <td class="num muted" data-t="${b.time}">${ago(Date.now() / 1000 - b.time)}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderChart(hours) {
+  const W = Math.max(280, $("chartWrap").clientWidth), H = 200, L = 28, R = 4, T = 10, B = 26;
+  const max = Math.max(2, ...hours.map((h) => h.miners));
+  const step = Math.max(1, Math.ceil(max / 4));
+  const top = Math.ceil(max / step) * step;
+  const pw = W - L - R, ph = H - T - B, n = hours.length, slot = pw / n, gap = 2;
+  const y = (v) => T + ph - ph * v / top;
+  let g = `<g class="axis">`;
+  for (let v = 0; v <= top; v += step) {
+    g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)" stroke-width="1"/>`;
+    g += `<text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+  }
+  hours.forEach((h, i) => {
+    const every = W < 500 ? 8 : 4;
+    if ((n - 1 - i) % every === 0) {
+      const t = new Date(h.start * 1000);
+      const lab = i === n - 1 ? "now" : t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      g += `<text x="${L + slot * i + slot / 2}" y="${H - 6}" text-anchor="middle">${lab}</text>`;
+    }
+  });
+  g += `</g>`;
+  let bars = "";
+  hours.forEach((h, i) => {
+    const x = L + slot * i + gap / 2, w = slot - gap, by = y(h.miners), bh = T + ph - by;
+    if (h.miners > 0) {
+      const r = Math.min(4, w / 2, bh);
+      bars += `<path d="M${x},${T + ph} V${by + r} Q${x},${by} ${x + r},${by} H${x + w - r} Q${x + w},${by} ${x + w},${by + r} V${T + ph} Z" fill="var(--series-1)"/>`;
+    }
+    bars += `<rect x="${L + slot * i}" y="${T}" width="${slot}" height="${ph}" fill="transparent" data-i="${i}" class="hit"/>`;
+  });
+  const svg = $("chart");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = g + `<line x1="${L}" x2="${W - R}" y1="${T + ph}" y2="${T + ph}" stroke="var(--border)"/>` + bars;
+  svg.querySelectorAll(".hit").forEach((el) => {
+    el.addEventListener("mousemove", (e) => showTip(e, hours[+el.dataset.i]));
+    el.addEventListener("mouseleave", () => { $("tip").style.display = "none"; });
+  });
+}
+
+function showTip(e, h) {
+  const tip = $("tip"), wrap = $("chartWrap").getBoundingClientRect();
+  const a = new Date(h.start * 1000), b = new Date((h.start + 3600) * 1000);
+  const f = (t) => t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  tip.innerHTML = `${f(a)}–${f(b)}<br><b>${h.miners}</b> miner${h.miners === 1 ? "" : "s"} · <b>${h.blocks}</b> blocks`;
+  tip.style.display = "block";
+  let x = e.clientX - wrap.left + 12;
+  if (x + tip.offsetWidth > wrap.width) x = e.clientX - wrap.left - tip.offsetWidth - 12;
+  tip.style.left = x + "px";
+  tip.style.top = Math.max(0, e.clientY - wrap.top - 40) + "px";
+}
+
+function tick() {
+  const now = Date.now() / 1000;
+  document.querySelectorAll("[data-t]").forEach((el) => { el.textContent = ago(now - +el.dataset.t); });
+  const dot = $("dot"), st = $("status"), banner = $("banner");
+  if (!data) { st.textContent = lastFetchOk ? "Reconnecting…" : "Connecting…"; return; }
+  const tipAge = now - data.tip_time;
+  $("tipAge").textContent = "last block " + ago(tipAge);
+  const feedAge = now - data.updated;
+  if (feedAge > 90 || Date.now() - lastFetchOk > 60000) {
+    dot.className = "dot stale"; st.textContent = "Feed delayed, updated " + ago(feedAge);
+  } else {
+    dot.className = "dot pulse"; st.textContent = "Live · updated " + ago(feedAge);
+  }
+  if (tipAge > 600) {
+    banner.style.display = "block";
+    banner.textContent = `No new block for ${ago(tipAge).replace(" ago", "")}. Nobody may be mining right now.`;
+  } else banner.style.display = "none";
+}
+
+poll();
+setInterval(poll, POLL_MS);
+let rz; addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => data && renderChart(data.hours), 150); });
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

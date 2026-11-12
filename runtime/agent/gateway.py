@@ -129,7 +129,7 @@ class Served:
             raise SystemExit(f"{self.name}: embeddings need a pad_token that is in the tokenizer")
 
     def describe(self) -> dict:
-        return {"id": self.name, "object": "model", "owned_by": "uwc-testnet", "uwc_model": self.model_id,
+        return {"id": self.name, "object": "model", "owned_by": "uwc", "uwc_model": self.model_id,
                 "label": self.label, "dimensions": self.dim, "max_tokens": min(self.max_pos, BUCKETS[-1]),
                 "context": self.max_pos, "chat": self.gen_ok and self.template != "none",
                 "completions": self.gen_ok, "embeddings": self.embeddings, "price_per_1k_tokens_coins": self.price_per_1k}

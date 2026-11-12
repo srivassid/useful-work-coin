@@ -76,14 +76,14 @@ pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: au
 </head>
 <body>
 <header><div class="wrap top">
-  <div class="brand">UWC Jobs<small>testnet</small></div>
+  <div class="brand">UWC Jobs<small>mainnet</small></div>
   <div class="net" id="net">connecting…</div>
 </div></header>
 <main class="wrap">
 
 <section class="card" id="signup">
   <h2>Get started</h2>
-  <p class="muted">Create an API key to post AI jobs to the network. Testnet coins from the faucet pay for them. Each key gets its own account on the chain.</p>
+  <p class="muted">Create an API key to post AI jobs to the network. Each key gets its own account on the chain: fund it by sending coins to the key's address (from <code>./uwc-miner send</code>), and they move into its jobs balance within a few blocks.</p>
   <div class="row">
     <div><label for="su-name">Name for this key</label><input id="su-name" maxlength="80" placeholder="e.g. my laptop"></div>
     <div id="su-code-wrap"><label for="su-code">Signup code</label><input id="su-code" autocomplete="off"></div>
@@ -286,7 +286,9 @@ $("su-go").onclick = async () => {
     store.set("uwc_key", KEY);
     out.append(el("div", { class: "note" },
       el("b", { text: "Your API key is shown only once. Copy it somewhere safe." }), el("div", { class: "keybox mono", text: KEY }),
-      `The faucet sent ${k.faucet_coins} coins; they arrive with the next block (about a minute).`));
+      k.faucet_coins > 0 ? `The faucet sent ${k.faucet_coins} coins; they arrive with the next block (about a minute).`
+        : el("div", {}, "To fund it, send coins to ", el("span", { class: "mono", text: k.address }),
+          ". They move into the jobs balance a few blocks after they arrive (one coin stays in the wallet for transaction fees).")));
     setTimeout(() => { refreshAccount(); }, 1500);
   } catch (e) { out.append(errBox(e.message)); }
   $("su-go").disabled = false;

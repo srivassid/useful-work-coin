@@ -34,9 +34,39 @@ Launched 2026-11-12. Block 1 was mined at 06:26:29 UTC. Code: `chain/patches/002
 | Dev fund | 21,000,000 coins (1% of supply), paid once by block 1 to `uwc1pxhsl08wxwn37dz3t3rgqwsg76azgwdl6duh4x9lg629umlrppnjsz6d7jz`; consensus rejects a block 1 that does not pay it, and no other block may |
 | Council | 2 of 3 keys, held by the project at launch |
 
-Status: mining is live. The job market (model registrations, pools, verifiers) opens once the
-first coins mature; the mainnet `uwc-miner` package follows it. The jobs web page is not on
-mainnet yet: it needs a deposit flow in place of the testnet faucet.
+Status: mining and the job market are live; the mainnet `uwc-miner` package follows.
+
+### Job market and API
+
+Opened 2026-11-12 at block ~400. Four models are registered, each with a job pool and staked
+providers and verifiers run by the project:
+
+| Model | Chain id | Pool category | Price per 1,000 tokens |
+|---|---|---|---|
+| Qwen3 1.7B (chat, completion, embeddings) | `c84eea62…` | `62f57cc3…` | 1.5 coins |
+| Llama 3.2 3B Instruct (chat, completion) | `08fde5c3…` | `7c995318…` | 2.5 coins |
+| Mistral 7B Instruct v0.2 (chat, completion) | `0795f63d…` | `4eb0a8ae…` | 5 coins |
+| Llama 3.1 8B, base (completion only) | `72de4c76…` | `f93a71b5…` | 6 coins |
+
+The job gateway (`runtime/agent/gateway.py`) serves an OpenAI-compatible API and the jobs page at
+<https://165-232-182-224.sslip.io/>. There is no faucet on mainnet:
+
+1. `POST /v1/keys` (or **Create key** on the page) returns an API key and a `uwc1p…` address.
+2. Send coins to that address. Every 5 minutes the gateway moves them into the key's jobs balance,
+   keeping 1 coin in the wallet for transaction fees.
+3. Call `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` or `/v1/batches` with
+   `Authorization: Bearer <key>`. `GET /v1/account` shows the balance; `GET /v1/jobs/<id>` a
+   request's trust level.
+
+Each request is posted on chain as a job (minimum fee 0.5 coins). A provider accepts it, computes
+it and commits the result; a verifier recomputes sampled stages. Trust goes from *committed* (the
+answer is back, about 5 minutes on a quiet network) to *verified* (about 10 minutes later) to
+*final* when the challenge window closes, about 5 hours. End-to-end test on 2026-11-12: one chat
+request on each instruct model and a completion on Llama 3.1 8B, 0.5 coins each.
+
+Live mining stats: <https://aicoin-miners.vercel.app> (miners active in the last hour and day,
+blocks, work rate), fed by `web/stats/exporter.py`, which publishes public chain data only.
+Server setup: `deploy/mainnet/`.
 
 Layout (from the doc): `chain/`, `miner/` (`miner/ampere`: Ampere port of Pearl's NoisyGEMM
 miner), `runtime/`, `verifier/` (`forced_errors.py`: keyholder shares and curator trees),

@@ -1,0 +1,13 @@
+165-232-182-224.sslip.io {
+	encode gzip
+	@stats path /stats.json
+	handle @stats {
+		header Access-Control-Allow-Origin *
+		header Cache-Control "no-store"
+		root * /var/www/uwc
+		file_server
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8693
+	}
+}

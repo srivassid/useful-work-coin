@@ -1,0 +1,22 @@
+[Unit]
+Description=UWC mainnet job data service (signed uploads)
+After=uwc-main-node.service
+Requires=uwc-main-node.service
+
+[Service]
+User=uwc
+Group=uwc
+WorkingDirectory=/opt/uwc/app
+Environment=HOME=/opt/uwc/data-main
+ExecStart=/usr/bin/python3 -m agent.data serve --auth --chain /opt/uwc/main --root /opt/uwc/data-main --bind 0.0.0.0:8692 --max-conn 64
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/uwc/data-main
+PrivateTmp=true
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

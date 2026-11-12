@@ -1,0 +1,13 @@
+[
+ {"name": "qwen3-1.7b", "label": "Qwen3 1.7B", "model": "/opt/uwc/gateway-main/models/qwen3-1.7b-gen.json", "tokenizer": "/opt/uwc/gateway/tokenizer.json",
+  "template": "qwen3", "price_per_1k": 1.5, "embeddings": true, "pad_token": "<|endoftext|>"},
+ {"name": "llama-3.2-3b-instruct", "label": "Llama 3.2 3B Instruct", "model": "/opt/uwc/gateway-main/models/llama-3.2-3b-instruct-gen.json",
+  "tokenizer": "/opt/uwc/gateway/tokenizers/llama-3.2-3b-instruct.json", "tokenizer_config": "/opt/uwc/gateway/tokenizers/llama-3.2-3b-instruct.config.json",
+  "template": "hf", "price_per_1k": 2.5},
+ {"name": "mistral-7b-instruct-v0.2", "label": "Mistral 7B Instruct v0.2", "model": "/opt/uwc/gateway-main/models/mistral-7b-instruct-v0.2-gen.json",
+  "tokenizer": "/opt/uwc/gateway/tokenizers/mistral-7b-instruct-v0.2.json", "tokenizer_config": "/opt/uwc/gateway/tokenizers/mistral-7b-instruct-v0.2.config.json",
+  "template": "hf", "price_per_1k": 5},
+ {"name": "llama-3.1-8b", "label": "Llama 3.1 8B (base, text completion)", "model": "/opt/uwc/gateway-main/models/llama-3.1-8b-gen.json",
+  "tokenizer": "/opt/uwc/gateway/tokenizers/llama-3.1-8b.json", "tokenizer_config": "/opt/uwc/gateway/tokenizers/llama-3.1-8b.config.json",
+  "template": "none", "price_per_1k": 6}
+]

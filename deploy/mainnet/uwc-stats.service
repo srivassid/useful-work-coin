@@ -1,0 +1,18 @@
+[Unit]
+Description=UWC mainnet stats exporter (public stats.json for the miners page)
+After=uwc-main-node.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/uwc/stats/exporter.py
+Environment=OUT=/var/www/uwc/stats.json LABELS=/opt/uwc/stats/labels.json RPC_PASS_FILE=/opt/uwc/main/rpcpass
+Restart=always
+RestartSec=10
+MemoryMax=150M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/www/uwc
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

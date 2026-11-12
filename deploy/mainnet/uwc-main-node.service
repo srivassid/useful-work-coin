@@ -1,0 +1,14 @@
+[Unit]
+Description=UWC mainnet seed node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=uwc
+ExecStart=/opt/uwc/bin-main/pearld --uwcmainnet --configfile=/opt/uwc/main/pearld.conf --datadir=/opt/uwc/main/node --logdir=/opt/uwc/main/logs --listen=0.0.0.0:8690 --externalip=165.232.182.224 --rpclisten=127.0.0.1:8691 --notls --txindex --addrindex --maxpeers=125 --utxocachemaxsize=64 --sigcachemaxsize=20000 --debuglevel=info
+Restart=on-failure
+RestartSec=10
+MemoryMax=1200M
+
+[Install]
+WantedBy=multi-user.target
