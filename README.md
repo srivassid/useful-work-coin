@@ -3,6 +3,9 @@
 Implementation of *Useful-Work Coin: Design v3* (`spec/design-v3.pdf`): Pearl's cuPOW lottery
 plus a verified job market. Work follows the doc's build plan.
 
+Public page for testers (install, tester note, design guide PDF):
+[srivassid/AICoin](https://github.com/srivassid/AICoin).
+
 | Step | Status |
 |---|---|
 | 1. Go/no-go: λ and quantization quality | **done**: see `spec/step1-results.md` |
