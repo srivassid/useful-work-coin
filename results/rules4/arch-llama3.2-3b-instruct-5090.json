@@ -1,0 +1,22 @@
+{
+ "model": "/home/sid/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95/",
+ "gpu": "NVIDIA GeForce RTX 5090",
+ "devices": "cuda:0",
+ "hadamard": 128,
+ "groups": 7,
+ "ppl_bf16": 17.41001163130323,
+ "arch": 1,
+ "qk_norm": false,
+ "rope_sha": "100ee4f0e04ca58379d71391336f4e88e969a02d5ddb3928afd502b125e9aa47",
+ "stages": {
+  "wiki 4x128": "cc890e2e1763deaa",
+  "random 3x128": "2c1c9c587d5f39f0",
+  "random 1x512": "62695ba64065458e",
+  "random 2x300": "bbe420c5f93e0c88"
+ },
+ "gen": {
+  "greedy": "e85091a75fc82d14",
+  "t0.8": "92ceb6fab8acec11"
+ },
+ "ppl_det": 17.481367010536967
+}
